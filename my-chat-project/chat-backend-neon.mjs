@@ -186,6 +186,7 @@ async function initDatabase() {
         unread_admin INTEGER NOT NULL DEFAULT 0 CHECK (unread_admin >= 0),
         unread_user INTEGER NOT NULL DEFAULT 0 CHECK (unread_user >= 0),
         last_auto_reply_at TIMESTAMPTZ,
+        last_seen_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
@@ -214,6 +215,7 @@ async function initDatabase() {
         type TEXT NOT NULL CHECK (type IN ('text','image')),
         text TEXT NOT NULL DEFAULT '',
         attachment_id UUID UNIQUE REFERENCES attachments(id) ON DELETE CASCADE,
+        read_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         CHECK (
           (type = 'text' AND attachment_id IS NULL AND length(text) > 0)
@@ -221,6 +223,15 @@ async function initDatabase() {
           (type = 'image' AND attachment_id IS NOT NULL)
         )
       )
+    `);
+
+    await client.query(`
+      ALTER TABLE conversations
+      ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ
+    `);
+    await client.query(`
+      ALTER TABLE messages
+      ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ
     `);
 
     await client.query(`
@@ -607,6 +618,8 @@ function publicMessage(row) {
     text: row.text || '',
     attachmentId: row.attachment_id || null,
     createdAt: new Date(row.created_at).toISOString(),
+    readAt: row.read_at ? new Date(row.read_at).toISOString() : null,
+    read: Boolean(row.read_at),
   };
 }
 
@@ -622,6 +635,15 @@ function publicAttachment(row) {
   };
 }
 
+function isConversationOnline(conversationId) {
+  for (const client of sseClients) {
+    if (client.kind === 'user' && client.conversationId === conversationId) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function conversationBase(row) {
   return {
     id: row.id,
@@ -631,6 +653,8 @@ function conversationBase(row) {
     updatedAt: new Date(row.updated_at).toISOString(),
     unreadAdmin: Number(row.unread_admin || 0),
     unreadUser: Number(row.unread_user || 0),
+    online: isConversationOnline(row.id),
+    lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at).toISOString() : null,
   };
 }
 
@@ -695,6 +719,45 @@ async function getPublicConversation(id, client = pool) {
     ...conversationBase(conversation),
     messages: messagesResult.rows.map(publicMessage),
   };
+}
+
+async function markConversationRead(conversationId, readerRole) {
+  const senderRole = readerRole === 'admin' ? 'user' : 'admin';
+  const unreadColumn = readerRole === 'admin' ? 'unread_admin' : 'unread_user';
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+    const updated = await client.query(
+      `
+        UPDATE messages
+        SET read_at = COALESCE(read_at, NOW())
+        WHERE conversation_id = $1
+          AND role = $2
+          AND read_at IS NULL
+        RETURNING id
+      `,
+      [conversationId, senderRole],
+    );
+    await client.query(
+      `UPDATE conversations SET ${unreadColumn} = 0 WHERE id = $1`,
+      [conversationId],
+    );
+    await client.query('COMMIT');
+    return updated.rowCount;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function touchConversationSeen(conversationId) {
+  await pool.query(
+    `UPDATE conversations SET last_seen_at = NOW() WHERE id = $1`,
+    [conversationId],
+  );
 }
 
 async function getAllSummaries() {
@@ -1035,9 +1098,9 @@ async function createUserMessage(conversationId, body) {
         const autoResult = await client.query(
           `
             INSERT INTO messages (
-              id, conversation_id, role, source, type, text
+              id, conversation_id, role, source, type, text, read_at
             )
-            VALUES ($1, $2, 'admin', 'auto', 'text', $3)
+            VALUES ($1, $2, 'admin', 'auto', 'text', $3, NOW())
             RETURNING *
           `,
           [randomUUID(), conversationId, replyText],
@@ -1240,9 +1303,9 @@ async function router(req, res) {
       await client.query(
         `
           INSERT INTO conversations (
-            id, visitor_key_hash, visitor_name
+            id, visitor_key_hash, visitor_name, last_seen_at
           )
-          VALUES ($1, $2, $3)
+          VALUES ($1, $2, $3, NOW())
         `,
         [conversationId, hashVisitorKey(visitorKey), visitorName],
       );
@@ -1332,7 +1395,41 @@ async function router(req, res) {
     };
     sseClients.add(client);
     sendSse(res, { type: 'connected', at: nowIso() });
-    req.on('close', () => sseClients.delete(client));
+
+    if (payload.kind === 'user') {
+      await touchConversationSeen(payload.conversationId);
+      const onlineConversation = await getPublicConversation(payload.conversationId);
+      broadcast(
+        {
+          type: 'presence-updated',
+          conversationId: payload.conversationId,
+          online: true,
+          lastSeenAt: onlineConversation?.lastSeenAt || nowIso(),
+        },
+        payload.conversationId,
+      );
+    }
+
+    req.on('close', () => {
+      sseClients.delete(client);
+      if (payload.kind === 'user') {
+        touchConversationSeen(payload.conversationId)
+          .then(async () => {
+            if (isConversationOnline(payload.conversationId)) return;
+            const offlineConversation = await getPublicConversation(payload.conversationId);
+            broadcast(
+              {
+                type: 'presence-updated',
+                conversationId: payload.conversationId,
+                online: false,
+                lastSeenAt: offlineConversation?.lastSeenAt || nowIso(),
+              },
+              payload.conversationId,
+            );
+          })
+          .catch((error) => console.error('更新访客离线状态失败：', error));
+      }
+    });
     return;
   }
 
@@ -1352,15 +1449,24 @@ async function router(req, res) {
       return sendError(res, 401, '访客会话不存在。', 'AUTH');
     }
 
+    await touchConversationSeen(conversation.id);
+
     if (req.method === 'GET' && pathname === '/api/user/conversation') {
-      await pool.query(
-        `UPDATE conversations SET unread_user = 0 WHERE id = $1`,
-        [conversation.id],
-      );
+      const readCount = await markConversationRead(conversation.id, 'user');
       const [publicConversation, config] = await Promise.all([
         getPublicConversation(conversation.id),
         getConfig(),
       ]);
+      if (readCount > 0) {
+        broadcast(
+          {
+            type: 'conversation-updated',
+            trigger: 'user-read',
+            conversation: publicConversation,
+          },
+          conversation.id,
+        );
+      }
       return sendJson(res, 200, {
         ok: true,
         conversation: publicConversation,
@@ -1416,14 +1522,16 @@ async function router(req, res) {
       const body = await readJson(req, 512 * 1024);
       const current = await getConfig();
       const validated = validateAdminSettings(body, current);
-      await pool.query(
+      const saved = await pool.query(
         `
-          UPDATE app_config
-          SET canned_replies = $1::jsonb,
-              auto_replies = $2::jsonb,
-              settings = $3::jsonb,
+          INSERT INTO app_config (id, canned_replies, auto_replies, settings, updated_at)
+          VALUES (1, $1::jsonb, $2::jsonb, $3::jsonb, NOW())
+          ON CONFLICT (id) DO UPDATE
+          SET canned_replies = EXCLUDED.canned_replies,
+              auto_replies = EXCLUDED.auto_replies,
+              settings = EXCLUDED.settings,
               updated_at = NOW()
-          WHERE id = 1
+          RETURNING canned_replies, auto_replies, settings, updated_at
         `,
         [
           JSON.stringify(validated.cannedReplies),
@@ -1431,8 +1539,14 @@ async function router(req, res) {
           JSON.stringify(validated.settings),
         ],
       );
-      broadcast({ type: 'settings-updated' });
-      return sendJson(res, 200, { ok: true, ...validated });
+      const persisted = {
+        cannedReplies: saved.rows[0].canned_replies || [],
+        autoReplies: saved.rows[0].auto_replies || [],
+        settings: saved.rows[0].settings || {},
+        updatedAt: new Date(saved.rows[0].updated_at).toISOString(),
+      };
+      broadcast({ type: 'settings-updated', updatedAt: persisted.updatedAt });
+      return sendJson(res, 200, { ok: true, ...persisted });
     }
 
     const match = pathname.match(
@@ -1452,34 +1566,18 @@ async function router(req, res) {
       }
 
       if (req.method === 'GET' && !action) {
-        await pool.query(
-          `UPDATE conversations SET unread_admin = 0 WHERE id = $1`,
-          [conversationId],
-        );
+        const readCount = await markConversationRead(conversationId, 'admin');
         const publicConversation = await getPublicConversation(conversationId);
-        broadcast(
-          {
-            type: 'summary-updated',
-            conversation: {
-              ...conversationBase({
-                ...conversation,
-                unread_admin: 0,
-              }),
-              latestMessage: publicConversation.messages.at(-1)
-                ? {
-                    type: publicConversation.messages.at(-1).type,
-                    text:
-                      publicConversation.messages.at(-1).type === 'image'
-                        ? publicConversation.messages.at(-1).text || '[图片]'
-                        : publicConversation.messages.at(-1).text,
-                    role: publicConversation.messages.at(-1).role,
-                    createdAt: publicConversation.messages.at(-1).createdAt,
-                  }
-                : null,
+        if (readCount > 0) {
+          broadcast(
+            {
+              type: 'conversation-updated',
+              trigger: 'admin-read',
+              conversation: publicConversation,
             },
-          },
-          conversationId,
-        );
+            conversationId,
+          );
+        }
         return sendJson(res, 200, {
           ok: true,
           conversation: publicConversation,
@@ -1537,7 +1635,11 @@ async function router(req, res) {
         const body = await readJson(req);
         const result = await createAdminMessage(conversationId, body);
         broadcast(
-          { type: 'conversation-updated', conversation: result.conversation },
+          {
+            type: 'conversation-updated',
+            trigger: 'admin-message',
+            conversation: result.conversation,
+          },
           conversationId,
         );
         return sendJson(res, 201, { ok: true, message: result.message });
