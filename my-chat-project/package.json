@@ -1,0 +1,16 @@
+{
+  "name": "neon-chat-backend",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node chat-backend-neon.mjs",
+    "check": "node --check chat-backend-neon.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.22.0"
+  }
+}

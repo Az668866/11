@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: neon-chat-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: DATABASE_URL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: TOKEN_SECRET
+        generateValue: true
+      - key: CHAT_RETENTION_HOURS
+        value: 24
+      - key: TOKEN_TTL_HOURS
+        value: 24
+      - key: MAX_IMAGE_MB
+        value: 8
+      - key: MAX_CONVERSATIONS
+        value: 1000
+      - key: DB_POOL_MAX
+        value: 5
