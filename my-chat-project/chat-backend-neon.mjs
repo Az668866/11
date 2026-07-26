@@ -13,11 +13,10 @@
  *   ALLOWED_ORIGINS  用户端和客户后台域名，英文逗号分隔
  *   TOKEN_SECRET     至少32个字符的随机密钥
  *
- * Telegram 发卡（启用时四项都必须设置）：
+ * Telegram 私聊发卡（启用时三项都必须设置）：
  *   TELEGRAM_BOT_TOKEN
  *   TELEGRAM_WEBHOOK_SECRET
- *   TELEGRAM_ALLOWED_CHAT_IDS
- *   TELEGRAM_ALLOWED_USER_IDS
+ *   TELEGRAM_ALLOWED_PRIVATE_USER_IDS 允许私聊发卡的 Telegram 数字用户 ID，英文逗号分隔
  *
  * 可选环境变量：
  *   PORT=10000
@@ -46,13 +45,11 @@ const DATABASE_URL = String(process.env.DATABASE_URL || '').trim();
 const TOKEN_SECRET_TEXT = process.env.TOKEN_SECRET || '';
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_WEBHOOK_SECRET = String(process.env.TELEGRAM_WEBHOOK_SECRET || '').trim();
-const TELEGRAM_ALLOWED_CHAT_IDS = new Set(
-  String(process.env.TELEGRAM_ALLOWED_CHAT_IDS || '')
-    .split(',').map((item) => item.trim()).filter(Boolean),
-);
-const TELEGRAM_ALLOWED_USER_IDS = new Set(
-  String(process.env.TELEGRAM_ALLOWED_USER_IDS || '')
-    .split(',').map((item) => item.trim()).filter(Boolean),
+const TELEGRAM_ALLOWED_PRIVATE_USER_IDS = new Set(
+  String(process.env.TELEGRAM_ALLOWED_PRIVATE_USER_IDS || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => /^\d+$/.test(item)),
 );
 const TELEGRAM_ENABLED = Boolean(TELEGRAM_BOT_TOKEN);
 const MAX_IMAGE_BYTES =
@@ -97,8 +94,10 @@ if (TELEGRAM_ENABLED) {
   if (!/^[A-Za-z0-9_-]{16,256}$/.test(TELEGRAM_WEBHOOK_SECRET)) {
     throw new Error('TELEGRAM_WEBHOOK_SECRET 必须为16-256位字母、数字、下划线或短横线。');
   }
-  if (!TELEGRAM_ALLOWED_CHAT_IDS.size || !TELEGRAM_ALLOWED_USER_IDS.size) {
-    throw new Error('启用 Telegram 时必须设置允许的群 ID 和操作员用户 ID。');
+  if (!TELEGRAM_ALLOWED_PRIVATE_USER_IDS.size) {
+    throw new Error(
+      '启用 Telegram 时必须设置 TELEGRAM_ALLOWED_PRIVATE_USER_IDS 私聊操作员白名单。',
+    );
   }
 }
 
@@ -1522,72 +1521,183 @@ async function handleTenantRenew(req, res) {
   });
 }
 
-function telegramAllowed(chatId, userId) {
-  return TELEGRAM_ALLOWED_CHAT_IDS.has(String(chatId)) && TELEGRAM_ALLOWED_USER_IDS.has(String(userId));
+function telegramPrivateAllowed(chat, userId) {
+  return Boolean(
+    chat?.type === 'private' &&
+      userId != null &&
+      TELEGRAM_ALLOWED_PRIVATE_USER_IDS.has(String(userId)),
+  );
 }
+
 async function telegramApi(method, payload) {
-  const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`, {
-    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload), signal:AbortSignal.timeout(12000),
-  });
+  const response = await fetch(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(12_000),
+    },
+  );
   const result = await response.json().catch(() => null);
-  if (!response.ok || !result?.ok) throw new Error(result?.description || `Telegram ${method} 失败。`);
+  if (!response.ok || !result?.ok) {
+    throw new Error(result?.description || `Telegram ${method} 失败。`);
+  }
   return result.result;
 }
+
+function telegramGenerateKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '一日卡', callback_data: 'license:1d' },
+        { text: '周卡', callback_data: 'license:7d' },
+      ],
+      [
+        { text: '月卡', callback_data: 'license:30d' },
+        { text: '半年卡', callback_data: 'license:180d' },
+      ],
+      [{ text: '年卡', callback_data: 'license:365d' }],
+    ],
+  };
+}
+
 async function processTelegramUpdate(update) {
   const message = update?.message;
   const callback = update?.callback_query;
+
   if (message?.text) {
-    const chatId=message.chat?.id, userId=message.from?.id;
-    const raw=String(message.text||'').trim();
-    const command=raw.split('@')[0];
-    if (['生成密钥','生成卡密','/key','/card','/generate'].includes(command)) {
-      if (!telegramAllowed(chatId,userId)) {
-        await telegramApi('sendMessage',{chat_id:chatId,text:'你没有生成卡密的权限。'}); return;
-      }
-      await telegramApi('sendMessage',{
-        chat_id:chatId,
-        text:'请点击下方按键选择，请注意：请确认钱包收款成功后，再把密钥发给客户！',
-        reply_markup:{inline_keyboard:[
-          [{text:'一日卡',callback_data:'license:1d'},{text:'周卡',callback_data:'license:7d'}],
-          [{text:'月卡',callback_data:'license:30d'},{text:'半年卡',callback_data:'license:180d'}],
-          [{text:'年卡',callback_data:'license:365d'}],
-        ]},
-        ...(message.message_thread_id ? {message_thread_id:message.message_thread_id}:{}),
-      }); return;
+    const chat = message.chat;
+    const chatId = chat?.id;
+    const userId = message.from?.id;
+    const raw = String(message.text || '').trim();
+    const command = raw.split('@')[0].toLowerCase();
+
+    // 本机器人只允许私聊发卡。群组、超级群和频道消息全部忽略。
+    if (chat?.type !== 'private') return;
+
+    if (!telegramPrivateAllowed(chat, userId)) {
+      await telegramApi('sendMessage', {
+        chat_id: chatId,
+        text: '⛔ 你不在私聊发卡白名单中，无法使用此机器人。',
+      });
+      return;
     }
-    const revokeMatch=raw.match(/^(?:\/revoke|禁用卡密)\s+(.+)$/i);
+
+    if (['/start', '/help'].includes(command)) {
+      await telegramApi('sendMessage', {
+        chat_id: chatId,
+        text: [
+          '✅ 私聊发卡机器人已启用。',
+          '',
+          '发送“生成密钥”或 /key 选择卡密时长。',
+          '停用卡密：/revoke 卡密',
+        ].join('\n'),
+      });
+      return;
+    }
+
+    if (
+      ['生成密钥', '生成卡密', '/key', '/card', '/generate'].includes(command)
+    ) {
+      await telegramApi('sendMessage', {
+        chat_id: chatId,
+        text: '请点击下方按键选择，请注意：请确认钱包收款成功后，再把密钥发给客户！',
+        reply_markup: telegramGenerateKeyboard(),
+      });
+      return;
+    }
+
+    const revokeMatch = raw.match(/^(?:\/revoke|禁用卡密)\s+(.+)$/i);
     if (revokeMatch) {
-      if (!telegramAllowed(chatId,userId)) return;
-      const key=normalizeLicenseKey(revokeMatch[1]);
-      const client=await pool.connect();
-      let text='卡密不存在。';
+      const key = normalizeLicenseKey(revokeMatch[1]);
+      const client = await pool.connect();
+      let text = '卡密不存在。';
       try {
         await client.query('BEGIN');
-        const result=await client.query(`SELECT * FROM license_keys WHERE key_hash=$1 FOR UPDATE`,[hashLicenseKey(key)]);
-        const row=result.rows[0];
+        const result = await client.query(
+          `SELECT * FROM license_keys WHERE key_hash=$1 FOR UPDATE`,
+          [hashLicenseKey(key)],
+        );
+        const row = result.rows[0];
         if (row) {
-          await client.query(`UPDATE license_keys SET status='revoked',updated_at=NOW() WHERE id=$1`,[row.id]);
-          if (row.tenant_id && row.status==='active') await client.query(`UPDATE tenants SET status='suspended',access_expires_at=NOW(),updated_at=NOW() WHERE id=$1`,[row.tenant_id]);
-          text=`已停用卡密：${licenseHint(row)}`;
+          await client.query(
+            `UPDATE license_keys
+             SET status='revoked',updated_at=NOW()
+             WHERE id=$1`,
+            [row.id],
+          );
+          if (row.tenant_id && row.status === 'active') {
+            await client.query(
+              `UPDATE tenants
+               SET status='suspended',access_expires_at=NOW(),updated_at=NOW()
+               WHERE id=$1`,
+              [row.tenant_id],
+            );
+          }
+          text = `已停用卡密：${licenseHint(row)}`;
         }
         await client.query('COMMIT');
-      } catch(e){await client.query('ROLLBACK');throw e;} finally{client.release();}
-      await telegramApi('sendMessage',{chat_id:chatId,text}); return;
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+      await telegramApi('sendMessage', { chat_id: chatId, text });
+      return;
     }
   }
+
   if (callback?.data?.startsWith('license:')) {
-    const chatId=callback.message?.chat?.id, userId=callback.from?.id;
-    const code=callback.data.slice(8);
-    if (!telegramAllowed(chatId,userId)) {
-      await telegramApi('answerCallbackQuery',{callback_query_id:callback.id,text:'你没有权限。',show_alert:true}); return;
+    const chat = callback.message?.chat;
+    const chatId = chat?.id;
+    const userId = callback.from?.id;
+    const code = callback.data.slice(8);
+
+    // 防止把私聊按钮转发到群后被利用，也防止非白名单用户点击。
+    if (!telegramPrivateAllowed(chat, userId)) {
+      await telegramApi('answerCallbackQuery', {
+        callback_query_id: callback.id,
+        text:
+          chat?.type === 'private'
+            ? '你不在私聊发卡白名单中。'
+            : '只能在机器人私聊中生成卡密。',
+        show_alert: true,
+      });
+      return;
     }
-    if (!LICENSE_DURATIONS[code]) return;
-    await telegramApi('answerCallbackQuery',{callback_query_id:callback.id,text:'正在生成卡密…'});
-    const created=await createLicenseRecord(code,{telegramChatId:chatId,telegramUserId:userId});
-    await telegramApi('sendMessage',{
-      chat_id:chatId,
-      text:[`✅ ${created.duration.label}已生成`,'',`卡密：${created.licenseKey}`,`有效时长：首次登录后台后 ${created.duration.days} 天`,'','请确认钱包收款成功后，再把卡密发给客户。','客户用此卡密登录后台；系统会自动创建独立租户和专属用户端入口。'].join('\n'),
-      ...(callback.message?.message_thread_id?{message_thread_id:callback.message.message_thread_id}:{}),
+
+    if (!LICENSE_DURATIONS[code]) {
+      await telegramApi('answerCallbackQuery', {
+        callback_query_id: callback.id,
+        text: '卡密时长无效。',
+        show_alert: true,
+      });
+      return;
+    }
+
+    await telegramApi('answerCallbackQuery', {
+      callback_query_id: callback.id,
+      text: '正在生成卡密…',
+    });
+
+    const created = await createLicenseRecord(code, {
+      telegramChatId: chatId,
+      telegramUserId: userId,
+    });
+
+    await telegramApi('sendMessage', {
+      chat_id: chatId,
+      text: [
+        `✅ ${created.duration.label}已生成`,
+        '',
+        `卡密：${created.licenseKey}`,
+        `有效时长：首次登录后台后 ${created.duration.days} 天`,
+        '',
+        '请确认钱包收款成功后，再把卡密发给客户。',
+        '客户用此卡密登录后台；系统会自动创建独立租户和专属用户端入口。',
+      ].join('\n'),
     });
   }
 }
