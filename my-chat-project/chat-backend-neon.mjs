@@ -6,7 +6,7 @@
  *   - 会话、消息、图片、快捷语、自动回复和设置全部存入 Neon PostgreSQL
  *   - 不创建本地数据目录，不读写 Render 磁盘
  *   - JavaScript 全局变量不保存聊天记录；仅保留 SSE 连接和限流计数等瞬时运行状态
- *   - 消息和图片最多保留 24 小时
+ *   - 消息和图片默认保留 30 天，可通过环境变量调整
  *
  * 必填环境变量：
  *   DATABASE_URL     Neon 的 pooled PostgreSQL 连接串
@@ -17,11 +17,13 @@
  * 可选环境变量：
  *   PORT=10000
  *   HOST=0.0.0.0
- *   CHAT_RETENTION_HOURS=24（强制不超过24小时）
+ *   CHAT_RETENTION_HOURS=720（默认30天，最多365天）
  *   TOKEN_TTL_HOURS=24
  *   MAX_IMAGE_MB=8
  *   MAX_CONVERSATIONS=1000
  *   DB_POOL_MAX=5
+ *   IP_GEO_ENABLED=true（是否查询公网 IP 的近似位置）
+ *   IP_GEO_URL_TEMPLATE=https://ipwho.is/{ip}（可选）
  */
 
 import http from 'node:http';
@@ -47,8 +49,8 @@ const MAX_CONVERSATIONS = Math.max(
   Number(process.env.MAX_CONVERSATIONS || 1000),
 );
 const RETENTION_HOURS = Math.min(
-  24,
-  Math.max(1, Number(process.env.CHAT_RETENTION_HOURS || 24)),
+  24 * 365,
+  Math.max(1, Number(process.env.CHAT_RETENTION_HOURS || 24 * 30)),
 );
 const TOKEN_TTL_SECONDS = Math.min(
   RETENTION_HOURS * 3600,
@@ -58,6 +60,10 @@ const DB_POOL_MAX = Math.min(
   20,
   Math.max(1, Number(process.env.DB_POOL_MAX || 5)),
 );
+const IP_GEO_ENABLED = String(process.env.IP_GEO_ENABLED || 'true').toLowerCase() !== 'false';
+const IP_GEO_URL_TEMPLATE = String(
+  process.env.IP_GEO_URL_TEMPLATE || 'https://ipwho.is/{ip}',
+).trim();
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
@@ -105,6 +111,7 @@ pool.on('error', (error) => {
 // 这里只保存实时连接和限流计数，不保存聊天内容。
 const sseClients = new Set();
 const rateBuckets = new Map();
+const ipGeoCache = new Map();
 let lastCleanupAt = 0;
 let cleanupPromise = null;
 
@@ -156,6 +163,8 @@ function defaultConfig() {
       defaultAutoReply: '消息已收到，客服看到后会尽快回复。',
       autoReplyCooldownSeconds: 20,
       userSiteUrl: '',
+      announcementEnabled: false,
+      announcementText: '',
     },
   };
 }
@@ -182,11 +191,21 @@ async function initDatabase() {
         id UUID PRIMARY KEY,
         visitor_key_hash TEXT NOT NULL,
         visitor_name TEXT NOT NULL,
+        visitor_note TEXT NOT NULL DEFAULT '',
+        ip_address TEXT NOT NULL DEFAULT '',
+        ip_location TEXT NOT NULL DEFAULT '',
+        ip_isp TEXT NOT NULL DEFAULT '',
+        device_type TEXT NOT NULL DEFAULT '',
+        device_label TEXT NOT NULL DEFAULT '',
+        entry_source TEXT NOT NULL DEFAULT '',
+        user_agent TEXT NOT NULL DEFAULT '',
+        referrer_url TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'closed')),
         unread_admin INTEGER NOT NULL DEFAULT 0 CHECK (unread_admin >= 0),
         unread_user INTEGER NOT NULL DEFAULT 0 CHECK (unread_user >= 0),
         last_auto_reply_at TIMESTAMPTZ,
         last_seen_at TIMESTAMPTZ,
+        last_visited_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
@@ -225,10 +244,22 @@ async function initDatabase() {
       )
     `);
 
-    await client.query(`
-      ALTER TABLE conversations
-      ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ
-    `);
+    const conversationColumns = [
+      `ADD COLUMN IF NOT EXISTS visitor_note TEXT NOT NULL DEFAULT ''`,
+      `ADD COLUMN IF NOT EXISTS ip_address TEXT NOT NULL DEFAULT ''`,
+      `ADD COLUMN IF NOT EXISTS ip_location TEXT NOT NULL DEFAULT ''`,
+      `ADD COLUMN IF NOT EXISTS ip_isp TEXT NOT NULL DEFAULT ''`,
+      `ADD COLUMN IF NOT EXISTS device_type TEXT NOT NULL DEFAULT ''`,
+      `ADD COLUMN IF NOT EXISTS device_label TEXT NOT NULL DEFAULT ''`,
+      `ADD COLUMN IF NOT EXISTS entry_source TEXT NOT NULL DEFAULT ''`,
+      `ADD COLUMN IF NOT EXISTS user_agent TEXT NOT NULL DEFAULT ''`,
+      `ADD COLUMN IF NOT EXISTS referrer_url TEXT NOT NULL DEFAULT ''`,
+      `ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ`,
+      `ADD COLUMN IF NOT EXISTS last_visited_at TIMESTAMPTZ`,
+    ];
+    for (const definition of conversationColumns) {
+      await client.query(`ALTER TABLE conversations ${definition}`);
+    }
     await client.query(`
       ALTER TABLE messages
       ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ
@@ -237,6 +268,10 @@ async function initDatabase() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS conversations_updated_at_idx
       ON conversations (updated_at DESC)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS conversations_visitor_key_idx
+      ON conversations (visitor_key_hash, updated_at DESC)
     `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS messages_conversation_created_idx
@@ -316,7 +351,7 @@ async function cleanupExpiredData() {
       `
         DELETE FROM conversations c
         WHERE
-          c.created_at < NOW() - ($1::text || ' hours')::interval
+          c.updated_at < NOW() - ($1::text || ' hours')::interval
           AND NOT EXISTS (
             SELECT 1 FROM messages m WHERE m.conversation_id = c.id
           )
@@ -540,11 +575,76 @@ function safeFilename(value) {
   );
 }
 
+function normalizeClientIp(value) {
+  let ip = String(value || '').trim();
+  if (!ip) return 'unknown';
+  if (ip.startsWith('::ffff:')) ip = ip.slice(7);
+  if (ip.startsWith('[') && ip.includes(']')) ip = ip.slice(1, ip.indexOf(']'));
+  if (/^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(ip)) ip = ip.replace(/:\d+$/, '');
+  return cleanText(ip, 80) || 'unknown';
+}
+
 function requestIp(req) {
-  const forwarded = String(req.headers['x-forwarded-for'] || '')
-    .split(',')[0]
-    .trim();
-  return forwarded || req.socket.remoteAddress || 'unknown';
+  const candidates = [
+    req.headers['cf-connecting-ip'],
+    req.headers['x-real-ip'],
+    String(req.headers['x-forwarded-for'] || '').split(',')[0],
+    req.socket.remoteAddress,
+  ];
+  return normalizeClientIp(candidates.find(Boolean));
+}
+
+function isPrivateIp(ip) {
+  const value = String(ip || '').toLowerCase();
+  if (!value || value === 'unknown' || value === '::1' || value === 'localhost') return true;
+  if (/^10\./.test(value) || /^127\./.test(value) || /^192\.168\./.test(value)) return true;
+  const match = value.match(/^172\.(\d+)\./);
+  if (match && Number(match[1]) >= 16 && Number(match[1]) <= 31) return true;
+  return value.startsWith('fc') || value.startsWith('fd') || value.startsWith('fe80:');
+}
+
+function headerLocation(req) {
+  const city = cleanText(req.headers['x-vercel-ip-city'] || req.headers['cf-ipcity'], 80);
+  const region = cleanText(req.headers['x-vercel-ip-country-region'] || req.headers['cf-region'], 80);
+  const country = cleanText(req.headers['x-vercel-ip-country'] || req.headers['cf-ipcountry'], 80);
+  return [country, region, city].filter(Boolean).join(' · ');
+}
+
+async function lookupIpProfile(req, ip) {
+  const fromHeaders = headerLocation(req);
+  if (isPrivateIp(ip)) {
+    return { location: fromHeaders || '本地或内网地址', isp: '' };
+  }
+  const cached = ipGeoCache.get(ip);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  if (!IP_GEO_ENABLED || !IP_GEO_URL_TEMPLATE.includes('{ip}')) {
+    return { location: fromHeaders || '未知位置', isp: '' };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3500);
+  try {
+    const url = IP_GEO_URL_TEMPLATE.replace('{ip}', encodeURIComponent(ip));
+    const response = await fetch(url, {
+      headers: { Accept: 'application/json', 'User-Agent': 'NeonChat/1.0' },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`IP location ${response.status}`);
+    const data = await response.json();
+    if (data?.success === false) throw new Error(data?.message || 'IP location failed');
+    const location = [data?.country, data?.region, data?.city].map((v) => cleanText(v, 80)).filter(Boolean).join(' · ');
+    const value = {
+      location: location || fromHeaders || '未知位置',
+      isp: cleanText(data?.connection?.isp || data?.isp, 120),
+    };
+    ipGeoCache.set(ip, { value, expiresAt: Date.now() + 24 * 3600 * 1000 });
+    return value;
+  } catch (error) {
+    console.warn('IP 位置查询失败：', error.message);
+    return { location: fromHeaders || '未知位置', isp: '' };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function rateLimit(req, res, name, max, windowMs) {
@@ -658,6 +758,21 @@ function conversationBase(row) {
   };
 }
 
+function adminConversationProfile(row) {
+  return {
+    visitorNote: row.visitor_note || '',
+    ipAddress: row.ip_address || '',
+    ipLocation: row.ip_location || '',
+    ipIsp: row.ip_isp || '',
+    deviceType: row.device_type || '',
+    deviceLabel: row.device_label || '',
+    entrySource: row.entry_source || '',
+    userAgent: row.user_agent || '',
+    referrerUrl: row.referrer_url || '',
+    lastVisitedAt: row.last_visited_at ? new Date(row.last_visited_at).toISOString() : null,
+  };
+}
+
 function conversationSummary(row) {
   const result = conversationBase(row);
   result.latestMessage = row.latest_id
@@ -674,6 +789,10 @@ function conversationSummary(row) {
   return result;
 }
 
+function adminConversationSummary(row) {
+  return { ...conversationSummary(row), ...adminConversationProfile(row) };
+}
+
 async function getConfig(client = pool) {
   const result = await client.query(
     `SELECT canned_replies, auto_replies, settings FROM app_config WHERE id = 1`,
@@ -682,7 +801,10 @@ async function getConfig(client = pool) {
   return {
     cannedReplies: result.rows[0].canned_replies || [],
     autoReplies: result.rows[0].auto_replies || [],
-    settings: result.rows[0].settings || {},
+    settings: {
+      ...defaultConfig().settings,
+      ...(result.rows[0].settings || {}),
+    },
   };
 }
 
@@ -721,6 +843,37 @@ async function getPublicConversation(id, client = pool) {
   };
 }
 
+async function getAdminConversation(id, client = pool) {
+  const conversationResult = await client.query(
+    `SELECT * FROM conversations WHERE id = $1`,
+    [id],
+  );
+  const conversation = conversationResult.rows[0];
+  if (!conversation) return null;
+  const messagesResult = await client.query(
+    `
+      SELECT * FROM messages
+      WHERE conversation_id = $1
+      ORDER BY created_at ASC, id ASC
+    `,
+    [id],
+  );
+  return {
+    ...conversationBase(conversation),
+    ...adminConversationProfile(conversation),
+    messages: messagesResult.rows.map(publicMessage),
+  };
+}
+
+function publicUserSettings(settings) {
+  return {
+    siteName: settings?.siteName || '在线客服',
+    announcementEnabled: Boolean(settings?.announcementEnabled),
+    announcementText: cleanText(settings?.announcementText, 2000),
+    retentionHours: RETENTION_HOURS,
+  };
+}
+
 async function markConversationRead(conversationId, readerRole) {
   const senderRole = readerRole === 'admin' ? 'user' : 'admin';
   const unreadColumn = readerRole === 'admin' ? 'unread_admin' : 'unread_user';
@@ -755,7 +908,7 @@ async function markConversationRead(conversationId, readerRole) {
 
 async function touchConversationSeen(conversationId) {
   await pool.query(
-    `UPDATE conversations SET last_seen_at = NOW() WHERE id = $1`,
+    `UPDATE conversations SET last_seen_at = NOW(), last_visited_at = NOW() WHERE id = $1`,
     [conversationId],
   );
 }
@@ -779,7 +932,7 @@ async function getAllSummaries() {
     ) latest ON TRUE
     ORDER BY c.updated_at DESC
   `);
-  return result.rows.map(conversationSummary);
+  return result.rows.map(adminConversationSummary);
 }
 
 function authorizeConversation(payload, conversation) {
@@ -892,6 +1045,14 @@ function validateAdminSettings(body, current) {
       input.userSiteUrl !== undefined
         ? cleanText(input.userSiteUrl, 500)
         : current.settings.userSiteUrl,
+    announcementEnabled:
+      input.announcementEnabled !== undefined
+        ? Boolean(input.announcementEnabled)
+        : Boolean(current.settings.announcementEnabled),
+    announcementText:
+      input.announcementText !== undefined
+        ? cleanText(input.announcementText, 2000)
+        : cleanText(current.settings.announcementText, 2000),
   };
 
   return { cannedReplies, autoReplies, settings };
@@ -905,6 +1066,7 @@ function broadcast(payload, conversationId = null) {
   for (const client of sseClients) {
     if (
       client.kind === 'user' &&
+      conversationId &&
       client.conversationId !== conversationId
     ) {
       continue;
@@ -1277,9 +1439,81 @@ async function router(req, res) {
   }
 
   if (req.method === 'POST' && pathname === '/api/user/session') {
-    if (!rateLimit(req, res, 'new-session', 12, 60_000)) return;
-    const body = await readJson(req, 32 * 1024);
+    if (!rateLimit(req, res, 'user-session', 20, 60_000)) return;
+    const body = await readJson(req, 64 * 1024);
     await cleanupExpiredData();
+
+    const suppliedVisitorKey = cleanText(body.visitorKey, 200);
+    const validSuppliedKey = /^[A-Za-z0-9_-]{20,200}$/.test(suppliedVisitorKey);
+    const visitorKey = validSuppliedKey
+      ? suppliedVisitorKey
+      : randomBytes(24).toString('base64url');
+    const visitorKeyHash = hashVisitorKey(visitorKey);
+    const forceNew = Boolean(body.forceNew);
+    const ipAddress = requestIp(req);
+    const ipProfile = await lookupIpProfile(req, ipAddress);
+    const deviceType = cleanText(body.deviceType, 40);
+    const deviceLabel = cleanText(body.deviceLabel, 120);
+    const entrySource = cleanText(body.entrySource, 40);
+    const userAgent = cleanText(req.headers['user-agent'] || body.userAgent, 500);
+    const referrerUrl = cleanText(body.referrerUrl || req.headers.referer, 500);
+    const config = await getConfig();
+
+    if (validSuppliedKey && !forceNew) {
+      const existingResult = await pool.query(
+        `
+          SELECT * FROM conversations
+          WHERE visitor_key_hash = $1
+          ORDER BY updated_at DESC
+          LIMIT 1
+        `,
+        [visitorKeyHash],
+      );
+      const existing = existingResult.rows[0];
+      if (existing) {
+        await pool.query(
+          `
+            UPDATE conversations
+            SET
+              ip_address = $2,
+              ip_location = $3,
+              ip_isp = $4,
+              device_type = COALESCE(NULLIF($5, ''), device_type),
+              device_label = COALESCE(NULLIF($6, ''), device_label),
+              entry_source = COALESCE(NULLIF($7, ''), entry_source),
+              user_agent = COALESCE(NULLIF($8, ''), user_agent),
+              referrer_url = COALESCE(NULLIF($9, ''), referrer_url),
+              last_seen_at = NOW(),
+              last_visited_at = NOW()
+            WHERE id = $1
+          `,
+          [
+            existing.id,
+            ipAddress,
+            ipProfile.location,
+            ipProfile.isp,
+            deviceType,
+            deviceLabel,
+            entrySource,
+            userAgent,
+            referrerUrl,
+          ],
+        );
+        const conversation = await getPublicConversation(existing.id);
+        return sendJson(res, 200, {
+          ok: true,
+          restored: true,
+          visitorKey,
+          token: signToken({
+            kind: 'user',
+            conversationId: existing.id,
+            visitorKey,
+          }),
+          conversation,
+          settings: publicUserSettings(config.settings),
+        });
+      }
+    }
 
     const countResult = await pool.query(`SELECT COUNT(*)::int AS count FROM conversations`);
     if (countResult.rows[0].count >= MAX_CONVERSATIONS) {
@@ -1291,9 +1525,7 @@ async function router(req, res) {
       );
     }
 
-    const config = await getConfig();
     const conversationId = randomUUID();
-    const visitorKey = randomBytes(24).toString('base64url');
     const visitorName =
       cleanText(body.name, 40) || `访客 ${conversationId.slice(0, 6)}`;
     const client = await pool.connect();
@@ -1303,11 +1535,25 @@ async function router(req, res) {
       await client.query(
         `
           INSERT INTO conversations (
-            id, visitor_key_hash, visitor_name, last_seen_at
+            id, visitor_key_hash, visitor_name, ip_address, ip_location,
+            ip_isp, device_type, device_label, entry_source, user_agent,
+            referrer_url, last_seen_at, last_visited_at
           )
-          VALUES ($1, $2, $3, NOW())
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW())
         `,
-        [conversationId, hashVisitorKey(visitorKey), visitorName],
+        [
+          conversationId,
+          visitorKeyHash,
+          visitorName,
+          ipAddress,
+          ipProfile.location,
+          ipProfile.isp,
+          deviceType,
+          deviceLabel,
+          entrySource,
+          userAgent,
+          referrerUrl,
+        ],
       );
 
       if (config.settings?.welcomeText) {
@@ -1346,6 +1592,7 @@ async function router(req, res) {
           updated_at: conversation.updatedAt,
           unread_admin: conversation.unreadAdmin,
           unread_user: conversation.unreadUser,
+          last_seen_at: conversation.lastSeenAt,
           latest_id: conversation.messages.at(-1)?.id || null,
           latest_type: conversation.messages.at(-1)?.type,
           latest_text: conversation.messages.at(-1)?.text,
@@ -1358,13 +1605,15 @@ async function router(req, res) {
 
     return sendJson(res, 201, {
       ok: true,
+      restored: false,
+      visitorKey,
       token: signToken({
         kind: 'user',
         conversationId,
         visitorKey,
       }),
       conversation,
-      settings: { siteName: config.settings?.siteName || '在线客服' },
+      settings: publicUserSettings(config.settings),
     });
   }
 
@@ -1445,8 +1694,11 @@ async function router(req, res) {
     }
 
     const conversation = await getConversationRow(payload.conversationId);
-    if (!conversation || !authorizeConversation(payload, conversation)) {
-      return sendError(res, 401, '访客会话不存在。', 'AUTH');
+    if (!conversation) {
+      return sendError(res, 401, '访客会话已被删除。', 'CONVERSATION_DELETED');
+    }
+    if (!authorizeConversation(payload, conversation)) {
+      return sendError(res, 401, '访客会话验证失败。', 'AUTH');
     }
 
     await touchConversationSeen(conversation.id);
@@ -1470,7 +1722,7 @@ async function router(req, res) {
       return sendJson(res, 200, {
         ok: true,
         conversation: publicConversation,
-        settings: { siteName: config.settings?.siteName || '在线客服' },
+        settings: publicUserSettings(config.settings),
       });
     }
 
@@ -1542,7 +1794,7 @@ async function router(req, res) {
       const persisted = {
         cannedReplies: saved.rows[0].canned_replies || [],
         autoReplies: saved.rows[0].auto_replies || [],
-        settings: saved.rows[0].settings || {},
+        settings: { ...defaultConfig().settings, ...(saved.rows[0].settings || {}) },
         updatedAt: new Date(saved.rows[0].updated_at).toISOString(),
       };
       broadcast({ type: 'settings-updated', updatedAt: persisted.updatedAt });
@@ -1567,20 +1819,21 @@ async function router(req, res) {
 
       if (req.method === 'GET' && !action) {
         const readCount = await markConversationRead(conversationId, 'admin');
-        const publicConversation = await getPublicConversation(conversationId);
+        const adminConversation = await getAdminConversation(conversationId);
         if (readCount > 0) {
+          const safeConversation = await getPublicConversation(conversationId);
           broadcast(
             {
               type: 'conversation-updated',
               trigger: 'admin-read',
-              conversation: publicConversation,
+              conversation: safeConversation,
             },
             conversationId,
           );
         }
         return sendJson(res, 200, {
           ok: true,
-          conversation: publicConversation,
+          conversation: adminConversation,
         });
       }
 
@@ -1596,24 +1849,29 @@ async function router(req, res) {
           body.visitorName !== undefined
             ? cleanText(body.visitorName, 40) || conversation.visitor_name
             : conversation.visitor_name;
+        const visitorNote =
+          body.visitorNote !== undefined
+            ? cleanText(body.visitorNote, 80)
+            : conversation.visitor_note || '';
 
         await pool.query(
           `
             UPDATE conversations
-            SET status = $2, visitor_name = $3, updated_at = NOW()
+            SET status = $2, visitor_name = $3, visitor_note = $4, updated_at = NOW()
             WHERE id = $1
           `,
-          [conversationId, status, visitorName],
+          [conversationId, status, visitorName, visitorNote],
         );
 
-        const publicConversation = await getPublicConversation(conversationId);
+        const adminConversation = await getAdminConversation(conversationId);
+        const safeConversation = await getPublicConversation(conversationId);
         broadcast(
-          { type: 'conversation-updated', conversation: publicConversation },
+          { type: 'conversation-updated', conversation: safeConversation },
           conversationId,
         );
         return sendJson(res, 200, {
           ok: true,
-          conversation: publicConversation,
+          conversation: adminConversation,
         });
       }
 
