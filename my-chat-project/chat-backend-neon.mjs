@@ -34,6 +34,7 @@
  */
 
 import http from 'node:http';
+import { isIP } from 'node:net';
 import {
   createCipheriv,
   createDecipheriv,
@@ -148,6 +149,7 @@ const ALLOWED_VIDEO_TYPES = new Set([
   'video/webm',
   'video/quicktime',
 ]);
+const DEFAULT_USER_SITE_URL = 'https://zxkf.netlify.app/';
 
 const pool = new Pool({
   connectionString: DATABASE_URL,
@@ -164,6 +166,10 @@ pool.on('error', (error) => {
 // 这里只保存实时连接和限流计数，不保存聊天内容。
 const sseClients = new Set();
 const rateBuckets = new Map();
+const ipGeoCache = new Map();
+const ipGeoPending = new Map();
+const conversationGeoPending = new Set();
+const conversationGeoChecked = new Map();
 let lastCleanupAt = 0;
 let cleanupPromise = null;
 let activeUploads = 0;
@@ -215,7 +221,7 @@ function defaultConfig() {
       defaultAutoReplyEnabled: true,
       defaultAutoReply: '消息已收到，客服看到后会尽快回复。',
       autoReplyCooldownSeconds: 20,
-      userSiteUrl: '',
+      userSiteUrl: DEFAULT_USER_SITE_URL,
     },
   };
 }
@@ -360,6 +366,18 @@ async function initDatabase() {
 
     await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS album_id UUID`);
     await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS album_position SMALLINT NOT NULL DEFAULT 0`);
+    await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ`);
+    await client.query(`
+      UPDATE messages AS m
+      SET read_at = m.created_at
+      FROM conversations AS c
+      WHERE m.conversation_id = c.id
+        AND m.read_at IS NULL
+        AND (
+          (m.role = 'user' AND c.unread_admin = 0)
+          OR (m.role = 'admin' AND c.unread_user = 0)
+        )
+    `);
     await client.query(`
       DO $migration$
       BEGIN
@@ -451,6 +469,7 @@ async function initDatabase() {
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS license_keys_tenant_idx ON license_keys (tenant_id, created_at DESC)`);
     await client.query(`CREATE INDEX IF NOT EXISTS license_keys_created_at_idx ON license_keys (created_at DESC)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS license_keys_suffix_idx ON license_keys (key_suffix)`);
     await client.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS license_keys_telegram_update_unique_idx
       ON license_keys (telegram_update_id)
@@ -459,6 +478,11 @@ async function initDatabase() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS messages_conversation_created_idx
       ON messages (conversation_id, created_at ASC)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS messages_unread_idx
+      ON messages (conversation_id, role, created_at)
+      WHERE read_at IS NULL
     `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS messages_created_at_idx
@@ -489,6 +513,35 @@ async function initDatabase() {
         JSON.stringify(defaults.autoReplies),
         JSON.stringify(defaults.settings),
       ],
+    );
+    await client.query(
+      `
+        UPDATE tenant_config
+        SET settings = jsonb_set(
+              COALESCE(settings, '{}'::jsonb),
+              '{userSiteUrl}',
+              to_jsonb($1::text),
+              true
+            ),
+            updated_at = NOW()
+        WHERE NULLIF(BTRIM(COALESCE(settings->>'userSiteUrl', '')), '') IS NULL
+      `,
+      [DEFAULT_USER_SITE_URL],
+    );
+    await client.query(
+      `
+        UPDATE app_config
+        SET settings = jsonb_set(
+              COALESCE(settings, '{}'::jsonb),
+              '{userSiteUrl}',
+              to_jsonb($1::text),
+              true
+            ),
+            updated_at = NOW()
+        WHERE id = 1
+          AND NULLIF(BTRIM(COALESCE(settings->>'userSiteUrl', '')), '') IS NULL
+      `,
+      [DEFAULT_USER_SITE_URL],
     );
 
     await client.query('COMMIT');
@@ -833,11 +886,207 @@ function safeFilename(value) {
   );
 }
 
+function normalizeIp(value) {
+  let ip = String(value || '').trim();
+  if (ip.startsWith('[') && ip.includes(']')) ip = ip.slice(1, ip.indexOf(']'));
+  if (ip.startsWith('::ffff:')) ip = ip.slice(7);
+  if (/^\d{1,3}(?:\.\d{1,3}){3}:\d+$/.test(ip)) {
+    ip = ip.slice(0, ip.lastIndexOf(':'));
+  }
+  return isIP(ip) ? ip : '';
+}
+
+function isPublicLookupIp(ip) {
+  const version = isIP(ip);
+  if (version === 4) {
+    const [a, b] = ip.split('.').map(Number);
+    return !(
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 198 && (b === 18 || b === 19))
+    );
+  }
+  if (version === 6) {
+    const lower = ip.toLowerCase();
+    return !(
+      lower === '::' ||
+      lower === '::1' ||
+      lower.startsWith('fc') ||
+      lower.startsWith('fd') ||
+      /^fe[89ab]/.test(lower)
+    );
+  }
+  return false;
+}
+
 function requestIp(req) {
   const forwarded = String(req.headers['x-forwarded-for'] || '')
-    .split(',')[0]
-    .trim();
-  return forwarded || req.socket.remoteAddress || 'unknown';
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const candidates = [
+    req.headers['cf-connecting-ip'],
+    req.headers['true-client-ip'],
+    req.headers['x-real-ip'],
+    ...forwarded,
+    req.socket.remoteAddress,
+  ];
+  for (const candidate of candidates) {
+    const ip = normalizeIp(candidate);
+    if (ip) return ip;
+  }
+  return 'unknown';
+}
+
+async function lookupIpGeo(ip) {
+  const normalized = normalizeIp(ip);
+  if (!normalized || !isPublicLookupIp(normalized)) {
+    return { location: '', isp: '' };
+  }
+
+  const cached = ipGeoCache.get(normalized);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  if (ipGeoPending.has(normalized)) return ipGeoPending.get(normalized);
+
+  const pending = (async () => {
+    let value = { location: '', isp: '' };
+    let ttl = 10 * 60 * 1000;
+    try {
+      const url = new URL(`https://ipwho.is/${encodeURIComponent(normalized)}`);
+      url.searchParams.set('lang', 'zh-CN');
+      url.searchParams.set(
+        'fields',
+        'success,country,region,city,connection',
+      );
+      const response = await fetch(url, {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(3000),
+      });
+      const data = response.ok ? await response.json() : null;
+      if (data?.success) {
+        const parts = [
+          cleanText(data.country, 80),
+          cleanText(data.region, 100),
+          cleanText(data.city, 100),
+        ].filter(
+          (item, index, list) =>
+            item &&
+            list.findIndex(
+              (candidate) =>
+                candidate.toLocaleLowerCase() === item.toLocaleLowerCase(),
+            ) === index,
+        );
+        value = {
+          location: cleanText(parts.join(' · '), 250),
+          isp: cleanText(
+            data.connection?.isp || data.connection?.org,
+            180,
+          ),
+        };
+        ttl = 24 * 60 * 60 * 1000;
+      }
+    } catch {}
+
+    if (ipGeoCache.size >= 2000) {
+      ipGeoCache.delete(ipGeoCache.keys().next().value);
+    }
+    ipGeoCache.set(normalized, { value, expiresAt: Date.now() + ttl });
+    return value;
+  })().finally(() => ipGeoPending.delete(normalized));
+
+  ipGeoPending.set(normalized, pending);
+  return pending;
+}
+
+function queueConversationIpGeo(conversationId, tenantId, ip) {
+  const normalized = normalizeIp(ip);
+  if (
+    !isUuid(conversationId) ||
+    !isUuid(tenantId) ||
+    !isPublicLookupIp(normalized)
+  ) return;
+
+  const key = `${tenantId}:${conversationId}:${normalized}`;
+  if (
+    conversationGeoPending.has(key) ||
+    (conversationGeoChecked.get(key) || 0) > Date.now()
+  ) return;
+  if (conversationGeoChecked.size >= 5000) {
+    conversationGeoChecked.delete(conversationGeoChecked.keys().next().value);
+  }
+  conversationGeoChecked.set(key, Date.now() + 10 * 60 * 1000);
+  conversationGeoPending.add(key);
+
+  (async () => {
+    const current = await pool.query(
+      `
+        SELECT ip_address, ip_location, ip_isp
+        FROM conversations
+        WHERE id = $1 AND tenant_id = $2
+      `,
+      [conversationId, tenantId],
+    );
+    const row = current.rows[0];
+    if (
+      !row ||
+      normalizeIp(row.ip_address) !== normalized ||
+      (row.ip_location && row.ip_isp)
+    ) {
+      if (row?.ip_location && row?.ip_isp) {
+        conversationGeoChecked.set(key, Date.now() + 24 * 60 * 60 * 1000);
+      }
+      return;
+    }
+
+    const geo = await lookupIpGeo(normalized);
+    if (!geo.location && !geo.isp) return;
+    if (
+      (row.ip_location || !geo.location) &&
+      (row.ip_isp || !geo.isp)
+    ) return;
+    const updated = await pool.query(
+      `
+        UPDATE conversations
+        SET
+          ip_location = CASE
+            WHEN BTRIM(ip_location) = '' AND $4 <> '' THEN $4
+            ELSE ip_location
+          END,
+          ip_isp = CASE
+            WHEN BTRIM(ip_isp) = '' AND $5 <> '' THEN $5
+            ELSE ip_isp
+          END
+        WHERE id = $1
+          AND tenant_id = $2
+          AND ip_address = $3
+          AND (
+            (BTRIM(ip_location) = '' AND $4 <> '')
+            OR (BTRIM(ip_isp) = '' AND $5 <> '')
+          )
+        RETURNING *
+      `,
+      [conversationId, tenantId, normalized, geo.location, geo.isp],
+    );
+    if (updated.rows[0]) {
+      conversationGeoChecked.set(key, Date.now() + 24 * 60 * 60 * 1000);
+      broadcast(
+        {
+          type: 'summary-updated',
+          conversation: conversationBase(updated.rows[0]),
+        },
+        conversationId,
+        tenantId,
+      );
+    }
+  })()
+    .catch((error) => console.error('IP位置查询失败：', error.message))
+    .finally(() => conversationGeoPending.delete(key));
 }
 
 function rateLimit(req, res, name, max, windowMs, identity = '') {
@@ -924,6 +1173,8 @@ function publicMessage(row) {
     albumId: row.album_id || null,
     albumPosition: Number(row.album_position || 0),
     createdAt: new Date(row.created_at).toISOString(),
+    read: Boolean(row.read_at),
+    readAt: row.read_at ? new Date(row.read_at).toISOString() : null,
   };
 }
 
@@ -1169,6 +1420,23 @@ function validateAdminSettings(body, current) {
       current.settings.autoReplyCooldownSeconds ??
       20,
   );
+  const userSiteUrlInput =
+    input.userSiteUrl !== undefined
+      ? cleanText(input.userSiteUrl, 500)
+      : cleanText(current.settings.userSiteUrl, 500) ||
+        DEFAULT_USER_SITE_URL;
+  let userSiteUrl = DEFAULT_USER_SITE_URL;
+  try {
+    const parsed = new URL(userSiteUrlInput || DEFAULT_USER_SITE_URL);
+    if (parsed.protocol !== 'https:') throw new Error();
+    userSiteUrl = parsed.toString();
+  } catch {
+    throw requestError(
+      '用户端入口必须填写有效的 HTTPS 网址。',
+      400,
+      'USER_SITE_URL',
+    );
+  }
 
   const settings = {
     ...current.settings,
@@ -1195,10 +1463,7 @@ function validateAdminSettings(body, current) {
     autoReplyCooldownSeconds: Number.isFinite(cooldownRaw)
       ? Math.min(3600, Math.max(0, cooldownRaw))
       : 20,
-    userSiteUrl:
-      input.userSiteUrl !== undefined
-        ? cleanText(input.userSiteUrl, 500)
-        : current.settings.userSiteUrl,
+    userSiteUrl,
     announcementEnabled:
       input.announcementEnabled !== undefined
         ? Boolean(input.announcementEnabled)
@@ -1231,6 +1496,48 @@ function broadcast(payload, conversationId = null, tenantId = null) {
       sseClients.delete(client);
     }
   }
+}
+
+async function markConversationRead(conversationId, tenantId, reader) {
+  const senderRole = reader === 'admin' ? 'user' : 'admin';
+  const unreadColumn = reader === 'admin' ? 'unread_admin' : 'unread_user';
+  const result = await pool.query(
+    `
+      WITH cleared AS (
+        UPDATE conversations
+        SET ${unreadColumn} = 0
+        WHERE id = $1 AND tenant_id = $2
+        RETURNING id
+      )
+      UPDATE messages AS m
+      SET read_at = NOW()
+      FROM cleared
+      WHERE m.conversation_id = cleared.id
+        AND m.role = $3
+        AND m.read_at IS NULL
+      RETURNING m.id, m.read_at
+    `,
+    [conversationId, tenantId, senderRole],
+  );
+  const messageIds = result.rows.map((row) => row.id);
+  const readAt = result.rows[0]?.read_at
+    ? new Date(result.rows[0].read_at).toISOString()
+    : null;
+
+  if (messageIds.length) {
+    broadcast(
+      {
+        type: 'messages-read',
+        conversationId,
+        reader,
+        messageIds,
+        readAt,
+      },
+      conversationId,
+      tenantId,
+    );
+  }
+  return { messageIds, readAt };
 }
 
 function disconnectTenant(tenantId, payload) {
@@ -1784,6 +2091,14 @@ async function touchConversation(conversationId, body = {}, req = null, tenantId
   await pool.query(
     `
       UPDATE conversations SET
+        ip_location = CASE
+          WHEN $2 <> '' AND ip_address IS DISTINCT FROM $2 THEN ''
+          ELSE ip_location
+        END,
+        ip_isp = CASE
+          WHEN $2 <> '' AND ip_address IS DISTINCT FROM $2 THEN ''
+          ELSE ip_isp
+        END,
         last_seen_at = NOW(),
         ip_address = CASE WHEN $2 <> '' THEN $2 ELSE ip_address END,
         device_type = CASE WHEN $3 <> '' THEN $3 ELSE device_type END,
@@ -1903,8 +2218,8 @@ async function handleTenantLogin(req, res) {
       tenant = tenantResult.rows[0];
       await createTenantConfig(tenantId, client);
       await client.query(
-        `UPDATE license_keys SET tenant_id=$2,status='active',key_ciphertext=NULL,activated_at=NOW(),expires_at=$3,last_used_at=NOW(),updated_at=NOW() WHERE id=$1`,
-        [license.id, tenantId, expiry.toISOString()],
+        `UPDATE license_keys SET tenant_id=$2,status='active',key_ciphertext=COALESCE(key_ciphertext,$4),activated_at=NOW(),expires_at=$3,last_used_at=NOW(),updated_at=NOW() WHERE id=$1`,
+        [license.id, tenantId, expiry.toISOString(), encryptLicenseKey(key)],
       );
       license = { ...license, tenant_id: tenantId, status: 'active', expires_at: expiry };
     } else {
@@ -1923,7 +2238,10 @@ async function handleTenantLogin(req, res) {
       if (accessIssue === 'TENANT_EXPIRED') {
         const error = new Error('卡密已到期，请购买新卡密续费。'); error.statusCode = 403; error.code = 'TENANT_EXPIRED'; error.expiresAt = new Date(tenant.access_expires_at).toISOString(); throw error;
       }
-      await client.query(`UPDATE license_keys SET last_used_at=NOW(),updated_at=NOW() WHERE id=$1`, [license.id]);
+      await client.query(
+        `UPDATE license_keys SET key_ciphertext=COALESCE(key_ciphertext,$2),last_used_at=NOW(),updated_at=NOW() WHERE id=$1`,
+        [license.id, encryptLicenseKey(key)],
+      );
     }
     await client.query('COMMIT');
   } catch (error) {
@@ -1973,10 +2291,14 @@ async function handleTenantRenew(req, res) {
       [tenant.id, newExpiry.toISOString()],
     );
     tenant = tenantResult.rows[0];
+    await client.query(
+      `UPDATE license_keys SET key_ciphertext=COALESCE(key_ciphertext,$2),updated_at=NOW() WHERE id=$1`,
+      [current.id, encryptLicenseKey(currentKey)],
+    );
     await client.query(`UPDATE license_keys SET status='superseded',updated_at=NOW() WHERE tenant_id=$1 AND status='active'`, [tenant.id]);
     await client.query(
-      `UPDATE license_keys SET tenant_id=$2,status='active',key_ciphertext=NULL,activated_at=NOW(),expires_at=$3,last_used_at=NOW(),updated_at=NOW() WHERE id=$1`,
-      [newLicense.id, tenant.id, newExpiry.toISOString()],
+      `UPDATE license_keys SET tenant_id=$2,status='active',key_ciphertext=COALESCE(key_ciphertext,$4),activated_at=NOW(),expires_at=$3,last_used_at=NOW(),updated_at=NOW() WHERE id=$1`,
+      [newLicense.id, tenant.id, newExpiry.toISOString(), encryptLicenseKey(newKey)],
     );
     await client.query('COMMIT');
   } catch (error) { await client.query('ROLLBACK'); throw error; }
@@ -2107,7 +2429,7 @@ async function sendTelegramChunks(chatId, lines, message = null) {
 async function sendAllLicenses(chatId, message) {
   const result = await pool.query(`
     SELECT
-      key_prefix, key_suffix, duration_code, duration_days, status,
+      key_ciphertext, key_prefix, key_suffix, duration_code, duration_days, status,
       telegram_user_id, telegram_username, telegram_display_name,
       activated_at, expires_at, revoked_at, created_at
     FROM license_keys
@@ -2116,16 +2438,17 @@ async function sendAllLicenses(chatId, message) {
   const rows = result.rows;
   const lines = [
     `📋 当前共有 ${rows.length} 张卡密`,
-    '为保护卡密安全，列表仅显示尾号；完整卡密只在生成时展示。',
+    '⚠️ 以下包含完整卡密，请勿转发到非授权群。',
     '',
   ];
   rows.forEach((row, index) => {
+    const fullKey = decryptLicenseKey(row.key_ciphertext);
     const expiry =
       row.status === 'unused'
         ? `首次登录后 ${row.duration_days} 天`
         : formatTelegramDate(row.expires_at);
     lines.push(
-      `${index + 1}. ${licenseHint(row)} · ${telegramLicenseStatus(row)}`,
+      `${index + 1}. ${fullKey || `${licenseHint(row)}（历史卡密可按尾号禁用）`} · ${telegramLicenseStatus(row)}`,
       `生成者：${telegramLicenseCreator(row)}`,
       `生成：${formatTelegramDate(row.created_at)}｜到期：${expiry}`,
       ...(row.revoked_at
@@ -2180,6 +2503,7 @@ async function processTelegramUpdate(update) {
           '',
           '生成卡密：发送“生成卡密”或 /key',
           '禁用卡密：禁用卡密 VIP-XXXXX-XXXXX-XXXXX-XXXXX',
+          '历史卡密：也可发送“禁用卡密 尾号5位”',
           '查看卡密：发送“查看卡密”或 /licenses',
         ].join('\n'),
         ...telegramThread(message),
@@ -2199,10 +2523,17 @@ async function processTelegramUpdate(update) {
 
     if (revokeMatch) {
       const key = normalizeLicenseKey(revokeMatch[1]);
-      if (!/^VIP-[A-Z2-9]{5}(?:-[A-Z2-9]{5}){3}$/.test(key)) {
+      const hasFullKey = /^VIP-[A-Z2-9]{5}(?:-[A-Z2-9]{5}){3}$/.test(key);
+      const suffix = hasFullKey
+        ? ''
+        : String(revokeMatch[1] || '')
+            .trim()
+            .toUpperCase()
+            .match(/([A-Z2-9]{5})$/)?.[1] || '';
+      if (!hasFullKey && !suffix) {
         await telegramApi('sendMessage', {
           chat_id: chatId,
-          text: '卡密格式不正确，请检查后重试。',
+          text: '卡密格式不正确，请输入完整卡密或卡密尾号5位。',
           ...telegramThread(message),
         });
         return;
@@ -2212,20 +2543,34 @@ async function processTelegramUpdate(update) {
       let revokedTenantId = null;
       try {
         await client.query('BEGIN');
-        const result = await client.query(
-          `SELECT * FROM license_keys WHERE key_hash=$1 FOR UPDATE`,
-          [hashLicenseKey(key)],
-        );
-        const row = result.rows[0];
+        const result = hasFullKey
+          ? await client.query(
+              `SELECT * FROM license_keys WHERE key_hash=$1 FOR UPDATE`,
+              [hashLicenseKey(key)],
+            )
+          : await client.query(
+              `SELECT * FROM license_keys WHERE key_suffix=$1 ORDER BY created_at DESC FOR UPDATE`,
+              [suffix],
+            );
+        const row = result.rows.length === 1 ? result.rows[0] : null;
+        if (!hasFullKey && result.rows.length > 1) {
+          text = '此尾号对应多张卡密，请输入完整卡密以免禁用错误。';
+        }
         if (row) {
+          const displayKey =
+            (hasFullKey ? key : decryptLicenseKey(row.key_ciphertext)) ||
+            licenseHint(row);
           if (row.status === 'revoked') {
-            text = `此卡密已经被禁用：${licenseHint(row)}`;
+            text = `此卡密已经被禁用：${displayKey}`;
           } else {
             await client.query(
               `UPDATE license_keys
-               SET status='revoked',key_ciphertext=NULL,revoked_at=NOW(),updated_at=NOW()
+               SET status='revoked',
+                   key_ciphertext=COALESCE(key_ciphertext,$2),
+                   revoked_at=NOW(),
+                   updated_at=NOW()
                WHERE id=$1`,
-              [row.id],
+              [row.id, hasFullKey ? encryptLicenseKey(key) : null],
             );
             if (row.tenant_id && row.status === 'active') {
               await client.query(
@@ -2236,7 +2581,7 @@ async function processTelegramUpdate(update) {
               );
               revokedTenantId = row.tenant_id;
             }
-            text = `✅ 已禁用卡密：${licenseHint(row)}`;
+            text = `✅ 已禁用卡密：${displayKey}`;
           }
         }
         await client.query('COMMIT');
@@ -2330,6 +2675,19 @@ async function processTelegramUpdate(update) {
       },
       ...telegramThread(callback.message),
     });
+    const selectionMessageId = callback.message?.message_id;
+    if (selectionMessageId) {
+      await telegramApi('deleteMessage', {
+        chat_id: chatId,
+        message_id: selectionMessageId,
+      }).catch(async () => {
+        await telegramApi('editMessageReplyMarkup', {
+          chat_id: chatId,
+          message_id: selectionMessageId,
+          reply_markup: { inline_keyboard: [] },
+        }).catch(() => {});
+      });
+    }
   }
 }
 
@@ -2432,10 +2790,17 @@ async function router(req, res) {
       await touchConversation(conversationId,body,req,tenant.id);
     }
     const conversation=await getPublicConversation(conversationId,pool,tenant.id);
+    queueConversationIpGeo(
+      conversationId,
+      tenant.id,
+      conversation?.ipAddress || requestIp(req),
+    );
     if (created) broadcast({type:'conversation-created',conversation:conversationSummary({
       id:conversation.id,tenant_id:tenant.id,visitor_name:conversation.visitorName,visitor_note:'',status:conversation.status,
       created_at:conversation.createdAt,updated_at:conversation.updatedAt,last_seen_at:conversation.lastSeenAt,
       unread_admin:conversation.unreadAdmin,unread_user:conversation.unreadUser,
+      ip_address:conversation.ipAddress,ip_location:conversation.ipLocation,ip_isp:conversation.ipIsp,
+      device_type:conversation.deviceType,device_label:conversation.deviceLabel,entry_source:conversation.entrySource,
       latest_id:conversation.messages.at(-1)?.id||null,latest_type:conversation.messages.at(-1)?.type,
       latest_text:conversation.messages.at(-1)?.text,latest_role:conversation.messages.at(-1)?.role,
       latest_created_at:conversation.messages.at(-1)?.createdAt,
@@ -2483,6 +2848,11 @@ async function router(req, res) {
       const conversation = await getConversationRow(payload.conversationId, pool, false, payload.tenantId);
       if (!conversation || !authorizeConversation(payload, conversation)) return sendError(res,401,'会话已失效。','AUTH');
       await touchConversation(conversation.id,{},req,payload.tenantId);
+      queueConversationIpGeo(
+        conversation.id,
+        payload.tenantId,
+        requestIp(req),
+      );
     }
     const connectionIdentity =
       payload.kind === 'tenant_admin'
@@ -2551,12 +2921,13 @@ async function router(req, res) {
     const conversation = await getConversationRow(payload.conversationId, pool, false, payload.tenantId);
     if (!conversation || !authorizeConversation(payload, conversation)) return sendError(res,401,'访客会话不存在。','AUTH');
     await touchConversation(conversation.id,{},req,payload.tenantId);
+    queueConversationIpGeo(
+      conversation.id,
+      payload.tenantId,
+      requestIp(req),
+    );
 
     if (req.method === 'GET' && pathname === '/api/user/conversation') {
-      await pool.query(
-        `UPDATE conversations SET unread_user = 0 WHERE id = $1 AND tenant_id = $2`,
-        [conversation.id, payload.tenantId],
-      );
       const [publicConversation, config] = await Promise.all([
         getPublicConversation(conversation.id, pool, payload.tenantId),
         getConfig(payload.tenantId),
@@ -2566,6 +2937,15 @@ async function router(req, res) {
         conversation: publicConversation,
         settings: config.settings,
       });
+    }
+
+    if (req.method === 'POST' && pathname === '/api/user/read') {
+      const receipt = await markConversationRead(
+        conversation.id,
+        payload.tenantId,
+        'user',
+      );
+      return sendJson(res, 200, { ok: true, ...receipt });
     }
 
     if (req.method === 'POST' && pathname === '/api/user/uploads') {
@@ -2687,7 +3067,7 @@ async function router(req, res) {
     }
 
     const match = pathname.match(
-      /^\/api\/admin\/conversations\/([^/]+)(?:\/(messages|uploads))?$/,
+      /^\/api\/admin\/conversations\/([^/]+)(?:\/(messages|uploads|read))?$/,
     );
 
     if (match) {
@@ -2703,9 +3083,10 @@ async function router(req, res) {
       }
 
       if (req.method === 'GET' && !action) {
-        await pool.query(
-          `UPDATE conversations SET unread_admin = 0 WHERE id = $1 AND tenant_id = $2`,
-          [conversationId, payload.tenantId],
+        await markConversationRead(
+          conversationId,
+          payload.tenantId,
+          'admin',
         );
         const publicConversation = await getPublicConversation(conversationId, pool, payload.tenantId);
         broadcast(
@@ -2738,6 +3119,15 @@ async function router(req, res) {
           ok: true,
           conversation: publicConversation,
         });
+      }
+
+      if (req.method === 'POST' && action === 'read') {
+        const receipt = await markConversationRead(
+          conversationId,
+          payload.tenantId,
+          'admin',
+        );
+        return sendJson(res, 200, { ok: true, ...receipt });
       }
 
       if (req.method === 'PATCH' && !action) {
