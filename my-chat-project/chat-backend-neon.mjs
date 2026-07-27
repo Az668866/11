@@ -6,17 +6,18 @@
  *   - 会话、消息、图片、快捷语、自动回复和设置全部存入 Neon PostgreSQL
  *   - 不创建本地数据目录，不读写 Render 磁盘
  *   - JavaScript 全局变量不保存聊天记录；仅保留 SSE 连接和限流计数等瞬时运行状态
- *   - 消息和图片最多保留 24 小时
+ *   - 消息、图片和视频最多保留 24 小时
  *
  * 必填环境变量：
  *   DATABASE_URL     Neon 的 pooled PostgreSQL 连接串
  *   ALLOWED_ORIGINS  用户端和客户后台域名，英文逗号分隔
  *   TOKEN_SECRET     至少32个字符的随机密钥
  *
- * Telegram 私聊发卡（启用时三项都必须设置）：
+ * Telegram 发卡（启用时必须设置）：
  *   TELEGRAM_BOT_TOKEN
  *   TELEGRAM_WEBHOOK_SECRET
- *   TELEGRAM_ALLOWED_PRIVATE_USER_IDS 允许私聊发卡的 Telegram 数字用户 ID，英文逗号分隔
+ *   TELEGRAM_ALLOWED_USER_IDS 允许操作机器人的 Telegram 数字用户 ID，英文逗号分隔
+ *   TELEGRAM_ALLOWED_GROUP_IDS 允许使用机器人的群组/超级群数字 ID，英文逗号分隔
  *
  * 可选环境变量：
  *   PORT=10000
@@ -24,12 +25,19 @@
  *   CHAT_RETENTION_HOURS=24（强制不超过24小时）
  *   TOKEN_TTL_HOURS=24
  *   MAX_IMAGE_MB=8
+ *   MAX_VIDEO_MB=25
+ *   MAX_CONCURRENT_UPLOADS=4
  *   MAX_CONVERSATIONS=1000
+ *   MAX_MESSAGES_PER_CONVERSATION=500
+ *   MAX_SSE_CONNECTIONS=500
  *   DB_POOL_MAX=5
  */
 
 import http from 'node:http';
 import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
   createHmac,
   randomBytes,
   randomUUID,
@@ -45,30 +53,54 @@ const DATABASE_URL = String(process.env.DATABASE_URL || '').trim();
 const TOKEN_SECRET_TEXT = process.env.TOKEN_SECRET || '';
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_WEBHOOK_SECRET = String(process.env.TELEGRAM_WEBHOOK_SECRET || '').trim();
-const TELEGRAM_ALLOWED_PRIVATE_USER_IDS = new Set(
-  String(process.env.TELEGRAM_ALLOWED_PRIVATE_USER_IDS || '')
+const TELEGRAM_ALLOWED_USER_IDS = new Set(
+  [
+    process.env.TELEGRAM_ALLOWED_USER_IDS,
+    process.env.TELEGRAM_ALLOWED_PRIVATE_USER_IDS,
+  ]
+    .filter(Boolean)
+    .join(',')
     .split(',')
     .map((item) => item.trim())
     .filter((item) => /^\d+$/.test(item)),
 );
+const TELEGRAM_ALLOWED_GROUP_IDS = new Set(
+  String(process.env.TELEGRAM_ALLOWED_GROUP_IDS || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => /^-?\d+$/.test(item)),
+);
 const TELEGRAM_ENABLED = Boolean(TELEGRAM_BOT_TOKEN);
+function envNumber(name, fallback, min, max) {
+  const parsed = Number(process.env[name] ?? fallback);
+  return Number.isFinite(parsed)
+    ? Math.min(max, Math.max(min, parsed))
+    : fallback;
+}
 const MAX_IMAGE_BYTES =
-  Math.max(1, Number(process.env.MAX_IMAGE_MB || 8)) * 1024 * 1024;
-const MAX_CONVERSATIONS = Math.max(
-  10,
-  Number(process.env.MAX_CONVERSATIONS || 1000),
+  envNumber('MAX_IMAGE_MB', 8, 1, 16) * 1024 * 1024;
+const MAX_VIDEO_BYTES =
+  envNumber('MAX_VIDEO_MB', 25, 1, 50) * 1024 * 1024;
+const MAX_ALBUM_IMAGES = 9;
+const MAX_CONCURRENT_UPLOADS = Math.trunc(
+  envNumber('MAX_CONCURRENT_UPLOADS', 4, 1, 8),
 );
-const RETENTION_HOURS = Math.min(
-  24,
-  Math.max(1, Number(process.env.CHAT_RETENTION_HOURS || 24)),
+const MAX_CONVERSATIONS = Math.trunc(
+  envNumber('MAX_CONVERSATIONS', 1000, 10, 10_000),
 );
+const MAX_MESSAGES_PER_CONVERSATION = Math.trunc(
+  envNumber('MAX_MESSAGES_PER_CONVERSATION', 500, 100, 5000),
+);
+const MAX_SSE_CONNECTIONS = Math.trunc(
+  envNumber('MAX_SSE_CONNECTIONS', 500, 50, 2000),
+);
+const RETENTION_HOURS = envNumber('CHAT_RETENTION_HOURS', 24, 1, 24);
 const TOKEN_TTL_SECONDS = Math.min(
   RETENTION_HOURS * 3600,
-  Math.max(1, Number(process.env.TOKEN_TTL_HOURS || 24)) * 3600,
+  envNumber('TOKEN_TTL_HOURS', 24, 1, 24) * 3600,
 );
-const DB_POOL_MAX = Math.min(
-  20,
-  Math.max(1, Number(process.env.DB_POOL_MAX || 5)),
+const DB_POOL_MAX = Math.trunc(
+  envNumber('DB_POOL_MAX', 5, 1, 20),
 );
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
@@ -94,19 +126,27 @@ if (TELEGRAM_ENABLED) {
   if (!/^[A-Za-z0-9_-]{16,256}$/.test(TELEGRAM_WEBHOOK_SECRET)) {
     throw new Error('TELEGRAM_WEBHOOK_SECRET 必须为16-256位字母、数字、下划线或短横线。');
   }
-  if (!TELEGRAM_ALLOWED_PRIVATE_USER_IDS.size) {
+  if (!TELEGRAM_ALLOWED_USER_IDS.size) {
     throw new Error(
-      '启用 Telegram 时必须设置 TELEGRAM_ALLOWED_PRIVATE_USER_IDS 私聊操作员白名单。',
+      '启用 Telegram 时必须设置 TELEGRAM_ALLOWED_USER_IDS 操作员白名单（旧变量 TELEGRAM_ALLOWED_PRIVATE_USER_IDS 仍兼容）。',
     );
   }
 }
 
 const TOKEN_SECRET = Buffer.from(TOKEN_SECRET_TEXT, 'utf8');
+const LICENSE_ENCRYPTION_KEY = createHash('sha256')
+  .update(TOKEN_SECRET)
+  .digest();
 const ALLOWED_IMAGE_TYPES = new Set([
   'image/jpeg',
   'image/png',
   'image/webp',
   'image/gif',
+]);
+const ALLOWED_VIDEO_TYPES = new Set([
+  'video/mp4',
+  'video/webm',
+  'video/quicktime',
 ]);
 
 const pool = new Pool({
@@ -126,6 +166,7 @@ const sseClients = new Set();
 const rateBuckets = new Map();
 let lastCleanupAt = 0;
 let cleanupPromise = null;
+let activeUploads = 0;
 
 function nowIso() {
   return new Date().toISOString();
@@ -169,7 +210,7 @@ function defaultConfig() {
     ],
     settings: {
       siteName: '在线客服',
-      welcomeText: '您好，欢迎咨询。您可以发送文字或图片，我们会尽快回复。',
+      welcomeText: '您好，欢迎咨询。您可以发送文字、图片或视频，我们会尽快回复。',
       autoReplyEnabled: true,
       defaultAutoReplyEnabled: true,
       defaultAutoReply: '消息已收到，客服看到后会尽快回复。',
@@ -212,6 +253,7 @@ async function initDatabase() {
         id UUID PRIMARY KEY,
         tenant_id UUID REFERENCES tenants(id) ON DELETE SET NULL,
         key_hash TEXT NOT NULL UNIQUE,
+        key_ciphertext TEXT,
         key_prefix TEXT NOT NULL,
         key_suffix TEXT NOT NULL,
         duration_code TEXT NOT NULL CHECK (duration_code IN ('1d','7d','30d','180d','365d')),
@@ -219,8 +261,12 @@ async function initDatabase() {
         status TEXT NOT NULL DEFAULT 'unused' CHECK (status IN ('unused','active','superseded','revoked')),
         telegram_chat_id TEXT,
         telegram_user_id TEXT,
+        telegram_username TEXT,
+        telegram_display_name TEXT,
+        telegram_update_id BIGINT,
         activated_at TIMESTAMPTZ,
         expires_at TIMESTAMPTZ,
+        revoked_at TIMESTAMPTZ,
         last_used_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -269,13 +315,21 @@ async function initDatabase() {
     await client.query(`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS user_agent TEXT NOT NULL DEFAULT ''`);
     await client.query(`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS referrer_url TEXT NOT NULL DEFAULT ''`);
     await client.query(`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ`);
+    await client.query(`ALTER TABLE license_keys ADD COLUMN IF NOT EXISTS telegram_username TEXT`);
+    await client.query(`ALTER TABLE license_keys ADD COLUMN IF NOT EXISTS telegram_display_name TEXT`);
+    await client.query(`ALTER TABLE license_keys ADD COLUMN IF NOT EXISTS key_ciphertext TEXT`);
+    await client.query(`ALTER TABLE license_keys ADD COLUMN IF NOT EXISTS telegram_update_id BIGINT`);
+    await client.query(`ALTER TABLE license_keys ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ`);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS attachments (
         id UUID PRIMARY KEY,
         conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
         filename TEXT NOT NULL,
-        mime TEXT NOT NULL CHECK (mime IN ('image/jpeg','image/png','image/webp','image/gif')),
+        mime TEXT NOT NULL CHECK (mime IN (
+          'image/jpeg','image/png','image/webp','image/gif',
+          'video/mp4','video/webm','video/quicktime'
+        )),
         size INTEGER NOT NULL CHECK (size > 0),
         uploader TEXT NOT NULL CHECK (uploader IN ('user','admin')),
         data BYTEA NOT NULL,
@@ -290,16 +344,96 @@ async function initDatabase() {
         conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
         role TEXT NOT NULL CHECK (role IN ('user','admin')),
         source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual','auto')),
-        type TEXT NOT NULL CHECK (type IN ('text','image')),
+        type TEXT NOT NULL CHECK (type IN ('text','image','video')),
         text TEXT NOT NULL DEFAULT '',
         attachment_id UUID UNIQUE REFERENCES attachments(id) ON DELETE CASCADE,
+        album_id UUID,
+        album_position SMALLINT NOT NULL DEFAULT 0 CHECK (album_position BETWEEN 0 AND 9),
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         CHECK (
           (type = 'text' AND attachment_id IS NULL AND length(text) > 0)
           OR
-          (type = 'image' AND attachment_id IS NOT NULL)
+          (type IN ('image','video') AND attachment_id IS NOT NULL)
         )
       )
+    `);
+
+    await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS album_id UUID`);
+    await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS album_position SMALLINT NOT NULL DEFAULT 0`);
+    await client.query(`
+      DO $migration$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conrelid = 'license_keys'::regclass
+            AND conname = 'license_keys_status_check'
+            AND pg_get_constraintdef(oid) LIKE '%revoked%'
+        ) THEN
+          ALTER TABLE license_keys
+            DROP CONSTRAINT IF EXISTS license_keys_status_check;
+          ALTER TABLE license_keys
+            ADD CONSTRAINT license_keys_status_check
+            CHECK (status IN ('unused','active','superseded','revoked'));
+        END IF;
+
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conrelid = 'attachments'::regclass
+            AND conname = 'attachments_mime_check'
+            AND pg_get_constraintdef(oid) LIKE '%video/mp4%'
+        ) THEN
+          ALTER TABLE attachments
+            DROP CONSTRAINT IF EXISTS attachments_mime_check;
+          ALTER TABLE attachments
+            ADD CONSTRAINT attachments_mime_check CHECK (mime IN (
+              'image/jpeg','image/png','image/webp','image/gif',
+              'video/mp4','video/webm','video/quicktime'
+            ));
+        END IF;
+
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conrelid = 'messages'::regclass
+            AND conname = 'messages_type_check'
+            AND pg_get_constraintdef(oid) LIKE '%video%'
+        ) THEN
+          ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_type_check;
+          ALTER TABLE messages
+            ADD CONSTRAINT messages_type_check
+            CHECK (type IN ('text','image','video'));
+        END IF;
+
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conrelid = 'messages'::regclass
+            AND conname = 'messages_check'
+            AND pg_get_constraintdef(oid) LIKE '%video%'
+        ) THEN
+          ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_check;
+          ALTER TABLE messages
+            ADD CONSTRAINT messages_check CHECK (
+              (type = 'text' AND attachment_id IS NULL AND length(text) > 0)
+              OR
+              (type IN ('image','video') AND attachment_id IS NOT NULL)
+            );
+        END IF;
+
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conrelid = 'messages'::regclass
+            AND conname = 'messages_album_position_check'
+        ) THEN
+          ALTER TABLE messages
+            ADD CONSTRAINT messages_album_position_check
+            CHECK (album_position BETWEEN 0 AND 9);
+        END IF;
+      END
+      $migration$
     `);
 
     await client.query(`
@@ -316,6 +450,12 @@ async function initDatabase() {
       WHERE tenant_id IS NOT NULL
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS license_keys_tenant_idx ON license_keys (tenant_id, created_at DESC)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS license_keys_created_at_idx ON license_keys (created_at DESC)`);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS license_keys_telegram_update_unique_idx
+      ON license_keys (telegram_update_id)
+      WHERE telegram_update_id IS NOT NULL
+    `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS messages_conversation_created_idx
       ON messages (conversation_id, created_at ASC)
@@ -323,6 +463,11 @@ async function initDatabase() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS messages_created_at_idx
       ON messages (created_at)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS messages_conversation_album_idx
+      ON messages (conversation_id, album_id)
+      WHERE album_id IS NOT NULL
     `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS attachments_created_at_idx
@@ -453,7 +598,7 @@ function signTokenUntil(payload, expiresAt) {
   const target = Math.floor(new Date(expiresAt).getTime() / 1000);
   const now = Math.floor(Date.now() / 1000);
   if (!Number.isFinite(target) || target <= now) return '';
-  return signToken(payload, target - now);
+  return signToken(payload, Math.min(target - now, TOKEN_TTL_SECONDS));
 }
 
 function verifyToken(token) {
@@ -496,12 +641,51 @@ function hashVisitorKey(visitorKey) {
 }
 
 function normalizeLicenseKey(value) {
-  return String(value || '').trim().toUpperCase().replace(/[\s_]+/g, '-').replace(/-+/g, '-');
+  const source = String(value || '').trim().toUpperCase();
+  const embedded = source.match(
+    /(?:^|[^A-Z0-9])(VIP(?:[\s_-]*[A-Z2-9]{5}){4})(?=$|[^A-Z0-9])/,
+  )?.[1];
+  if (embedded) {
+    const raw = embedded.replace(/[^A-Z2-9]/g, '').slice(3);
+    return `VIP-${raw.match(/.{5}/g).join('-')}`;
+  }
+  return source.replace(/[\s_]+/g, '-').replace(/-+/g, '-');
 }
 function hashLicenseKey(value) {
   return createHmac('sha256', TOKEN_SECRET)
     .update(`license:${normalizeLicenseKey(value)}`)
     .digest('base64url');
+}
+function encryptLicenseKey(value) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', LICENSE_ENCRYPTION_KEY, iv);
+  const encrypted = Buffer.concat([
+    cipher.update(String(value), 'utf8'),
+    cipher.final(),
+  ]);
+  return [
+    iv.toString('base64url'),
+    cipher.getAuthTag().toString('base64url'),
+    encrypted.toString('base64url'),
+  ].join('.');
+}
+function decryptLicenseKey(value) {
+  try {
+    const [iv, tag, encrypted, extra] = String(value || '').split('.');
+    if (!iv || !tag || !encrypted || extra) return '';
+    const decipher = createDecipheriv(
+      'aes-256-gcm',
+      LICENSE_ENCRYPTION_KEY,
+      Buffer.from(iv, 'base64url'),
+    );
+    decipher.setAuthTag(Buffer.from(tag, 'base64url'));
+    return Buffer.concat([
+      decipher.update(Buffer.from(encrypted, 'base64url')),
+      decipher.final(),
+    ]).toString('utf8');
+  } catch {
+    return '';
+  }
 }
 const LICENSE_DURATIONS = Object.freeze({
   '1d': { label: '一日卡', days: 1 },
@@ -521,7 +705,9 @@ function generateTenantCode() {
   return `site_${randomBytes(12).toString('base64url')}`;
 }
 function licenseHint(row) {
-  return row ? `${row.key_prefix || 'VIP'}-••••-••••-${row.key_suffix || '????'}` : '';
+  return row
+    ? `${row.key_prefix || 'VIP'}-•••••-•••••-•••••-${row.key_suffix || '?????'}`
+    : '';
 }
 
 
@@ -654,8 +840,8 @@ function requestIp(req) {
   return forwarded || req.socket.remoteAddress || 'unknown';
 }
 
-function rateLimit(req, res, name, max, windowMs) {
-  const key = `${name}:${requestIp(req)}`;
+function rateLimit(req, res, name, max, windowMs, identity = '') {
+  const key = `${name}:${identity || requestIp(req)}`;
   const now = Date.now();
   const current = rateBuckets.get(key);
 
@@ -684,7 +870,7 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000).unref();
 
-function imageContentMatchesMime(data, mime) {
+function mediaContentMatchesMime(data, mime) {
   if (!Buffer.isBuffer(data)) return false;
 
   if (mime === 'image/jpeg') {
@@ -713,6 +899,17 @@ function imageContentMatchesMime(data, mime) {
     );
   }
 
+  if (mime === 'video/webm') {
+    return (
+      data.length >= 4 &&
+      data.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]))
+    );
+  }
+
+  if (mime === 'video/mp4' || mime === 'video/quicktime') {
+    return data.length >= 12 && data.subarray(4, 8).toString('ascii') === 'ftyp';
+  }
+
   return false;
 }
 
@@ -724,6 +921,8 @@ function publicMessage(row) {
     type: row.type,
     text: row.text || '',
     attachmentId: row.attachment_id || null,
+    albumId: row.album_id || null,
+    albumPosition: Number(row.album_position || 0),
     createdAt: new Date(row.created_at).toISOString(),
   };
 }
@@ -771,7 +970,9 @@ function conversationSummary(row) {
         text:
           row.latest_type === 'image'
             ? row.latest_text || '[图片]'
-            : row.latest_text || '',
+            : row.latest_type === 'video'
+              ? row.latest_text || '[视频]'
+              : row.latest_text || '',
         role: row.latest_role,
         createdAt: new Date(row.latest_created_at).toISOString(),
       }
@@ -808,11 +1009,12 @@ async function getConfig(tenantId, client = pool) {
   };
 }
 
-async function getConversationRow(id, client = pool, forUpdate = false, tenantId = null) {
+async function getConversationRow(id, client = pool, forUpdate = false, tenantId) {
+  if (!isUuid(id) || !isUuid(tenantId)) return null;
   const result = await client.query(
     `
       SELECT * FROM conversations
-      WHERE id = $1 AND ($2::uuid IS NULL OR tenant_id = $2)
+      WHERE id = $1 AND tenant_id = $2
       ${forUpdate ? 'FOR UPDATE' : ''}
     `,
     [id, tenantId],
@@ -820,9 +1022,10 @@ async function getConversationRow(id, client = pool, forUpdate = false, tenantId
   return result.rows[0] || null;
 }
 
-async function getPublicConversation(id, client = pool, tenantId = null) {
+async function getPublicConversation(id, client = pool, tenantId) {
+  if (!isUuid(id) || !isUuid(tenantId)) return null;
   const conversationResult = await client.query(
-    `SELECT * FROM conversations WHERE id = $1 AND ($2::uuid IS NULL OR tenant_id = $2)`,
+    `SELECT * FROM conversations WHERE id = $1 AND tenant_id = $2`,
     [id, tenantId],
   );
   const conversation = conversationResult.rows[0];
@@ -830,11 +1033,28 @@ async function getPublicConversation(id, client = pool, tenantId = null) {
 
   const messagesResult = await client.query(
     `
-      SELECT * FROM messages
-      WHERE conversation_id = $1
-      ORDER BY created_at ASC, id ASC
+      WITH recent AS (
+        SELECT *
+        FROM messages
+        WHERE conversation_id = $1
+        ORDER BY created_at DESC, id DESC
+        LIMIT $2
+      ),
+      recent_albums AS (
+        SELECT DISTINCT album_id
+        FROM recent
+        WHERE album_id IS NOT NULL
+      )
+      SELECT m.*
+      FROM messages m
+      WHERE m.conversation_id = $1
+        AND (
+          m.id IN (SELECT id FROM recent)
+          OR m.album_id IN (SELECT album_id FROM recent_albums)
+        )
+      ORDER BY created_at ASC, album_position ASC, id ASC
     `,
-    [id],
+    [id, MAX_MESSAGES_PER_CONVERSATION],
   );
 
   return {
@@ -997,11 +1217,64 @@ function sendSse(res, payload) {
 }
 
 function broadcast(payload, conversationId = null, tenantId = null) {
+  if (!isUuid(tenantId)) return;
   for (const client of sseClients) {
-    if (client.kind === 'user' && client.conversationId !== conversationId) continue;
-    if (client.kind === 'tenant_admin' && tenantId && client.tenantId !== tenantId) continue;
+    if (client.tenantId !== tenantId) continue;
+    if (
+      conversationId &&
+      client.kind === 'user' &&
+      client.conversationId !== conversationId
+    ) continue;
     try {
       sendSse(client.res, payload);
+    } catch {
+      sseClients.delete(client);
+    }
+  }
+}
+
+function disconnectTenant(tenantId, payload) {
+  if (!tenantId) return;
+  for (const client of sseClients) {
+    if (client.tenantId !== tenantId) continue;
+    try {
+      sendSse(client.res, payload);
+      client.res.end();
+    } catch {}
+    sseClients.delete(client);
+  }
+}
+
+function updateTenantConnectionsAfterRenewal(
+  tenantId,
+  accessExpiresAt,
+  activeLicenseId,
+) {
+  const expiry = new Date(accessExpiresAt).getTime();
+  for (const client of sseClients) {
+    if (client.tenantId !== tenantId) continue;
+    if (
+      client.kind === 'tenant_admin' &&
+      client.licenseId !== activeLicenseId
+    ) {
+      try {
+        sendSse(client.res, {
+          type: 'license-replaced',
+          licenseId: client.licenseId,
+          at: nowIso(),
+        });
+        client.res.end();
+      } catch {}
+      sseClients.delete(client);
+      continue;
+    }
+    client.accessExpiresAt = expiry;
+    try {
+      sendSse(client.res, {
+        type: 'tenant-renewed',
+        accessExpiresAt: new Date(accessExpiresAt).toISOString(),
+        at: nowIso(),
+      });
     } catch {
       sseClients.delete(client);
     }
@@ -1029,39 +1302,52 @@ async function handleUpload(req, res, payload, conversation) {
     return sendError(res, 409, '此会话已结束。', 'CLOSED');
   }
 
-  if (!rateLimit(req, res, 'upload', 12, 60_000)) return;
+  const rateIdentity = `${payload.kind}:${payload.tenantId}:${conversation.id}`;
+  if (!rateLimit(req, res, 'upload', 30, 60_000, rateIdentity)) return;
 
   const mime = String(req.headers['content-type'] || '')
     .split(';')[0]
     .trim()
     .toLowerCase();
+  const isImage = ALLOWED_IMAGE_TYPES.has(mime);
+  const isVideo = ALLOWED_VIDEO_TYPES.has(mime);
 
-  if (!ALLOWED_IMAGE_TYPES.has(mime)) {
+  if (!isImage && !isVideo) {
     return sendError(
       res,
       415,
-      '仅支持 JPG、PNG、WEBP、GIF 图片。',
-      'IMAGE_TYPE',
+      '仅支持 JPG、PNG、WEBP、GIF 图片，以及 MP4、WEBM、MOV 视频。',
+      'MEDIA_TYPE',
     );
   }
 
-  const data = await readBody(req, MAX_IMAGE_BYTES);
+  const maxBytes = isVideo ? MAX_VIDEO_BYTES : MAX_IMAGE_BYTES;
+  if (activeUploads >= MAX_CONCURRENT_UPLOADS) {
+    return sendError(res, 503, '当前上传较多，请稍后重试。', 'UPLOAD_BUSY');
+  }
+  activeUploads += 1;
+  let data;
+  try {
+    data = await readBody(req, maxBytes);
+  } finally {
+    activeUploads -= 1;
+  }
   if (!data.length) {
-    return sendError(res, 400, '图片内容为空。', 'EMPTY_IMAGE');
+    return sendError(res, 400, '媒体内容为空。', 'EMPTY_MEDIA');
   }
 
-  if (!imageContentMatchesMime(data, mime)) {
+  if (!mediaContentMatchesMime(data, mime)) {
     return sendError(
       res,
       415,
-      '图片内容与文件类型不匹配。',
-      'IMAGE_SIGNATURE',
+      '媒体内容与文件类型不匹配。',
+      'MEDIA_SIGNATURE',
     );
   }
 
   const attachmentId = randomUUID();
   const filename = safeFilename(
-    req.headers['x-file-name'] || `image-${attachmentId}`,
+    req.headers['x-file-name'] || `${isVideo ? 'video' : 'image'}-${attachmentId}`,
   );
 
   const result = await pool.query(
@@ -1086,7 +1372,134 @@ async function handleUpload(req, res, payload, conversation) {
   return sendJson(res, 201, {
     ok: true,
     attachment: publicAttachment(result.rows[0]),
+    mediaType: isVideo ? 'video' : 'image',
   });
+}
+
+function requestError(message, statusCode, code) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.code = code;
+  return error;
+}
+
+function parseMessageInput(body = {}) {
+  const requestedType = cleanText(body.type, 20) || 'text';
+  if (!['text', 'image', 'video'].includes(requestedType)) {
+    throw requestError('消息类型无效。', 400, 'INVALID_MESSAGE_TYPE');
+  }
+
+  const text = cleanText(body.text, 4000);
+  if (requestedType === 'text') {
+    if (!text) throw requestError('消息不能为空。', 400, 'EMPTY_MESSAGE');
+    return { type: 'text', text, attachmentIds: [] };
+  }
+
+  const inputIds = Array.isArray(body.attachmentIds)
+    ? body.attachmentIds
+    : [body.attachmentId];
+  const attachmentIds = inputIds
+    .map((value) => cleanText(value, 80))
+    .filter(Boolean);
+
+  if (
+    !attachmentIds.length ||
+    attachmentIds.some((id) => !isUuid(id)) ||
+    new Set(attachmentIds).size !== attachmentIds.length
+  ) {
+    throw requestError('媒体附件无效。', 400, 'INVALID_ATTACHMENT');
+  }
+  if (requestedType === 'image' && attachmentIds.length > MAX_ALBUM_IMAGES) {
+    throw requestError(
+      `一次最多发送 ${MAX_ALBUM_IMAGES} 张图片。`,
+      400,
+      'ALBUM_LIMIT',
+    );
+  }
+  if (requestedType === 'video' && attachmentIds.length !== 1) {
+    throw requestError('一次只能发送一个视频。', 400, 'VIDEO_LIMIT');
+  }
+
+  return { type: requestedType, text, attachmentIds };
+}
+
+async function lockPendingAttachments(
+  client,
+  conversationId,
+  uploader,
+  type,
+  attachmentIds,
+) {
+  const result = await client.query(
+    `
+      SELECT id, mime
+      FROM attachments
+      WHERE id = ANY($1::uuid[])
+        AND conversation_id = $2
+        AND uploader = $3
+        AND linked_at IS NULL
+      FOR UPDATE
+    `,
+    [attachmentIds, conversationId, uploader],
+  );
+  if (result.rows.length !== attachmentIds.length) {
+    throw requestError(
+      '媒体附件无效、已使用或不属于当前会话。',
+      400,
+      'INVALID_ATTACHMENT',
+    );
+  }
+  const byId = new Map(result.rows.map((row) => [row.id, row]));
+  const valid = attachmentIds.every((id) => {
+    const mime = byId.get(id)?.mime;
+    return type === 'image'
+      ? ALLOWED_IMAGE_TYPES.has(mime)
+      : ALLOWED_VIDEO_TYPES.has(mime);
+  });
+  if (!valid) {
+    throw requestError('媒体附件类型不匹配。', 400, 'INVALID_ATTACHMENT_TYPE');
+  }
+}
+
+async function insertMediaMessages(
+  client,
+  conversationId,
+  role,
+  type,
+  text,
+  attachmentIds,
+) {
+  const albumId =
+    type === 'image' && attachmentIds.length > 1 ? randomUUID() : null;
+  const rows = [];
+  for (let index = 0; index < attachmentIds.length; index += 1) {
+    const result = await client.query(
+      `
+        INSERT INTO messages (
+          id, conversation_id, role, source, type, text, attachment_id,
+          album_id, album_position
+        )
+        VALUES ($1, $2, $3, 'manual', $4, $5, $6, $7, $8)
+        RETURNING *
+      `,
+      [
+        randomUUID(),
+        conversationId,
+        role,
+        type,
+        index === 0 ? text : '',
+        attachmentIds[index],
+        albumId,
+        index,
+      ],
+    );
+    rows.push(result.rows[0]);
+  }
+  await client.query(
+    `UPDATE attachments SET linked_at = NOW() WHERE id = ANY($1::uuid[])`,
+    [attachmentIds],
+  );
+  return rows;
 }
 
 async function createUserMessage(conversationId, body, tenantId) {
@@ -1094,76 +1507,48 @@ async function createUserMessage(conversationId, body, tenantId) {
 
   try {
     await client.query('BEGIN');
-    const conversation = await getConversationRow(conversationId, client, true, tenantId);
+    const conversation = await getConversationRow(
+      conversationId,
+      client,
+      true,
+      tenantId,
+    );
     if (!conversation) {
-      const error = new Error('访客会话不存在。');
-      error.statusCode = 401;
-      error.code = 'AUTH';
-      throw error;
+      throw requestError('访客会话不存在。', 401, 'AUTH');
     }
     if (conversation.status === 'closed') {
-      const error = new Error('此会话已结束。');
-      error.statusCode = 409;
-      error.code = 'CLOSED';
-      throw error;
+      throw requestError('此会话已结束。', 409, 'CLOSED');
     }
 
-    const type = body.type === 'image' ? 'image' : 'text';
-    const text = cleanText(body.text, 4000);
-    const attachmentId = cleanText(body.attachmentId, 80);
-
-    if (type === 'text' && !text) {
-      const error = new Error('消息不能为空。');
-      error.statusCode = 400;
-      error.code = 'EMPTY_MESSAGE';
-      throw error;
-    }
-
-    if (type === 'image') {
-      if (!isUuid(attachmentId)) {
-        const error = new Error('图片附件无效。');
-        error.statusCode = 400;
-        error.code = 'INVALID_ATTACHMENT';
-        throw error;
-      }
-      const attachmentResult = await client.query(
+    const input = parseMessageInput(body);
+    let messageRows;
+    if (input.type === 'text') {
+      const result = await client.query(
         `
-          SELECT id FROM attachments
-          WHERE id = $1 AND conversation_id = $2 AND linked_at IS NULL
-          FOR UPDATE
+          INSERT INTO messages (
+            id, conversation_id, role, source, type, text
+          )
+          VALUES ($1, $2, 'user', 'manual', 'text', $3)
+          RETURNING *
         `,
-        [attachmentId, conversationId],
+        [randomUUID(), conversationId, input.text],
       );
-      if (!attachmentResult.rows[0]) {
-        const error = new Error('图片附件无效或已经使用。');
-        error.statusCode = 400;
-        error.code = 'INVALID_ATTACHMENT';
-        throw error;
-      }
-    }
-
-    const messageId = randomUUID();
-    const messageResult = await client.query(
-      `
-        INSERT INTO messages (
-          id, conversation_id, role, source, type, text, attachment_id
-        )
-        VALUES ($1, $2, 'user', 'manual', $3, $4, $5)
-        RETURNING *
-      `,
-      [
-        messageId,
+      messageRows = [result.rows[0]];
+    } else {
+      await lockPendingAttachments(
+        client,
         conversationId,
-        type,
-        text,
-        type === 'image' ? attachmentId : null,
-      ],
-    );
-
-    if (type === 'image') {
-      await client.query(
-        `UPDATE attachments SET linked_at = NOW() WHERE id = $1`,
-        [attachmentId],
+        'user',
+        input.type,
+        input.attachmentIds,
+      );
+      messageRows = await insertMediaMessages(
+        client,
+        conversationId,
+        'user',
+        input.type,
+        input.text,
+        input.attachmentIds,
       );
     }
 
@@ -1171,13 +1556,13 @@ async function createUserMessage(conversationId, body, tenantId) {
       `
         UPDATE conversations
         SET unread_admin = unread_admin + 1, updated_at = NOW()
-        WHERE id = $1
+        WHERE id = $1 AND tenant_id = $2
       `,
-      [conversationId],
+      [conversationId, tenantId],
     );
 
     let autoReplyRow = null;
-    if (type === 'text') {
+    if (input.type === 'text') {
       const config = await getConfig(conversation.tenant_id, client);
       const cooldownSeconds = Math.min(
         3600,
@@ -1187,8 +1572,11 @@ async function createUserMessage(conversationId, body, tenantId) {
         ? new Date(conversation.last_auto_reply_at).getTime()
         : 0;
       const cooldownPassed =
-        !lastAutoReplyAt || Date.now() - lastAutoReplyAt >= cooldownSeconds * 1000;
-      const replyText = cooldownPassed ? matchAutoReply(config, text) : '';
+        !lastAutoReplyAt ||
+        Date.now() - lastAutoReplyAt >= cooldownSeconds * 1000;
+      const replyText = cooldownPassed
+        ? matchAutoReply(config, input.text)
+        : '';
 
       if (replyText) {
         const autoResult = await client.query(
@@ -1205,22 +1593,26 @@ async function createUserMessage(conversationId, body, tenantId) {
         await client.query(
           `
             UPDATE conversations
-            SET
-              unread_user = unread_user + 1,
-              last_auto_reply_at = NOW(),
-              updated_at = NOW()
-            WHERE id = $1
+            SET unread_user = unread_user + 1,
+                last_auto_reply_at = NOW(),
+                updated_at = NOW()
+            WHERE id = $1 AND tenant_id = $2
           `,
-          [conversationId],
+          [conversationId, tenantId],
         );
       }
     }
 
     await client.query('COMMIT');
-    const publicConversation = await getPublicConversation(conversationId, pool, conversation.tenant_id);
-
+    const publicConversation = await getPublicConversation(
+      conversationId,
+      pool,
+      conversation.tenant_id,
+    );
+    const messages = messageRows.map(publicMessage);
     return {
-      message: publicMessage(messageResult.rows[0]),
+      message: messages[0],
+      messages,
       autoReply: autoReplyRow ? publicMessage(autoReplyRow) : null,
       conversation: publicConversation,
     };
@@ -1237,91 +1629,70 @@ async function createAdminMessage(conversationId, body, tenantId) {
 
   try {
     await client.query('BEGIN');
-    const conversation = await getConversationRow(conversationId, client, true, tenantId);
+    const conversation = await getConversationRow(
+      conversationId,
+      client,
+      true,
+      tenantId,
+    );
     if (!conversation) {
-      const error = new Error('会话不存在。');
-      error.statusCode = 404;
-      error.code = 'NOT_FOUND';
-      throw error;
+      throw requestError('会话不存在。', 404, 'NOT_FOUND');
     }
     if (conversation.status === 'closed') {
-      const error = new Error('此会话已结束。');
-      error.statusCode = 409;
-      error.code = 'CLOSED';
-      throw error;
+      throw requestError('此会话已结束。', 409, 'CLOSED');
     }
 
-    const type = body.type === 'image' ? 'image' : 'text';
-    const text = cleanText(body.text, 4000);
-    const attachmentId = cleanText(body.attachmentId, 80);
-
-    if (type === 'text' && !text) {
-      const error = new Error('消息不能为空。');
-      error.statusCode = 400;
-      error.code = 'EMPTY_MESSAGE';
-      throw error;
-    }
-
-    if (type === 'image') {
-      if (!isUuid(attachmentId)) {
-        const error = new Error('图片附件无效。');
-        error.statusCode = 400;
-        error.code = 'INVALID_ATTACHMENT';
-        throw error;
-      }
-      const attachmentResult = await client.query(
+    const input = parseMessageInput(body);
+    let messageRows;
+    if (input.type === 'text') {
+      const result = await client.query(
         `
-          SELECT id FROM attachments
-          WHERE id = $1 AND conversation_id = $2 AND linked_at IS NULL
-          FOR UPDATE
+          INSERT INTO messages (
+            id, conversation_id, role, source, type, text
+          )
+          VALUES ($1, $2, 'admin', 'manual', 'text', $3)
+          RETURNING *
         `,
-        [attachmentId, conversationId],
+        [randomUUID(), conversationId, input.text],
       );
-      if (!attachmentResult.rows[0]) {
-        const error = new Error('图片附件无效或已经使用。');
-        error.statusCode = 400;
-        error.code = 'INVALID_ATTACHMENT';
-        throw error;
-      }
-    }
-
-    const messageResult = await client.query(
-      `
-        INSERT INTO messages (
-          id, conversation_id, role, source, type, text, attachment_id
-        )
-        VALUES ($1, $2, 'admin', 'manual', $3, $4, $5)
-        RETURNING *
-      `,
-      [
-        randomUUID(),
+      messageRows = [result.rows[0]];
+    } else {
+      await lockPendingAttachments(
+        client,
         conversationId,
-        type,
-        text,
-        type === 'image' ? attachmentId : null,
-      ],
-    );
-
-    if (type === 'image') {
-      await client.query(`UPDATE attachments SET linked_at = NOW() WHERE id = $1`, [
-        attachmentId,
-      ]);
+        'admin',
+        input.type,
+        input.attachmentIds,
+      );
+      messageRows = await insertMediaMessages(
+        client,
+        conversationId,
+        'admin',
+        input.type,
+        input.text,
+        input.attachmentIds,
+      );
     }
 
     await client.query(
       `
         UPDATE conversations
         SET unread_user = unread_user + 1, updated_at = NOW()
-        WHERE id = $1
+        WHERE id = $1 AND tenant_id = $2
       `,
-      [conversationId],
+      [conversationId, tenantId],
     );
 
     await client.query('COMMIT');
-    const publicConversation = await getPublicConversation(conversationId, pool, conversation.tenant_id);
-
+    const publicConversation = await getPublicConversation(
+      conversationId,
+      pool,
+      conversation.tenant_id,
+    );
+    const messages = messageRows.map(publicMessage);
     return {
-      message: publicMessage(messageResult.rows[0]),
+      message: messages[0],
+      messages,
       conversation: publicConversation,
     };
   } catch (error) {
@@ -1342,6 +1713,23 @@ async function getTenantById(tenantId, client = pool, forUpdate = false) {
   return result.rows[0] || null;
 }
 
+async function getTenantForAdminToken(payload, client = pool) {
+  if (!isUuid(payload?.tenantId) || !isUuid(payload?.licenseId)) return null;
+  const result = await client.query(
+    `
+      SELECT t.*
+      FROM tenants t
+      JOIN license_keys l
+        ON l.id = $2
+       AND l.tenant_id = t.id
+       AND l.status = 'active'
+      WHERE t.id = $1
+    `,
+    [payload.tenantId, payload.licenseId],
+  );
+  return result.rows[0] || null;
+}
+
 async function getTenantByCode(publicCode, client = pool) {
   const code = cleanText(publicCode, 100);
   if (!code) return null;
@@ -1349,8 +1737,36 @@ async function getTenantByCode(publicCode, client = pool) {
   return result.rows[0] || null;
 }
 
-function tenantExpired(tenant) {
-  return !tenant || tenant.status !== 'active' || new Date(tenant.access_expires_at).getTime() <= Date.now();
+function tenantAccessIssue(tenant) {
+  if (!tenant) return 'TENANT_NOT_FOUND';
+  if (tenant.status !== 'active') return 'LICENSE_REVOKED';
+  if (new Date(tenant.access_expires_at).getTime() <= Date.now()) {
+    return 'TENANT_EXPIRED';
+  }
+  return '';
+}
+
+function sendTenantAccessError(res, tenant, audience = 'admin') {
+  const issue = tenantAccessIssue(tenant);
+  if (issue === 'LICENSE_REVOKED') {
+    return sendJson(res, 403, {
+      ok: false,
+      error:
+        audience === 'admin'
+          ? '你的卡密已被禁用，如有疑问请联系 Telegram @YingYingUu。'
+          : '该客服服务已停用，请联系商家。',
+      code: issue,
+      supportTelegram: '@YingYingUu',
+    });
+  }
+  return sendError(
+    res,
+    403,
+    audience === 'admin'
+      ? '卡密已到期，请购买新卡密续费。'
+      : '该客服服务已到期，请联系商家续费。',
+    issue === 'TENANT_NOT_FOUND' ? 'TENANT_NOT_FOUND' : 'TENANT_EXPIRED',
+  );
 }
 
 function publicTenant(tenant) {
@@ -1363,7 +1779,8 @@ function publicTenant(tenant) {
   };
 }
 
-async function touchConversation(conversationId, body = {}, req = null, tenantId = null) {
+async function touchConversation(conversationId, body = {}, req = null, tenantId) {
+  if (!isUuid(conversationId) || !isUuid(tenantId)) return;
   await pool.query(
     `
       UPDATE conversations SET
@@ -1374,7 +1791,15 @@ async function touchConversation(conversationId, body = {}, req = null, tenantId
         entry_source = CASE WHEN $5 <> '' THEN $5 ELSE entry_source END,
         user_agent = CASE WHEN $6 <> '' THEN $6 ELSE user_agent END,
         referrer_url = CASE WHEN $7 <> '' THEN $7 ELSE referrer_url END
-      WHERE id = $1 AND ($8::uuid IS NULL OR tenant_id = $8)
+      WHERE id = $1 AND tenant_id = $8
+        AND (
+          last_seen_at IS NULL
+          OR last_seen_at < NOW() - INTERVAL '20 seconds'
+          OR ($2 <> '' AND ip_address IS DISTINCT FROM $2)
+          OR ($3 <> '' AND device_type IS DISTINCT FROM $3)
+          OR ($4 <> '' AND device_label IS DISTINCT FROM $4)
+          OR ($5 <> '' AND entry_source IS DISTINCT FROM $5)
+        )
     `,
     [
       conversationId,
@@ -1389,23 +1814,57 @@ async function touchConversation(conversationId, body = {}, req = null, tenantId
 async function createLicenseRecord(durationCode, metadata = {}) {
   const duration = LICENSE_DURATIONS[durationCode];
   if (!duration) throw new Error('卡密时长无效。');
+  const updateId = Number(metadata.telegramUpdateId);
+  const telegramUpdateId = Number.isSafeInteger(updateId) ? updateId : null;
+
+  async function existingForUpdate() {
+    if (telegramUpdateId == null) return null;
+    const result = await pool.query(
+      `SELECT * FROM license_keys WHERE telegram_update_id = $1`,
+      [telegramUpdateId],
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    const licenseKey = decryptLicenseKey(row.key_ciphertext);
+    if (!licenseKey) {
+      throw new Error('此发卡请求已经处理，卡密已激活或不再可重复显示。');
+    }
+    return {
+      licenseKey,
+      row,
+      duration: LICENSE_DURATIONS[row.duration_code] || duration,
+    };
+  }
+
+  const existing = await existingForUpdate();
+  if (existing) return existing;
+
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const licenseKey = generateLicenseKey();
     try {
       const result = await pool.query(
         `
           INSERT INTO license_keys (
-            id, key_hash, key_prefix, key_suffix, duration_code, duration_days,
-            telegram_chat_id, telegram_user_id
-          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+            id, key_hash, key_ciphertext, key_prefix, key_suffix,
+            duration_code, duration_days,
+            telegram_chat_id, telegram_user_id, telegram_username,
+            telegram_display_name, telegram_update_id
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
           RETURNING *
         `,
-        [randomUUID(), hashLicenseKey(licenseKey), 'VIP', licenseKey.slice(-5),
-         durationCode, duration.days, cleanText(metadata.telegramChatId, 50), cleanText(metadata.telegramUserId, 50)],
+        [randomUUID(), hashLicenseKey(licenseKey), encryptLicenseKey(licenseKey),
+         'VIP', licenseKey.slice(-5), durationCode, duration.days,
+         cleanText(metadata.telegramChatId, 50),
+         cleanText(metadata.telegramUserId, 50),
+         cleanText(metadata.telegramUsername, 64),
+         cleanText(metadata.telegramDisplayName, 120), telegramUpdateId],
       );
       return { licenseKey, row: result.rows[0], duration };
     } catch (error) {
-      if (error?.code !== '23505' || attempt === 4) throw error;
+      if (error?.code !== '23505') throw error;
+      const duplicateUpdate = await existingForUpdate();
+      if (duplicateUpdate) return duplicateUpdate;
+      if (attempt === 4) throw error;
     }
   }
   throw new Error('生成卡密失败。');
@@ -1444,7 +1903,7 @@ async function handleTenantLogin(req, res) {
       tenant = tenantResult.rows[0];
       await createTenantConfig(tenantId, client);
       await client.query(
-        `UPDATE license_keys SET tenant_id=$2,status='active',activated_at=NOW(),expires_at=$3,last_used_at=NOW(),updated_at=NOW() WHERE id=$1`,
+        `UPDATE license_keys SET tenant_id=$2,status='active',key_ciphertext=NULL,activated_at=NOW(),expires_at=$3,last_used_at=NOW(),updated_at=NOW() WHERE id=$1`,
         [license.id, tenantId, expiry.toISOString()],
       );
       license = { ...license, tenant_id: tenantId, status: 'active', expires_at: expiry };
@@ -1453,7 +1912,15 @@ async function handleTenantLogin(req, res) {
       if (!tenant) {
         const error = new Error('租户账户不存在，请联系平台。'); error.statusCode = 409; error.code = 'LICENSE_STATE'; throw error;
       }
-      if (tenantExpired(tenant)) {
+      const accessIssue = tenantAccessIssue(tenant);
+      if (accessIssue === 'LICENSE_REVOKED') {
+        throw requestError(
+          '你的卡密已被禁用，如有疑问请联系 Telegram @YingYingUu。',
+          403,
+          'LICENSE_REVOKED',
+        );
+      }
+      if (accessIssue === 'TENANT_EXPIRED') {
         const error = new Error('卡密已到期，请购买新卡密续费。'); error.statusCode = 403; error.code = 'TENANT_EXPIRED'; error.expiresAt = new Date(tenant.access_expires_at).toISOString(); throw error;
       }
       await client.query(`UPDATE license_keys SET last_used_at=NOW(),updated_at=NOW() WHERE id=$1`, [license.id]);
@@ -1508,12 +1975,13 @@ async function handleTenantRenew(req, res) {
     tenant = tenantResult.rows[0];
     await client.query(`UPDATE license_keys SET status='superseded',updated_at=NOW() WHERE tenant_id=$1 AND status='active'`, [tenant.id]);
     await client.query(
-      `UPDATE license_keys SET tenant_id=$2,status='active',activated_at=NOW(),expires_at=$3,last_used_at=NOW(),updated_at=NOW() WHERE id=$1`,
+      `UPDATE license_keys SET tenant_id=$2,status='active',key_ciphertext=NULL,activated_at=NOW(),expires_at=$3,last_used_at=NOW(),updated_at=NOW() WHERE id=$1`,
       [newLicense.id, tenant.id, newExpiry.toISOString()],
     );
     await client.query('COMMIT');
   } catch (error) { await client.query('ROLLBACK'); throw error; }
   finally { client.release(); }
+  updateTenantConnectionsAfterRenewal(tenant.id, newExpiry, newLicense.id);
   return sendJson(res, 200, {
     ok:true,
     token: signTokenUntil({ kind:'tenant_admin', tenantId:tenant.id, licenseId:newLicense.id }, newExpiry),
@@ -1521,11 +1989,14 @@ async function handleTenantRenew(req, res) {
   });
 }
 
-function telegramPrivateAllowed(chat, userId) {
+function telegramOperatorAllowed(chat, userId) {
+  if (userId == null || !TELEGRAM_ALLOWED_USER_IDS.has(String(userId))) {
+    return false;
+  }
+  if (chat?.type === 'private') return true;
   return Boolean(
-    chat?.type === 'private' &&
-      userId != null &&
-      TELEGRAM_ALLOWED_PRIVATE_USER_IDS.has(String(userId)),
+    ['group', 'supergroup'].includes(chat?.type) &&
+      TELEGRAM_ALLOWED_GROUP_IDS.has(String(chat.id)),
   );
 }
 
@@ -1562,6 +2033,110 @@ function telegramGenerateKeyboard() {
   };
 }
 
+function telegramThread(message) {
+  return message?.message_thread_id
+    ? { message_thread_id: message.message_thread_id }
+    : {};
+}
+
+function telegramDisplayName(user = {}) {
+  return cleanText(
+    [user.first_name, user.last_name].filter(Boolean).join(' '),
+    120,
+  );
+}
+
+function formatTelegramDate(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return '—';
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(date);
+}
+
+function telegramLicenseStatus(row) {
+  if (row.status === 'unused') return '未激活';
+  if (
+    row.status === 'active' &&
+    row.expires_at &&
+    new Date(row.expires_at).getTime() <= Date.now()
+  ) return '已到期';
+  if (row.status === 'active') return '使用中';
+  if (row.status === 'superseded') return '已续费替换';
+  if (row.status === 'revoked') return '已禁用';
+  return row.status || '未知';
+}
+
+function telegramLicenseCreator(row) {
+  const parts = [];
+  if (row.telegram_display_name) parts.push(row.telegram_display_name);
+  if (row.telegram_username) parts.push(`@${row.telegram_username}`);
+  if (row.telegram_user_id) parts.push(`ID ${row.telegram_user_id}`);
+  return parts.join(' · ') || '历史记录（未保存生成者）';
+}
+
+async function sendTelegramChunks(chatId, lines, message = null) {
+  const chunks = [];
+  let current = '';
+  for (const line of lines) {
+    const next = current ? `${current}\n${line}` : line;
+    if (next.length > 3600 && current) {
+      chunks.push(current);
+      current = line;
+    } else {
+      current = next;
+    }
+  }
+  if (current) chunks.push(current);
+  for (const text of chunks) {
+    await telegramApi('sendMessage', {
+      chat_id: chatId,
+      text,
+      ...telegramThread(message),
+    });
+  }
+}
+
+async function sendAllLicenses(chatId, message) {
+  const result = await pool.query(`
+    SELECT
+      key_prefix, key_suffix, duration_code, duration_days, status,
+      telegram_user_id, telegram_username, telegram_display_name,
+      activated_at, expires_at, revoked_at, created_at
+    FROM license_keys
+    ORDER BY created_at DESC, id DESC
+  `);
+  const rows = result.rows;
+  const lines = [
+    `📋 当前共有 ${rows.length} 张卡密`,
+    '为保护卡密安全，列表仅显示尾号；完整卡密只在生成时展示。',
+    '',
+  ];
+  rows.forEach((row, index) => {
+    const expiry =
+      row.status === 'unused'
+        ? `首次登录后 ${row.duration_days} 天`
+        : formatTelegramDate(row.expires_at);
+    lines.push(
+      `${index + 1}. ${licenseHint(row)} · ${telegramLicenseStatus(row)}`,
+      `生成者：${telegramLicenseCreator(row)}`,
+      `生成：${formatTelegramDate(row.created_at)}｜到期：${expiry}`,
+      ...(row.revoked_at
+        ? [`禁用：${formatTelegramDate(row.revoked_at)}`]
+        : []),
+      '',
+    );
+  });
+  await sendTelegramChunks(chatId, lines, message);
+}
+
 async function processTelegramUpdate(update) {
   const message = update?.message;
   const callback = update?.callback_query;
@@ -1571,48 +2146,70 @@ async function processTelegramUpdate(update) {
     const chatId = chat?.id;
     const userId = message.from?.id;
     const raw = String(message.text || '').trim();
-    const command = raw.split('@')[0].toLowerCase();
+    const command = (raw.split(/\s+/)[0] || '')
+      .replace(/@[A-Za-z0-9_]+$/i, '')
+      .toLowerCase();
+    const isHelp = ['/start', '/help'].includes(command);
+    const isGenerate =
+      ['生成密钥', '生成卡密'].includes(raw) ||
+      ['/key', '/card', '/generate'].includes(command);
+    const revokeMatch = raw.match(
+      /^(?:\/revoke(?:@[A-Za-z0-9_]+)?|禁用卡密)\s+(.+)$/i,
+    );
+    const isList =
+      raw === '查看卡密' ||
+      raw === '查看所有卡密' ||
+      ['/licenses', '/keys'].includes(command);
 
-    // 本机器人只允许私聊发卡。群组、超级群和频道消息全部忽略。
-    if (chat?.type !== 'private') return;
+    if (!isHelp && !isGenerate && !revokeMatch && !isList) return;
 
-    if (!telegramPrivateAllowed(chat, userId)) {
+    if (!telegramOperatorAllowed(chat, userId)) {
       await telegramApi('sendMessage', {
         chat_id: chatId,
-        text: '⛔ 你不在私聊发卡白名单中，无法使用此机器人。',
+        text: '⛔ 当前用户或群组未被授权使用此机器人。',
+        ...telegramThread(message),
       });
       return;
     }
 
-    if (['/start', '/help'].includes(command)) {
+    if (isHelp) {
       await telegramApi('sendMessage', {
         chat_id: chatId,
         text: [
-          '✅ 私聊发卡机器人已启用。',
+          '✅ 卡密管理机器人已启用。',
           '',
-          '发送“生成密钥”或 /key 选择卡密时长。',
-          '停用卡密：/revoke 卡密',
+          '生成卡密：发送“生成卡密”或 /key',
+          '禁用卡密：禁用卡密 VIP-XXXXX-XXXXX-XXXXX-XXXXX',
+          '查看卡密：发送“查看卡密”或 /licenses',
         ].join('\n'),
+        ...telegramThread(message),
       });
       return;
     }
 
-    if (
-      ['生成密钥', '生成卡密', '/key', '/card', '/generate'].includes(command)
-    ) {
+    if (isGenerate) {
       await telegramApi('sendMessage', {
         chat_id: chatId,
         text: '请点击下方按键选择，请注意：请确认钱包收款成功后，再把密钥发给客户！',
         reply_markup: telegramGenerateKeyboard(),
+        ...telegramThread(message),
       });
       return;
     }
 
-    const revokeMatch = raw.match(/^(?:\/revoke|禁用卡密)\s+(.+)$/i);
     if (revokeMatch) {
       const key = normalizeLicenseKey(revokeMatch[1]);
+      if (!/^VIP-[A-Z2-9]{5}(?:-[A-Z2-9]{5}){3}$/.test(key)) {
+        await telegramApi('sendMessage', {
+          chat_id: chatId,
+          text: '卡密格式不正确，请检查后重试。',
+          ...telegramThread(message),
+        });
+        return;
+      }
       const client = await pool.connect();
       let text = '卡密不存在。';
+      let revokedTenantId = null;
       try {
         await client.query('BEGIN');
         const result = await client.query(
@@ -1621,21 +2218,26 @@ async function processTelegramUpdate(update) {
         );
         const row = result.rows[0];
         if (row) {
-          await client.query(
-            `UPDATE license_keys
-             SET status='revoked',updated_at=NOW()
-             WHERE id=$1`,
-            [row.id],
-          );
-          if (row.tenant_id && row.status === 'active') {
+          if (row.status === 'revoked') {
+            text = `此卡密已经被禁用：${licenseHint(row)}`;
+          } else {
             await client.query(
-              `UPDATE tenants
-               SET status='suspended',access_expires_at=NOW(),updated_at=NOW()
+              `UPDATE license_keys
+               SET status='revoked',key_ciphertext=NULL,revoked_at=NOW(),updated_at=NOW()
                WHERE id=$1`,
-              [row.tenant_id],
+              [row.id],
             );
+            if (row.tenant_id && row.status === 'active') {
+              await client.query(
+                `UPDATE tenants
+                 SET status='suspended',updated_at=NOW()
+                 WHERE id=$1`,
+                [row.tenant_id],
+              );
+              revokedTenantId = row.tenant_id;
+            }
+            text = `✅ 已禁用卡密：${licenseHint(row)}`;
           }
-          text = `已停用卡密：${licenseHint(row)}`;
         }
         await client.query('COMMIT');
       } catch (error) {
@@ -1644,7 +2246,25 @@ async function processTelegramUpdate(update) {
       } finally {
         client.release();
       }
-      await telegramApi('sendMessage', { chat_id: chatId, text });
+      if (revokedTenantId) {
+        disconnectTenant(revokedTenantId, {
+          type: 'license-revoked',
+          message:
+            '你的卡密已被禁用，如有疑问请联系 Telegram @YingYingUu。',
+          supportTelegram: '@YingYingUu',
+          at: nowIso(),
+        });
+      }
+      await telegramApi('sendMessage', {
+        chat_id: chatId,
+        text,
+        ...telegramThread(message),
+      });
+      return;
+    }
+
+    if (isList) {
+      await sendAllLicenses(chatId, message);
       return;
     }
   }
@@ -1655,14 +2275,10 @@ async function processTelegramUpdate(update) {
     const userId = callback.from?.id;
     const code = callback.data.slice(8);
 
-    // 防止把私聊按钮转发到群后被利用，也防止非白名单用户点击。
-    if (!telegramPrivateAllowed(chat, userId)) {
+    if (!telegramOperatorAllowed(chat, userId)) {
       await telegramApi('answerCallbackQuery', {
         callback_query_id: callback.id,
-        text:
-          chat?.type === 'private'
-            ? '你不在私聊发卡白名单中。'
-            : '只能在机器人私聊中生成卡密。',
+        text: '当前用户或群组未被授权。',
         show_alert: true,
       });
       return;
@@ -1680,24 +2296,39 @@ async function processTelegramUpdate(update) {
     await telegramApi('answerCallbackQuery', {
       callback_query_id: callback.id,
       text: '正在生成卡密…',
-    });
+    }).catch(() => {});
 
     const created = await createLicenseRecord(code, {
       telegramChatId: chatId,
       telegramUserId: userId,
+      telegramUsername: callback.from?.username || '',
+      telegramDisplayName: telegramDisplayName(callback.from),
+      telegramUpdateId: update.update_id,
     });
 
+    const resultText = [
+      `✅ ${created.duration.label}已生成`,
+      '',
+      `卡密：${created.licenseKey}`,
+      `有效时长：首次登录后台后 ${created.duration.days} 天`,
+      '',
+      '请确认钱包收款成功后，再把卡密发给客户。',
+      '客户首次登录后会自动创建独立后台和专属用户端入口。',
+    ].join('\n');
     await telegramApi('sendMessage', {
       chat_id: chatId,
-      text: [
-        `✅ ${created.duration.label}已生成`,
-        '',
-        `卡密：${created.licenseKey}`,
-        `有效时长：首次登录后台后 ${created.duration.days} 天`,
-        '',
-        '请确认钱包收款成功后，再把卡密发给客户。',
-        '客户用此卡密登录后台；系统会自动创建独立租户和专属用户端入口。',
-      ].join('\n'),
+      text: resultText,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: '📋 点击复制全部内容',
+              copy_text: { text: resultText },
+            },
+          ],
+        ],
+      },
+      ...telegramThread(callback.message),
     });
   }
 }
@@ -1737,18 +2368,21 @@ async function router(req, res) {
     if (!timingSafeTextEqual(secret,TELEGRAM_WEBHOOK_SECRET)) return sendError(res,403,'Webhook 校验失败。','TELEGRAM_SECRET');
     const update=await readJson(req,512*1024);
     const updateId=Number(update.update_id);
-    let updateClaimed = false;
     if (Number.isSafeInteger(updateId)) {
       const claimed=await pool.query(`INSERT INTO telegram_updates(update_id) VALUES($1) ON CONFLICT DO NOTHING RETURNING update_id`,[updateId]);
       if (!claimed.rows[0]) return sendJson(res,200,{ok:true});
-      updateClaimed = true;
     }
     try {
       await processTelegramUpdate(update);
     } catch(error) {
       console.error('Telegram 更新处理失败：',error);
-      if (updateClaimed) await pool.query(`DELETE FROM telegram_updates WHERE update_id=$1`,[updateId]).catch(()=>{});
-      return sendError(res,500,'Telegram 更新处理失败，请让 Telegram 重试。','TELEGRAM_PROCESSING');
+      if (Number.isSafeInteger(updateId)) {
+        await pool.query(
+          `DELETE FROM telegram_updates WHERE update_id=$1`,
+          [updateId],
+        ).catch(() => {});
+      }
+      return sendError(res,500,'Telegram 更新处理失败，请重新发送指令。','TELEGRAM_PROCESSING');
     }
     return sendJson(res,200,{ok:true});
   }
@@ -1765,7 +2399,7 @@ async function router(req, res) {
     const body=await readJson(req,64*1024);
     const tenant=await getTenantByCode(body.tenantCode);
     if (!tenant) return sendError(res,404,'用户端入口无效。','TENANT_NOT_FOUND');
-    if (tenantExpired(tenant)) return sendError(res,403,'该客服服务已到期，请联系商家续费。','TENANT_EXPIRED');
+    if (tenantAccessIssue(tenant)) return sendTenantAccessError(res,tenant,'user');
     const config=await getConfig(tenant.id);
     let conversationId=null;
     let visitorKey=cleanText(body.visitorKey,200);
@@ -1822,12 +2456,62 @@ async function router(req, res) {
       return sendError(res, 401, '登录已失效。', 'AUTH');
     }
 
-    const tenant = await getTenantById(payload.tenantId);
-    if (!tenant || tenantExpired(tenant)) return sendError(res,403,'服务已到期，请续费。','TENANT_EXPIRED');
+    const tenant =
+      payload.kind === 'tenant_admin'
+        ? await getTenantForAdminToken(payload)
+        : await getTenantById(payload.tenantId);
+    if (!tenant && payload.kind === 'tenant_admin') {
+      const tenantState = await getTenantById(payload.tenantId);
+      if (tenantAccessIssue(tenantState) === 'LICENSE_REVOKED') {
+        return sendTenantAccessError(res, tenantState, 'admin');
+      }
+      return sendError(
+        res,
+        401,
+        '此后台登录已被新的续费卡密替换，请重新登录。',
+        'LICENSE_REPLACED',
+      );
+    }
+    if (tenantAccessIssue(tenant)) {
+      return sendTenantAccessError(
+        res,
+        tenant,
+        payload.kind === 'tenant_admin' ? 'admin' : 'user',
+      );
+    }
     if (payload.kind === 'user') {
       const conversation = await getConversationRow(payload.conversationId, pool, false, payload.tenantId);
       if (!conversation || !authorizeConversation(payload, conversation)) return sendError(res,401,'会话已失效。','AUTH');
       await touchConversation(conversation.id,{},req,payload.tenantId);
+    }
+    const connectionIdentity =
+      payload.kind === 'tenant_admin'
+        ? `${payload.tenantId}:${payload.licenseId}`
+        : `${payload.tenantId}:${payload.conversationId}`;
+    if (
+      !rateLimit(
+        req,
+        res,
+        'sse-connect',
+        60,
+        60_000,
+        connectionIdentity,
+      )
+    ) return;
+    const sameConnections = [...sseClients].filter(
+      (client) =>
+        client.kind === payload.kind &&
+        client.tenantId === payload.tenantId &&
+        (payload.kind === 'tenant_admin'
+          ? client.licenseId === payload.licenseId
+          : client.conversationId === payload.conversationId),
+    ).length;
+    const perSessionLimit = payload.kind === 'tenant_admin' ? 6 : 4;
+    if (
+      sseClients.size >= MAX_SSE_CONNECTIONS ||
+      sameConnections >= perSessionLimit
+    ) {
+      return sendError(res, 503, '实时连接数量已达上限，请稍后重试。', 'SSE_LIMIT');
     }
 
     res.statusCode = 200;
@@ -1842,6 +2526,7 @@ async function router(req, res) {
       kind: payload.kind,
       tenantId: payload.tenantId,
       conversationId: payload.conversationId || null,
+      licenseId: payload.licenseId || null,
       accessExpiresAt: new Date(tenant.access_expires_at).getTime(),
     };
     sseClients.add(client);
@@ -1862,7 +2547,7 @@ async function router(req, res) {
     }
 
     const tenant = await getTenantById(payload.tenantId);
-    if (!tenant || tenantExpired(tenant)) return sendError(res,403,'该客服服务已到期，请联系商家续费。','TENANT_EXPIRED');
+    if (tenantAccessIssue(tenant)) return sendTenantAccessError(res,tenant,'user');
     const conversation = await getConversationRow(payload.conversationId, pool, false, payload.tenantId);
     if (!conversation || !authorizeConversation(payload, conversation)) return sendError(res,401,'访客会话不存在。','AUTH');
     await touchConversation(conversation.id,{},req,payload.tenantId);
@@ -1888,7 +2573,16 @@ async function router(req, res) {
     }
 
     if (req.method === 'POST' && pathname === '/api/user/messages') {
-      if (!rateLimit(req, res, 'user-message', 40, 60_000)) return;
+      if (
+        !rateLimit(
+          req,
+          res,
+          'user-message',
+          40,
+          60_000,
+          `${payload.tenantId}:${conversation.id}`,
+        )
+      ) return;
       const body = await readJson(req);
       const result = await createUserMessage(conversation.id, body, payload.tenantId);
       broadcast(
@@ -1903,7 +2597,9 @@ async function router(req, res) {
       return sendJson(res, 201, {
         ok: true,
         message: result.message,
+        messages: result.messages,
         autoReply: result.autoReply,
+        conversation: result.conversation,
       });
     }
   }
@@ -1913,9 +2609,21 @@ async function router(req, res) {
     if (!payload) {
       return sendError(res, 401, '后台登录已失效。', 'AUTH');
     }
-    const activeTenant = await getTenantById(payload.tenantId);
-    if (!activeTenant || tenantExpired(activeTenant)) {
-      return sendError(res,403,'卡密已到期或已被停用，请续费。','TENANT_EXPIRED');
+    const activeTenant = await getTenantForAdminToken(payload);
+    if (!activeTenant) {
+      const tenantState = await getTenantById(payload.tenantId);
+      if (tenantAccessIssue(tenantState) === 'LICENSE_REVOKED') {
+        return sendTenantAccessError(res, tenantState, 'admin');
+      }
+      return sendError(
+        res,
+        401,
+        '此后台登录已被新的续费卡密替换，请重新登录。',
+        'LICENSE_REPLACED',
+      );
+    }
+    if (tenantAccessIssue(activeTenant)) {
+      return sendTenantAccessError(res,activeTenant,'admin');
     }
 
     if (req.method === 'GET' && pathname === '/api/admin/bootstrap') {
@@ -1928,6 +2636,25 @@ async function router(req, res) {
         ok: true,
         tenant: publicTenant(tenant),
         conversations,
+        cannedReplies: config.cannedReplies,
+        autoReplies: config.autoReplies,
+        settings: config.settings,
+      });
+    }
+
+    if (req.method === 'GET' && pathname === '/api/admin/conversations') {
+      const conversations = await getAllSummaries(payload.tenantId);
+      return sendJson(res, 200, {
+        ok: true,
+        tenant: publicTenant(activeTenant),
+        conversations,
+      });
+    }
+
+    if (req.method === 'GET' && pathname === '/api/admin/config') {
+      const config = await getConfig(payload.tenantId);
+      return sendJson(res, 200, {
+        ok: true,
         cannedReplies: config.cannedReplies,
         autoReplies: config.autoReplies,
         settings: config.settings,
@@ -1995,7 +2722,9 @@ async function router(req, res) {
                     text:
                       publicConversation.messages.at(-1).type === 'image'
                         ? publicConversation.messages.at(-1).text || '[图片]'
-                        : publicConversation.messages.at(-1).text,
+                        : publicConversation.messages.at(-1).type === 'video'
+                          ? publicConversation.messages.at(-1).text || '[视频]'
+                          : publicConversation.messages.at(-1).text,
                     role: publicConversation.messages.at(-1).role,
                     createdAt: publicConversation.messages.at(-1).createdAt,
                   }
@@ -2061,15 +2790,33 @@ async function router(req, res) {
       }
 
       if (req.method === 'POST' && action === 'messages') {
-        if (!rateLimit(req, res, 'admin-message', 100, 60_000)) return;
+        if (
+          !rateLimit(
+            req,
+            res,
+            'admin-message',
+            100,
+            60_000,
+            `${payload.tenantId}:${conversationId}`,
+          )
+        ) return;
         const body = await readJson(req);
         const result = await createAdminMessage(conversationId, body, payload.tenantId);
         broadcast(
-          { type: 'conversation-updated', conversation: result.conversation },
+          {
+            type: 'conversation-updated',
+            trigger: 'admin-message',
+            conversation: result.conversation,
+          },
           conversationId,
           payload.tenantId,
         );
-        return sendJson(res, 201, { ok: true, message: result.message });
+        return sendJson(res, 201, {
+          ok: true,
+          message: result.message,
+          messages: result.messages,
+          conversation: result.conversation,
+        });
       }
     }
   }
@@ -2077,14 +2824,14 @@ async function router(req, res) {
   if (req.method === 'GET' && pathname.startsWith('/api/media/')) {
     const payload = authenticate(req);
     if (!payload) {
-      return sendError(res, 401, '没有权限读取图片。', 'AUTH');
+      return sendError(res, 401, '没有权限读取媒体。', 'AUTH');
     }
 
     const attachmentId = safeDecodeURIComponent(
       pathname.slice('/api/media/'.length),
     );
     if (!isUuid(attachmentId)) {
-      return sendError(res, 404, '图片不存在。', 'NOT_FOUND');
+      return sendError(res, 404, '媒体不存在。', 'NOT_FOUND');
     }
     const result = await pool.query(
       `
@@ -2105,7 +2852,7 @@ async function router(req, res) {
       [attachmentId],
     );
     const row = result.rows[0];
-    if (!row) return sendError(res, 404, '图片不存在。', 'NOT_FOUND');
+    if (!row) return sendError(res, 404, '媒体不存在。', 'NOT_FOUND');
 
     const conversationForAuth = {
       id: row.conversation_id,
@@ -2113,14 +2860,30 @@ async function router(req, res) {
       visitor_key_hash: row.visitor_key_hash,
     };
     if (!authorizeConversation(payload, conversationForAuth)) {
-      return sendError(res, 403, '没有权限读取图片。', 'FORBIDDEN');
+      return sendError(res, 403, '没有权限读取媒体。', 'FORBIDDEN');
     }
-    const tenant = await getTenantById(row.tenant_id);
-    if (!tenant || tenantExpired(tenant)) return sendError(res,403,'服务已到期，请续费。','TENANT_EXPIRED');
+    const tenant =
+      payload.kind === 'tenant_admin'
+        ? await getTenantForAdminToken(payload)
+        : await getTenantById(row.tenant_id);
+    if (!tenant && payload.kind === 'tenant_admin') {
+      const tenantState = await getTenantById(payload.tenantId);
+      if (tenantAccessIssue(tenantState) === 'LICENSE_REVOKED') {
+        return sendTenantAccessError(res, tenantState, 'admin');
+      }
+      return sendError(res, 401, '后台登录已失效。', 'LICENSE_REPLACED');
+    }
+    if (tenantAccessIssue(tenant)) {
+      return sendTenantAccessError(
+        res,
+        tenant,
+        payload.kind === 'tenant_admin' ? 'admin' : 'user',
+      );
+    }
 
     const data = row.data;
     if (!Buffer.isBuffer(data)) {
-      return sendError(res, 404, '图片不存在。', 'NOT_FOUND');
+      return sendError(res, 404, '媒体不存在。', 'NOT_FOUND');
     }
 
     res.statusCode = 200;
@@ -2128,7 +2891,10 @@ async function router(req, res) {
     res.setHeader('Content-Length', String(data.length));
     res.setHeader('Cache-Control', 'no-store, max-age=0');
     res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Content-Disposition', `inline; filename="image"`);
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${ALLOWED_VIDEO_TYPES.has(row.mime) ? 'video' : 'image'}"`,
+    );
     return res.end(data);
   }
 
@@ -2151,7 +2917,7 @@ const server = http.createServer((req, res) => {
   });
 });
 
-server.requestTimeout = 30_000;
+server.requestTimeout = 90_000;
 server.headersTimeout = 35_000;
 server.keepAliveTimeout = 65_000;
 
