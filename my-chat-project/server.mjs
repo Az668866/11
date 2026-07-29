@@ -1315,7 +1315,7 @@ function sessionCookie(token, maxAge = 8 * 60 * 60) {
     `${SESSION_COOKIE}=${encodeURIComponent(token)}`,
     'Path=/',
     'HttpOnly',
-    'SameSite=Strict',
+    'SameSite=None',
     `Max-Age=${Math.max(0, Math.trunc(maxAge))}`,
   ];
   if (COOKIE_SECURE) parts.push('Secure');
