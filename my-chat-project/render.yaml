@@ -2,8 +2,8 @@ services:
   - type: web
     name: neon-chat-backend
     runtime: node
-    plan: free
-    buildCommand: npm install
+    plan: standard
+    buildCommand: npm ci
     startCommand: npm start
     healthCheckPath: /health
     envVars:
@@ -11,19 +11,71 @@ services:
         value: "22"
       - key: DATABASE_URL
         sync: false
-      - key: ADMIN_PASSWORD
-        sync: false
       - key: ALLOWED_ORIGINS
         sync: false
       - key: TOKEN_SECRET
         generateValue: true
+      - key: PUBLIC_API_BASE
+        value: https://api.ykf000.com
+      - key: APP_VERSION
+        value: 1.8.1
+      - key: SUPPORT_TELEGRAM
+        value: "@YingYingUu"
+      - key: COOKIE_DOMAIN
+        value: .ykf000.com
+      - key: REQUIRE_CLOUDFLARE
+        value: "false"
+      - key: CLOUDFLARE_ORIGIN_SECRET
+        sync: false
       - key: CHAT_RETENTION_HOURS
         value: 24
       - key: TOKEN_TTL_HOURS
         value: 24
       - key: MAX_IMAGE_MB
         value: 8
+      - key: MAX_VIDEO_MB
+        value: 25
       - key: MAX_CONVERSATIONS
         value: 1000
+      - key: MAX_SSE_CONNECTIONS
+        value: 500
       - key: DB_POOL_MAX
         value: 5
+      - key: INSTANCE_MEMORY_MB
+        value: 2048
+      - key: INSTANCE_CPU_CORES
+        value: 1
+      - key: MAX_CONCURRENT_UPLOADS
+        value: 4
+      - key: SUPER_ADMIN_USERNAME
+        sync: false
+      - key: SUPER_ADMIN_PASSWORD
+        sync: false
+      - key: SUPER_ADMIN_TOTP_SECRET
+        sync: false
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: RENDER_API_KEY
+        sync: false
+      - key: RENDER_SERVICE_ID
+        sync: false
+      - key: NEON_API_KEY
+        sync: false
+      - key: NEON_PROJECT_ID
+        sync: false
+      - key: NEON_ORG_ID
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: TELEGRAM_ALLOWED_USER_IDS
+        sync: false
+      - key: TELEGRAM_ALLOWED_GROUP_IDS
+        sync: false
