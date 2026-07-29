@@ -4953,16 +4953,20 @@ function sampleCpuPercent() {
 }
 
 async function collectMonitorSnapshot({ persist = true } = {}) {
-  const queryStartedAt = performance.now();
-  const [database, tables, business, provider] = await Promise.all([
-    pool.query(`
+  const databaseStartedAt = performance.now();
+  const databasePromise = pool.query(`
       SELECT
         pg_database_size(current_database())::bigint AS database_size,
         COUNT(*) FILTER (WHERE state = 'active')::int AS active_connections,
         COUNT(*) FILTER (WHERE state = 'idle')::int AS idle_connections
       FROM pg_stat_activity
       WHERE datname = current_database()
-    `),
+    `).then((result) => ({
+      result,
+      latencyMs: Number((performance.now() - databaseStartedAt).toFixed(1)),
+    }));
+  const [databaseSample, tables, business, provider] = await Promise.all([
+    databasePromise,
     pool.query(`
       SELECT
         relname,
@@ -4986,6 +4990,7 @@ async function collectMonitorSnapshot({ persist = true } = {}) {
     `),
     fetchProviderMetrics(),
   ]);
+  const database = databaseSample.result;
   const memory = process.memoryUsage();
   const cpuPercent = sampleCpuPercent();
   const memoryPercent = Number(
@@ -5040,7 +5045,7 @@ async function collectMonitorSnapshot({ persist = true } = {}) {
     },
     database: {
       connected: true,
-      queryLatencyMs: Number((performance.now() - queryStartedAt).toFixed(1)),
+      queryLatencyMs: databaseSample.latencyMs,
       sizeBytes: Number(database.rows[0]?.database_size || 0),
       activeConnections: Number(
         database.rows[0]?.active_connections || 0,
@@ -5241,6 +5246,192 @@ function timezoneParts(date, timeZone) {
       .filter((part) => part.type !== 'literal')
       .map((part) => [part.type, part.value]),
   );
+}
+
+function offsetIsoDate(dateText, offsetDays) {
+  return new Date(
+    new Date(`${dateText}T12:00:00Z`).getTime() + offsetDays * 86_400_000,
+  )
+    .toISOString()
+    .slice(0, 10);
+}
+
+async function getYesterdaySystemAssessment() {
+  const settings = await getPlatformSettings();
+  let timeZone = settings.reportTimezone || 'Asia/Shanghai';
+  let parts;
+  try {
+    parts = timezoneParts(new Date(), timeZone);
+  } catch {
+    timeZone = 'Asia/Shanghai';
+    parts = timezoneParts(new Date(), timeZone);
+  }
+  const today = `${parts.year}-${parts.month}-${parts.day}`;
+  const date = offsetIsoDate(today, -1);
+  const previousDate = offsetIsoDate(today, -2);
+  const result = await pool.query(
+    `
+      SELECT
+        metrics,
+        (created_at AT TIME ZONE $3)::date::text AS local_date,
+        created_at
+      FROM system_metric_samples
+      WHERE (created_at AT TIME ZONE $3)::date IN ($1::date,$2::date)
+      ORDER BY created_at
+    `,
+    [previousDate, date, timeZone],
+  );
+  const samples = result.rows
+    .filter((row) => row.local_date === date)
+    .map((row) => row.metrics || {});
+  const previousSamples = result.rows
+    .filter((row) => row.local_date === previousDate)
+    .map((row) => row.metrics || {});
+  const values = (selector, list = samples) =>
+    list
+      .map((item) => Number(selector(item)))
+      .filter(Number.isFinite);
+  const average = (selector, list = samples) => {
+    const items = values(selector, list);
+    return items.length
+      ? items.reduce((sum, value) => sum + value, 0) / items.length
+      : 0;
+  };
+  const maximum = (selector, list = samples) =>
+    Math.max(0, ...values(selector, list));
+  const latest = samples.at(-1) || {};
+  const previousLatest = previousSamples.at(-1) || {};
+  const sampleCount = samples.length;
+  const coveragePercent = Number(
+    Math.min(100, (sampleCount / 1440) * 100).toFixed(1),
+  );
+  const cpuHighMinutes = samples.filter(
+    (item) => Number(item.application?.cpuPercent || 0) >= 80,
+  ).length;
+  const memoryHighMinutes = samples.filter(
+    (item) => Number(item.application?.memoryPercent || 0) >= 85,
+  ).length;
+  const databaseWaitingMinutes = samples.filter(
+    (item) => Number(item.database?.poolWaiting || 0) > 0,
+  ).length;
+  const cpuAverage = Number(
+    average((item) => item.application?.cpuPercent).toFixed(1),
+  );
+  const cpuPeak = Number(
+    maximum((item) => item.application?.cpuPercent).toFixed(1),
+  );
+  const memoryAverage = Number(
+    average((item) => item.application?.memoryPercent).toFixed(1),
+  );
+  const memoryPeak = Number(
+    maximum((item) => item.application?.memoryPercent).toFixed(1),
+  );
+  const responseAverage = Number(
+    average((item) => item.application?.averageResponseMs).toFixed(1),
+  );
+  const response95Peak = Number(
+    maximum((item) => item.application?.p95ResponseMs).toFixed(1),
+  );
+  const errorRatePeak = Number(
+    maximum((item) => item.application?.errorRate).toFixed(1),
+  );
+  const databaseLatencyAverage = Number(
+    average((item) => item.database?.queryLatencyMs).toFixed(1),
+  );
+  const databaseLatencyPeak = Number(
+    maximum((item) => item.database?.queryLatencyMs).toFixed(1),
+  );
+  const databaseBytes = Number(latest.database?.sizeBytes || 0);
+  const previousDatabaseBytes = Number(
+    previousLatest.database?.sizeBytes || 0,
+  );
+  const databaseGrowthBytes =
+    databaseBytes && previousDatabaseBytes
+      ? databaseBytes - previousDatabaseBytes
+      : 0;
+  const databaseConnectionPeak = maximum(
+    (item) => item.database?.activeConnections,
+  );
+  const databaseWaitingPeak = maximum(
+    (item) => item.database?.poolWaiting,
+  );
+  const totalRequests = samples.reduce(
+    (sum, item) =>
+      sum + Number(item.application?.requestsPerMinute || 0),
+    0,
+  );
+  const insufficient = sampleCount < 60;
+  let serverStatus = 'healthy';
+  if (
+    cpuAverage >= 70 ||
+    memoryAverage >= 75 ||
+    cpuHighMinutes >= 60 ||
+    memoryHighMinutes >= 30
+  ) {
+    serverStatus = 'upgrade';
+  } else if (
+    cpuPeak >= 90 ||
+    memoryPeak >= 90 ||
+    response95Peak >= 1000 ||
+    errorRatePeak >= 5
+  ) {
+    serverStatus = 'watch';
+  }
+  let databaseStatus = 'healthy';
+  if (databaseWaitingMinutes >= 5) {
+    databaseStatus = 'upgrade';
+  } else if (
+    databaseWaitingPeak > 0 ||
+    databaseLatencyAverage >= 500 ||
+    databaseLatencyPeak >= 1000 ||
+    databaseConnectionPeak >= Math.max(4, DB_POOL_MAX) ||
+    databaseBytes >= 400 * 1024 * 1024 ||
+    databaseGrowthBytes >= 100 * 1024 * 1024
+  ) {
+    databaseStatus = 'watch';
+  }
+  let status = 'healthy';
+  if (insufficient) status = 'insufficient';
+  else if ([serverStatus, databaseStatus].includes('upgrade')) status = 'upgrade';
+  else if ([serverStatus, databaseStatus].includes('watch')) status = 'watch';
+  const recommendation = {
+    healthy: '昨天运行平稳，当前服务器和数据库配置可以继续使用，暂时无需升级。',
+    watch: '昨天出现短时峰值或容量提醒，当前仍可运行，建议连续观察三天后再决定是否升级。',
+    upgrade: '昨天存在持续资源压力，建议优先升级标记为“建议升级”的项目。',
+    insufficient: '昨天有效监控样本不足，暂时无法可靠判断是否需要升级，请至少连续运行一整天。',
+  }[status];
+  return {
+    date,
+    timeZone,
+    status,
+    recommendation,
+    sampleCount,
+    coveragePercent,
+    server: {
+      status: insufficient ? 'insufficient' : serverStatus,
+      cpuAverage,
+      cpuPeak,
+      cpuHighMinutes,
+      memoryAverage,
+      memoryPeak,
+      memoryHighMinutes,
+      totalRequests,
+      responseAverage,
+      response95Peak,
+      errorRatePeak,
+      ssePeak: maximum((item) => item.application?.sseConnections),
+    },
+    database: {
+      status: insufficient ? 'insufficient' : databaseStatus,
+      sizeBytes: databaseBytes,
+      growthBytes: databaseGrowthBytes,
+      connectionPeak: databaseConnectionPeak,
+      poolWaitingPeak: databaseWaitingPeak,
+      waitingMinutes: databaseWaitingMinutes,
+      latencyAverage: databaseLatencyAverage,
+      latencyPeak: databaseLatencyPeak,
+    },
+  };
 }
 
 async function buildDailyReport(reportDate, timeZone) {
@@ -5722,8 +5913,9 @@ function publicLicenseRow(row) {
 }
 
 async function getSuperDashboard() {
-  const result = await pool.query(`
-    SELECT
+  const [result, yesterday] = await Promise.all([
+    pool.query(`
+      SELECT
       (SELECT COUNT(*)::int FROM license_keys) AS license_total,
       (SELECT COUNT(*)::int FROM license_keys WHERE status = 'unused') AS license_unused,
       (SELECT COUNT(*)::int FROM license_keys
@@ -5742,7 +5934,9 @@ async function getSuperDashboard() {
         WHERE created_at >= date_trunc('day', NOW())) AS messages_today,
       (SELECT COALESCE(SUM(size),0)::bigint FROM attachments) +
         (SELECT COALESCE(SUM(size),0)::bigint FROM assets) AS media_bytes
-  `);
+    `),
+    getYesterdaySystemAssessment(),
+  ]);
   const row = result.rows[0];
   return {
     licenseTotal: Number(row.license_total || 0),
@@ -5757,6 +5951,7 @@ async function getSuperDashboard() {
     messagesToday: Number(row.messages_today || 0),
     mediaBytes: Number(row.media_bytes || 0),
     sseConnections: sseClients.size,
+    yesterday,
   };
 }
 
@@ -6001,6 +6196,7 @@ async function handleSuperRoutes(req, res, url, pathname) {
       releases,
       featureCatalog,
       featureFlags,
+      tenants,
     ] = await Promise.all([
       getSuperDashboard(),
       getPlatformSettings(),
@@ -6023,6 +6219,7 @@ async function handleSuperRoutes(req, res, url, pathname) {
       `),
       pool.query(`SELECT * FROM feature_catalog ORDER BY category,name`),
       pool.query(`SELECT * FROM feature_flags ORDER BY code`),
+      getSuperTenants(),
     ]);
     return sendJson(res, 200, {
       ok: true,
@@ -6035,6 +6232,7 @@ async function handleSuperRoutes(req, res, url, pathname) {
       releases: releases.rows,
       featureCatalog: featureCatalog.rows,
       featureFlags: featureFlags.rows,
+      tenants,
       monitor:
         lastMonitorSnapshot ||
         (await collectMonitorSnapshot({ persist: false })),
@@ -6641,9 +6839,16 @@ async function handleSuperRoutes(req, res, url, pathname) {
   if (req.method === 'POST' && pathname === '/api/super/features') {
     requireRole(admin, 'operations');
     const body = await readJson(req, 64 * 1024);
-    const code = cleanText(body.code, 80).toLowerCase();
-    if (!/^[a-z][a-z0-9_]{2,79}$/.test(code)) {
+    const requestedCode = cleanText(body.code, 80).toLowerCase();
+    if (requestedCode && !/^[a-z][a-z0-9_]{2,79}$/.test(requestedCode)) {
       return sendError(res, 400, '功能代码格式无效。', 'FEATURE_CODE');
+    }
+    const code =
+      requestedCode ||
+      `feature_${Date.now().toString(36)}_${randomBytes(3).toString('hex')}`;
+    const name = cleanText(body.name, 80);
+    if (!name) {
+      return sendError(res, 400, '请填写功能名称。', 'FEATURE_NAME');
     }
     const entitlements = cleanFeatureEntitlements(body.entitlements);
     const id = randomUUID();
@@ -6656,7 +6861,7 @@ async function handleSuperRoutes(req, res, url, pathname) {
       [
         id,
         code,
-        cleanText(body.name, 80) || code,
+        name,
         cleanText(body.description, 1000),
         cleanText(body.category, 80) || '其他',
         cleanText(body.icon, 50) || 'sparkles',
@@ -6678,6 +6883,7 @@ async function handleSuperRoutes(req, res, url, pathname) {
       { type: 'feature-catalog-updated' },
       { targetKind: 'user' },
     );
+    broadcastSuper({ type: 'feature-catalog-updated' });
     return sendJson(res, 201, { ok: true, id });
   }
   const featureMatch = pathname.match(
@@ -6686,6 +6892,9 @@ async function handleSuperRoutes(req, res, url, pathname) {
   if (featureMatch && isUuid(featureMatch[1]) && req.method === 'PATCH') {
     requireRole(admin, 'operations');
     const body = await readJson(req, 64 * 1024);
+    if (body.name !== undefined && !cleanText(body.name, 80)) {
+      return sendError(res, 400, '请填写功能名称。', 'FEATURE_NAME');
+    }
     const entitlements = body.entitlements === undefined
       ? null
       : cleanFeatureEntitlements(body.entitlements);
@@ -6728,6 +6937,7 @@ async function handleSuperRoutes(req, res, url, pathname) {
       { type: 'feature-catalog-updated' },
       { targetKind: 'user' },
     );
+    broadcastSuper({ type: 'feature-catalog-updated' });
     return sendJson(res, 200, { ok: true });
   }
 
