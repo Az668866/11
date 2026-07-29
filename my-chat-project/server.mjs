@@ -1426,8 +1426,9 @@ function authenticate(req, kind) {
 
 async function authenticateSuper(req) {
   const token =
+    getBearer(req) ||
     parseCookies(req)[SESSION_COOKIE] ||
-    (process.env.NODE_ENV === 'test' ? getBearer(req) : '');
+    '';
   const payload = verifyToken(token);
   if (
     payload?.kind !== 'super_admin' ||
@@ -5914,6 +5915,7 @@ async function handleSuperLogin(req, res) {
   );
   return sendJson(res, 200, {
     ok: true,
+    token,
     admin: {
       id: row.id,
       username: row.username,
@@ -5972,6 +5974,12 @@ async function handleSuperRoutes(req, res, url, pathname) {
   const admin = await authenticateSuper(req);
   if (!admin) {
     res.setHeader('Set-Cookie', sessionCookie('', 0));
+    if (req.method === 'GET' && pathname === '/api/super/bootstrap') {
+      return sendJson(res, 200, {
+        ok: true,
+        authenticated: false,
+      });
+    }
     return sendError(res, 401, '超级管理员登录已失效。', 'SUPER_AUTH');
   }
 
@@ -6018,6 +6026,7 @@ async function handleSuperRoutes(req, res, url, pathname) {
     ]);
     return sendJson(res, 200, {
       ok: true,
+      authenticated: true,
       admin,
       dashboard,
       platform,
