@@ -1,3 +1,8 @@
+/**
+ * 拓界云客服后端。数据库保存业务数据，R2 保存媒体文件，进程内只保留
+ * SSE 连接、短期限流和监控采样。环境变量及部署方式见 README-部署说明.md。
+ */
+
 import http from 'node:http';
 import https from 'node:https';
 import { lookup as dnsLookup } from 'node:dns';
@@ -46,6 +51,29 @@ const SUPER_ADMIN_TOTP_SECRET = String(
 )
   .replace(/\s+/g, '')
   .toUpperCase();
+const SUPER_ADMIN_USERNAME_2 = String(
+  process.env.SUPER_ADMIN_USERNAME_2 || '',
+).trim();
+const SUPER_ADMIN_PASSWORD_2 = String(
+  process.env.SUPER_ADMIN_PASSWORD_2 || '',
+);
+const SUPER_ADMIN_TOTP_SECRET_2 = String(
+  process.env.SUPER_ADMIN_TOTP_SECRET_2 || '',
+)
+  .replace(/\s+/g, '')
+  .toUpperCase();
+const ENV_SUPER_ADMINS = [
+  {
+    username: SUPER_ADMIN_USERNAME.toLowerCase(),
+    password: SUPER_ADMIN_PASSWORD,
+    totpSecret: SUPER_ADMIN_TOTP_SECRET,
+  },
+  {
+    username: SUPER_ADMIN_USERNAME_2.toLowerCase(),
+    password: SUPER_ADMIN_PASSWORD_2,
+    totpSecret: SUPER_ADMIN_TOTP_SECRET_2,
+  },
+].filter((item) => item.username && item.password);
 const COOKIE_DOMAIN = String(process.env.COOKIE_DOMAIN || '').trim();
 const COOKIE_SECURE = process.env.COOKIE_SECURE !== 'false';
 const REQUIRE_CLOUDFLARE = process.env.REQUIRE_CLOUDFLARE === 'true';
@@ -154,14 +182,34 @@ if (Boolean(SUPER_ADMIN_USERNAME) !== Boolean(SUPER_ADMIN_PASSWORD)) {
     'SUPER_ADMIN_USERNAME 和 SUPER_ADMIN_PASSWORD 必须同时设置。',
   );
 }
-if (SUPER_ADMIN_PASSWORD && SUPER_ADMIN_PASSWORD.length < 12) {
-  throw new Error('SUPER_ADMIN_PASSWORD 必须至少12位。');
+if (Boolean(SUPER_ADMIN_USERNAME_2) !== Boolean(SUPER_ADMIN_PASSWORD_2)) {
+  throw new Error(
+    'SUPER_ADMIN_USERNAME_2 和 SUPER_ADMIN_PASSWORD_2 必须同时设置。',
+  );
+}
+if (SUPER_ADMIN_PASSWORD && SUPER_ADMIN_PASSWORD.length < 8) {
+  throw new Error('SUPER_ADMIN_PASSWORD 必须至少8位。');
+}
+if (SUPER_ADMIN_PASSWORD_2 && SUPER_ADMIN_PASSWORD_2.length < 8) {
+  throw new Error('SUPER_ADMIN_PASSWORD_2 必须至少8位。');
+}
+if (
+  SUPER_ADMIN_USERNAME_2 &&
+  SUPER_ADMIN_USERNAME.toLowerCase() === SUPER_ADMIN_USERNAME_2.toLowerCase()
+) {
+  throw new Error('两个超级管理员账号不能相同。');
 }
 if (
   SUPER_ADMIN_TOTP_SECRET &&
   !/^[A-Z2-7]{16,128}$/.test(SUPER_ADMIN_TOTP_SECRET)
 ) {
   throw new Error('SUPER_ADMIN_TOTP_SECRET 必须是有效的 Base32 密钥。');
+}
+if (
+  SUPER_ADMIN_TOTP_SECRET_2 &&
+  !/^[A-Z2-7]{16,128}$/.test(SUPER_ADMIN_TOTP_SECRET_2)
+) {
+  throw new Error('SUPER_ADMIN_TOTP_SECRET_2 必须是有效的 Base32 密钥。');
 }
 if (REQUIRE_CLOUDFLARE && CLOUDFLARE_ORIGIN_SECRET.length < 24) {
   throw new Error(
@@ -1001,20 +1049,38 @@ async function initDatabase() {
         ('20000000-0000-4000-8000-000000000007','tenant_branding','独立客服品牌','租户自定义名称、头像和欢迎信息','品牌','palette')
       ON CONFLICT (code) DO NOTHING
     `);
-    if (SUPER_ADMIN_USERNAME && SUPER_ADMIN_PASSWORD) {
+    for (const envAdmin of ENV_SUPER_ADMINS) {
       await client.query(`
         INSERT INTO super_admins (
           id, username, password_hash, role, totp_secret_ciphertext
         ) VALUES ($1, $2, $3, 'owner', $4)
-        ON CONFLICT (username) DO NOTHING
+        ON CONFLICT (username) DO UPDATE SET
+          password_hash = EXCLUDED.password_hash,
+          role = 'owner',
+          totp_secret_ciphertext = EXCLUDED.totp_secret_ciphertext,
+          enabled = TRUE,
+          updated_at = NOW()
       `, [
         randomUUID(),
-        SUPER_ADMIN_USERNAME.toLowerCase(),
-        hashPassword(SUPER_ADMIN_PASSWORD),
-        SUPER_ADMIN_TOTP_SECRET
-          ? encryptSecret(SUPER_ADMIN_TOTP_SECRET)
+        envAdmin.username,
+        hashPassword(envAdmin.password),
+        envAdmin.totpSecret
+          ? encryptSecret(envAdmin.totpSecret)
           : null,
       ]);
+    }
+    if (ENV_SUPER_ADMINS.length >= 2) {
+      await client.query(
+        `
+          UPDATE super_admins
+          SET enabled = FALSE,
+              session_version = session_version + 1,
+              updated_at = NOW()
+          WHERE enabled = TRUE
+            AND NOT (username = ANY($1::text[]))
+        `,
+        [ENV_SUPER_ADMINS.map((item) => item.username)],
+      );
     }
 
     await client.query('COMMIT');
@@ -1315,7 +1381,7 @@ function sessionCookie(token, maxAge = 8 * 60 * 60) {
     `${SESSION_COOKIE}=${encodeURIComponent(token)}`,
     'Path=/',
     'HttpOnly',
-    'SameSite=None',
+    'SameSite=Strict',
     `Max-Age=${Math.max(0, Math.trunc(maxAge))}`,
   ];
   if (COOKIE_SECURE) parts.push('Secure');
@@ -1804,8 +1870,82 @@ function requestIp(req) {
   return 'unknown';
 }
 
+const CHINA_REGION_CODES = Object.freeze({
+  AH: '安徽', BJ: '北京', CQ: '重庆', FJ: '福建', GD: '广东',
+  GS: '甘肃', GX: '广西', GZ: '贵州', HA: '河南', HB: '湖北',
+  HE: '河北', HI: '海南', HK: '香港', HL: '黑龙江', HN: '湖南',
+  JL: '吉林', JS: '江苏', JX: '江西', LN: '辽宁', MO: '澳门',
+  NM: '内蒙古', NX: '宁夏', QH: '青海', SC: '四川', SD: '山东',
+  SH: '上海', SN: '陕西', SX: '山西', TJ: '天津', TW: '台湾',
+  XJ: '新疆', XZ: '西藏', YN: '云南', ZJ: '浙江',
+});
+
+const CHINA_LOCATION_NAMES = Object.freeze({
+  anhui: '安徽', beijing: '北京', chongqing: '重庆', fujian: '福建',
+  gansu: '甘肃', guangdong: '广东', guangxi: '广西',
+  guangxizhuang: '广西', guizhou: '贵州', hainan: '海南',
+  hebei: '河北', heilongjiang: '黑龙江', henan: '河南', hubei: '湖北',
+  hunan: '湖南', innermongolia: '内蒙古', jiangsu: '江苏',
+  jiangxi: '江西', jilin: '吉林', liaoning: '辽宁', neimenggu: '内蒙古',
+  ningxia: '宁夏', ningxiahui: '宁夏', qinghai: '青海',
+  shaanxi: '陕西', shandong: '山东', shanghai: '上海', shanxi: '山西',
+  sichuan: '四川', tianjin: '天津', tibet: '西藏', xinjiang: '新疆',
+  xinjianguygur: '新疆', xizang: '西藏', yunnan: '云南', zhejiang: '浙江',
+  guangzhou: '广州', shenzhen: '深圳', dongguan: '东莞', foshan: '佛山',
+  zhuhai: '珠海', zhongshan: '中山', huizhou: '惠州', jiangmen: '江门',
+  shantou: '汕头', zhanjiang: '湛江', maoming: '茂名', zhaoqing: '肇庆',
+  meizhou: '梅州', qingyuan: '清远', yangjiang: '阳江', shaoguan: '韶关',
+  heyuan: '河源', shanwei: '汕尾', jieyang: '揭阳', chaozhou: '潮州',
+  yunfu: '云浮', nanjing: '南京', suzhou: '苏州', hangzhou: '杭州',
+  ningbo: '宁波', wenzhou: '温州', fuzhou: '福州', xiamen: '厦门',
+  nanchang: '南昌', jinan: '济南', qingdao: '青岛', zhengzhou: '郑州',
+  wuhan: '武汉', changsha: '长沙', chengdu: '成都', guiyang: '贵阳',
+  kunming: '昆明', xian: '西安', lanzhou: '兰州', xining: '西宁',
+  yinchuan: '银川', urumqi: '乌鲁木齐', shenyang: '沈阳',
+  dalian: '大连', changchun: '长春', harbin: '哈尔滨',
+  shijiazhuang: '石家庄', taiyuan: '太原', hohhot: '呼和浩特',
+  nanning: '南宁', haikou: '海口', hefei: '合肥',
+});
+
+const CHINA_CITY_REGIONS = Object.freeze({
+  guangzhou: '广东', shenzhen: '广东', dongguan: '广东', foshan: '广东',
+  zhuhai: '广东', zhongshan: '广东', huizhou: '广东', jiangmen: '广东',
+  shantou: '广东', zhanjiang: '广东', maoming: '广东', zhaoqing: '广东',
+  meizhou: '广东', qingyuan: '广东', yangjiang: '广东', shaoguan: '广东',
+  heyuan: '广东', shanwei: '广东', jieyang: '广东', chaozhou: '广东',
+  yunfu: '广东', nanjing: '江苏', suzhou: '江苏', hangzhou: '浙江',
+  ningbo: '浙江', wenzhou: '浙江', fuzhou: '福建', xiamen: '福建',
+  nanchang: '江西', jinan: '山东', qingdao: '山东', zhengzhou: '河南',
+  wuhan: '湖北', changsha: '湖南', chengdu: '四川', guiyang: '贵州',
+  kunming: '云南', xian: '陕西', lanzhou: '甘肃', xining: '青海',
+  yinchuan: '宁夏', urumqi: '新疆', shenyang: '辽宁', dalian: '辽宁',
+  changchun: '吉林', harbin: '黑龙江', shijiazhuang: '河北',
+  taiyuan: '山西', hohhot: '内蒙古', nanning: '广西', haikou: '海南',
+  hefei: '安徽',
+});
+
+function cloudflareHeader(req, name, maxLength = 100) {
+  const raw = Array.isArray(req.headers[name])
+    ? req.headers[name][0]
+    : req.headers[name];
+  let value = String(raw || '').trim();
+  if (/%[0-9a-f]{2}/i.test(value)) {
+    try {
+      value = decodeURIComponent(value);
+    } catch {}
+  }
+  return cleanText(value, maxLength);
+}
+
+function chinaLocationKey(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/(?:province|city|autonomousregion)$/g, '')
+    .replace(/[^a-z0-9]/g, '');
+}
+
 function cloudflareVisitorLocation(req) {
-  const countryCode = cleanText(req.headers['cf-ipcountry'], 8).toUpperCase();
+  const countryCode = cloudflareHeader(req, 'cf-ipcountry', 8).toUpperCase();
   let country = countryCode;
   if (/^[A-Z]{2}$/.test(countryCode) && countryCode !== 'XX') {
     try {
@@ -1816,10 +1956,26 @@ function cloudflareVisitorLocation(req) {
       country = countryCode;
     }
   }
+  const rawRegion = cloudflareHeader(req, 'cf-region', 100);
+  const rawRegionCode = cloudflareHeader(req, 'cf-region-code', 16)
+    .toUpperCase()
+    .replace(/^CN-/, '');
+  const rawCity = cloudflareHeader(req, 'cf-ipcity', 100);
+  const regionKey = chinaLocationKey(rawRegion);
+  const cityKey = chinaLocationKey(rawCity);
+  const region = countryCode === 'CN'
+    ? CHINA_LOCATION_NAMES[regionKey] ||
+      CHINA_REGION_CODES[rawRegionCode] ||
+      CHINA_CITY_REGIONS[cityKey] ||
+      rawRegion
+    : rawRegion;
+  const city = countryCode === 'CN'
+    ? CHINA_LOCATION_NAMES[cityKey] || rawCity
+    : rawCity;
   const parts = [
     country,
-    cleanText(req.headers['cf-region'], 100),
-    cleanText(req.headers['cf-ipcity'], 100),
+    region,
+    city,
   ].filter(
     (item, index, list) =>
       item &&
@@ -1831,7 +1987,7 @@ function cloudflareVisitorLocation(req) {
   );
   return {
     location: cleanText(parts.join(' · '), 250),
-    timezone: cleanText(req.headers['cf-timezone'], 80),
+    timezone: cloudflareHeader(req, 'cf-timezone', 80),
   };
 }
 
@@ -7121,134 +7277,16 @@ async function handleSuperRoutes(req, res, url, pathname) {
     });
   }
 
-  if (req.method === 'GET' && pathname === '/api/super/admins') {
-    requireRole(admin, 'manager');
-    const result = await pool.query(`
-      SELECT id,username,role,enabled,last_login_at,created_at
-      FROM super_admins
-      ORDER BY created_at
-    `);
-    return sendJson(res, 200, { ok: true, admins: result.rows });
-  }
-  if (req.method === 'POST' && pathname === '/api/super/admins') {
-    requireRole(admin, 'owner');
-    const body = await readJson(req, 32 * 1024);
-    const username = cleanText(body.username, 80).toLowerCase();
-    if (!/^[a-z0-9_.-]{3,80}$/.test(username)) {
-      return sendError(res, 400, '管理员账号格式无效。', 'ADMIN_USERNAME');
-    }
-    if (String(body.password || '').length < 12) {
-      return sendError(res, 400, '管理员密码至少需要12位。', 'ADMIN_PASSWORD');
-    }
-    const role = ['manager','operations','support','readonly'].includes(body.role)
-      ? body.role : 'readonly';
-    const id = randomUUID();
-    await pool.query(
-      `
-        INSERT INTO super_admins (
-          id,username,password_hash,role,totp_secret_ciphertext
-        ) VALUES ($1,$2,$3,$4,$5)
-      `,
-      [
-        id,
-        username,
-        hashPassword(body.password),
-        role,
-        body.totpSecret
-          ? encryptSecret(
-              cleanText(body.totpSecret, 128).replace(/\s+/g, '').toUpperCase(),
-            )
-          : null,
-      ],
+  const superAdminsRoute =
+    pathname === '/api/super/admins' ||
+    /^\/api\/super\/admins\/[0-9a-f-]+$/i.test(pathname);
+  if (superAdminsRoute) {
+    return sendError(
+      res,
+      403,
+      '管理员账号只能通过服务器环境变量配置。',
+      'ENV_MANAGED_ADMINS',
     );
-    await writeAudit(req, admin, 'super_admin.create', {
-      targetType: 'super_admin',
-      targetId: id,
-      metadata: { role },
-    });
-    return sendJson(res, 201, { ok: true, id });
-  }
-  const superAdminMatch = pathname.match(
-    /^\/api\/super\/admins\/([0-9a-f-]+)$/i,
-  );
-  if (
-    superAdminMatch &&
-    isUuid(superAdminMatch[1]) &&
-    req.method === 'PATCH'
-  ) {
-    requireRole(admin, 'owner');
-    const targetId = superAdminMatch[1];
-    const body = await readJson(req, 32 * 1024);
-    const current = await pool.query(
-      `SELECT id,role,enabled FROM super_admins WHERE id=$1`,
-      [targetId],
-    );
-    if (!current.rows[0]) {
-      return sendError(res, 404, '管理员不存在。', 'NOT_FOUND');
-    }
-    if (targetId === admin.id && body.enabled === false) {
-      return sendError(res, 409, '不能停用当前登录账号。', 'ADMIN_SELF');
-    }
-    const nextRole = body.role === undefined
-      ? null
-      : ['owner','manager','operations','support','readonly'].includes(body.role)
-        ? body.role : 'readonly';
-    const removesOwner =
-      current.rows[0].role === 'owner' &&
-      (nextRole && nextRole !== 'owner' || body.enabled === false);
-    if (removesOwner) {
-      const owners = await pool.query(
-        `SELECT COUNT(*)::int AS count FROM super_admins WHERE role='owner' AND enabled=TRUE`,
-      );
-      if (Number(owners.rows[0].count) <= 1) {
-        return sendError(res, 409, '必须至少保留一个启用的所有者。', 'LAST_OWNER');
-      }
-    }
-    if (body.password !== undefined && String(body.password).length < 12) {
-      return sendError(res, 400, '管理员密码至少需要12位。', 'ADMIN_PASSWORD');
-    }
-    const encryptedTotp = body.clearTotp
-      ? null
-      : body.totpSecret === undefined
-        ? undefined
-        : encryptSecret(
-            cleanText(body.totpSecret, 128)
-              .replace(/\s+/g, '')
-              .toUpperCase(),
-          );
-    await pool.query(
-      `
-        UPDATE super_admins
-        SET role=COALESCE($2,role),
-            enabled=COALESCE($3,enabled),
-            password_hash=COALESCE($4,password_hash),
-            totp_secret_ciphertext=CASE
-              WHEN $5::boolean THEN $6
-              ELSE totp_secret_ciphertext
-            END,
-            session_version=session_version+1,
-            updated_at=NOW()
-        WHERE id=$1
-      `,
-      [
-        targetId,
-        nextRole,
-        body.enabled === undefined ? null : Boolean(body.enabled),
-        body.password === undefined ? null : hashPassword(body.password),
-        encryptedTotp !== undefined,
-        encryptedTotp === undefined ? null : encryptedTotp,
-      ],
-    );
-    await writeAudit(req, admin, 'super_admin.update', {
-      targetType: 'super_admin',
-      targetId,
-      metadata: {
-        role: nextRole,
-        enabled:
-          body.enabled === undefined ? current.rows[0].enabled : Boolean(body.enabled),
-      },
-    });
-    return sendJson(res, 200, { ok: true });
   }
 
   return sendError(res, 404, '超级管理员接口不存在。', 'NOT_FOUND');
