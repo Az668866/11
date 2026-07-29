@@ -1,16 +1,20 @@
 {
-  "name": "neon-chat-backend",
-  "version": "2.0.0",
+  "name": "tuojie-cloud-service",
+  "version": "1.8.1",
   "private": true,
   "type": "module",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "start": "node chat-backend-neon.mjs",
-    "check": "node --check chat-backend-neon.mjs"
+    "start": "node server.mjs",
+    "check": "node --check server.mjs",
+    "test": "node --test tests/*.test.mjs"
   },
   "dependencies": {
-    "pg": "^8.22.0"
+    "@aws-sdk/client-s3": "^3.1097.0",
+    "pg": "^8.22.0",
+    "qrcode": "^1.5.4",
+    "sharp": "^0.35.3"
   }
 }
