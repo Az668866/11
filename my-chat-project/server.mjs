@@ -311,6 +311,7 @@ let providerMetricsCache = {
   render: null,
   neon: null,
 };
+const telegramGenerationClaims = new Map();
 
 function nowIso() {
   return new Date().toISOString();
@@ -2785,7 +2786,11 @@ async function getPublicConversation(id, client = pool, tenantId) {
         SELECT *
         FROM messages
         WHERE conversation_id = $1
-        ORDER BY created_at DESC, id DESC
+        ORDER BY
+          created_at DESC,
+          CASE WHEN source = 'auto' THEN 1 ELSE 0 END DESC,
+          album_position DESC,
+          id DESC
         LIMIT $2
       ),
       recent_albums AS (
@@ -2800,7 +2805,11 @@ async function getPublicConversation(id, client = pool, tenantId) {
           m.id IN (SELECT id FROM recent)
           OR m.album_id IN (SELECT album_id FROM recent_albums)
         )
-      ORDER BY created_at ASC, album_position ASC, id ASC
+      ORDER BY
+        m.created_at ASC,
+        CASE WHEN m.source = 'auto' THEN 1 ELSE 0 END ASC,
+        m.album_position ASC,
+        m.id ASC
     `,
     [id, MAX_MESSAGES_PER_CONVERSATION],
   );
@@ -2825,7 +2834,10 @@ async function getAllSummaries(tenantId) {
       SELECT m.id, m.type, m.text, m.role, m.created_at
       FROM messages m
       WHERE m.conversation_id = c.id
-      ORDER BY m.created_at DESC, m.id DESC
+      ORDER BY
+        m.created_at DESC,
+        CASE WHEN m.source = 'auto' THEN 1 ELSE 0 END DESC,
+        m.id DESC
       LIMIT 1
     ) latest ON TRUE
     WHERE c.tenant_id = $1
@@ -3561,15 +3573,23 @@ async function createUserMessage(conversationId, body, tenantId) {
         const autoResult = await client.query(
           `
             INSERT INTO messages (
-              id, conversation_id, role, source, type, text, expires_at
+              id, conversation_id, role, source, type, text, created_at, expires_at
             )
             VALUES (
               $1,$2,'admin','auto','text',$3,
-              NOW() + ($4::text || ' hours')::interval
+              $5::timestamptz + INTERVAL '1 millisecond',
+              $5::timestamptz + INTERVAL '1 millisecond'
+                + ($4::text || ' hours')::interval
             )
             RETURNING *
           `,
-          [randomUUID(), conversationId, replyText, retentionHours],
+          [
+            randomUUID(),
+            conversationId,
+            replyText,
+            retentionHours,
+            messageRows.at(-1).created_at,
+          ],
         );
         autoReplyRow = autoResult.rows[0];
         await client.query(
@@ -4369,6 +4389,82 @@ function telegramGenerateKeyboard() {
   };
 }
 
+function telegramGenerationClaimKey(callback) {
+  const chatId = callback?.message?.chat?.id;
+  const messageId = callback?.message?.message_id;
+  return chatId != null && messageId != null
+    ? `${chatId}:${messageId}`
+    : '';
+}
+
+function claimTelegramGeneration(callback) {
+  const key = telegramGenerationClaimKey(callback);
+  if (!key) return { key: '', claimed: true };
+  const now = Date.now();
+  if (telegramGenerationClaims.size > 500) {
+    for (const [item, expiresAt] of telegramGenerationClaims) {
+      if (expiresAt <= now) telegramGenerationClaims.delete(item);
+    }
+  }
+  if ((telegramGenerationClaims.get(key) || 0) > now) {
+    return { key, claimed: false };
+  }
+  telegramGenerationClaims.set(key, now + 10 * 60_000);
+  return { key, claimed: true };
+}
+
+function telegramGeneratedLicenseText(created) {
+  return [
+    '<b>卡密已生成</b>',
+    '你的后台网站是 <b>YKF000.com</b>',
+    '为了你的隐私和客户安全',
+    '请保护好你的卡密 不要泄露！',
+    '',
+    `卡密类型：${created.duration.label}`,
+    `有效时长：首次登录后台后 ${created.duration.days} 天`,
+    '',
+    '<b>卡密</b>',
+    `<code>${created.licenseKey}</code>`,
+  ].join('\n');
+}
+
+function telegramGeneratedLicenseKeyboard(licenseKey) {
+  return {
+    inline_keyboard: [
+      [
+        {
+          text: '📋 点击复制卡密',
+          copy_text: { text: licenseKey },
+        },
+      ],
+    ],
+  };
+}
+
+async function showTelegramGeneratedLicense(callback, created) {
+  const chatId = callback.message?.chat?.id;
+  const messageId = callback.message?.message_id;
+  const payload = {
+    text: telegramGeneratedLicenseText(created),
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+    reply_markup: telegramGeneratedLicenseKeyboard(created.licenseKey),
+  };
+  if (chatId != null && messageId != null) {
+    await telegramApi('editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      ...payload,
+    });
+    return;
+  }
+  await telegramApi('sendMessage', {
+    chat_id: chatId,
+    ...payload,
+    ...telegramThread(callback.message),
+  });
+}
+
 function telegramThread(message) {
   return message?.message_thread_id
     ? { message_thread_id: message.message_thread_id }
@@ -4655,55 +4751,35 @@ async function processTelegramUpdate(update) {
       return;
     }
 
+    const generationClaim = claimTelegramGeneration(callback);
+    if (!generationClaim.claimed) {
+      await telegramApi('answerCallbackQuery', {
+        callback_query_id: callback.id,
+        text: '这张卡密已经生成，请查看当前消息。',
+        show_alert: true,
+      }).catch(() => {});
+      return;
+    }
+
     await telegramApi('answerCallbackQuery', {
       callback_query_id: callback.id,
       text: '正在生成卡密…',
     }).catch(() => {});
 
-    const created = await createLicenseRecord(code, {
-      telegramChatId: chatId,
-      telegramUserId: userId,
-      telegramUsername: callback.from?.username || '',
-      telegramDisplayName: telegramDisplayName(callback.from),
-      telegramUpdateId: update.update_id,
-    });
-
-    const resultText = [
-      `✅ ${created.duration.label}已生成`,
-      '',
-      `卡密：${created.licenseKey}`,
-      `有效时长：首次登录后台后 ${created.duration.days} 天`,
-      '',
-      '请确认钱包收款成功后，再把卡密发给客户。',
-      '客户首次登录后会自动创建独立后台和专属用户端入口。',
-    ].join('\n');
-    await telegramApi('sendMessage', {
-      chat_id: chatId,
-      text: resultText,
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: '📋 点击复制全部内容',
-              copy_text: { text: resultText },
-            },
-          ],
-        ],
-      },
-      ...telegramThread(callback.message),
-    });
-    const selectionMessageId = callback.message?.message_id;
-    if (selectionMessageId) {
-      await telegramApi('deleteMessage', {
-        chat_id: chatId,
-        message_id: selectionMessageId,
-      }).catch(async () => {
-        await telegramApi('editMessageReplyMarkup', {
-          chat_id: chatId,
-          message_id: selectionMessageId,
-          reply_markup: { inline_keyboard: [] },
-        }).catch(() => {});
+    try {
+      const created = await createLicenseRecord(code, {
+        telegramChatId: chatId,
+        telegramUserId: userId,
+        telegramUsername: callback.from?.username || '',
+        telegramDisplayName: telegramDisplayName(callback.from),
+        telegramUpdateId: update.update_id,
       });
+      await showTelegramGeneratedLicense(callback, created);
+    } catch (error) {
+      if (generationClaim.key) {
+        telegramGenerationClaims.delete(generationClaim.key);
+      }
+      throw error;
     }
   }
 }
