@@ -353,12 +353,13 @@ function defaultConfig() {
         replyText: '已记录人工客服请求，请稍等，客服上线后会优先回复。',
       },
     ],
-    settings: {
+      settings: {
       siteName: '在线客服',
       avatarAssetId: '',
       welcomeText: '您好，欢迎咨询。您可以发送文字、图片或视频，我们会尽快回复。',
       onlineStatusText: '客服在线',
       pageTitle: '在线客服',
+      quickReplyDirectSend: true,
       autoReplyEnabled: true,
       defaultAutoReplyEnabled: true,
       defaultAutoReply: '消息已收到，客服看到后会尽快回复。',
@@ -3020,12 +3021,16 @@ async function validateAdminSettings(body, current, tenantId) {
       input.onlineStatusText !== undefined
         ? cleanText(input.onlineStatusText, 40) || '客服在线'
         : current.settings.onlineStatusText || '客服在线',
-    pageTitle:
+       pageTitle:
       input.pageTitle !== undefined
         ? cleanText(input.pageTitle, 80) || '在线客服'
         : current.settings.pageTitle ||
           current.settings.siteName ||
           '在线客服',
+    quickReplyDirectSend:
+      input.quickReplyDirectSend !== undefined
+        ? Boolean(input.quickReplyDirectSend)
+        : current.settings.quickReplyDirectSend !== false,
     autoReplyEnabled:
       input.autoReplyEnabled !== undefined
         ? Boolean(input.autoReplyEnabled)
