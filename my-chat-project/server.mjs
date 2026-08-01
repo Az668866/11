@@ -9087,6 +9087,22 @@ function parseIsoDate(value, allowNull = true) {
   return date.toISOString();
 }
 
+async function syncCurrentReleaseVersion(databaseClient) {
+  const latest = await databaseClient.query(`
+    SELECT version
+    FROM releases
+    WHERE scope='all'
+    ORDER BY published_at DESC,created_at DESC
+    LIMIT 1
+  `);
+  const currentVersion = latest.rows[0]?.version || APP_VERSION;
+  await databaseClient.query(
+    `UPDATE platform_settings SET current_version=$1,updated_at=NOW() WHERE id=1`,
+    [currentVersion],
+  );
+  return currentVersion;
+}
+
 async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
   if (req.method === 'POST' && pathname === '/api/super/login') {
     return handleSuperLogin(req, res);
@@ -10265,6 +10281,160 @@ return sendJson(res, 200, { ok: true });
       version,
     });
     return sendJson(res, 201, { ok: true, id });
+  }
+
+  const releaseMatch = pathname.match(
+    /^\/api\/super\/releases\/([0-9a-f-]+)$/i,
+  );
+  if (
+    releaseMatch &&
+    isUuid(releaseMatch[1]) &&
+    ['PATCH', 'DELETE'].includes(req.method)
+  ) {
+    requireRole(admin, 'operations');
+    const releaseId = releaseMatch[1];
+    const body =
+      req.method === 'PATCH' ? await readJson(req, 256 * 1024) : null;
+    let updatedRelease = null;
+    let deletedRelease = null;
+    let currentVersion = APP_VERSION;
+    const databaseClient = await pool.connect();
+    try {
+      await databaseClient.query('BEGIN');
+      const existingResult = await databaseClient.query(
+        `SELECT * FROM releases WHERE id=$1 FOR UPDATE`,
+        [releaseId],
+      );
+      const existing = existingResult.rows[0];
+      if (!existing) {
+        await databaseClient.query('ROLLBACK');
+        return sendError(res, 404, '版本记录不存在。', 'RELEASE_NOT_FOUND');
+      }
+
+      if (req.method === 'PATCH') {
+        const version = cleanText(body.version ?? existing.version, 40);
+        if (!/^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(version)) {
+          await databaseClient.query('ROLLBACK');
+          return sendError(
+            res,
+            400,
+            '版本号格式应类似 1.8.2。',
+            'VERSION',
+          );
+        }
+        const duplicate = await databaseClient.query(
+          `SELECT 1 FROM releases WHERE version=$1 AND id<>$2 LIMIT 1`,
+          [version, releaseId],
+        );
+        if (duplicate.rowCount) {
+          await databaseClient.query('ROLLBACK');
+          return sendError(
+            res,
+            409,
+            '该版本号已经存在，请使用其他版本号。',
+            'VERSION_EXISTS',
+          );
+        }
+        const scope = body.scope === 'selected' ? 'selected' : 'all';
+        const tenantIds = cleanTenantIds(body.tenantIds);
+        if (scope === 'selected' && !tenantIds.length) {
+          await databaseClient.query('ROLLBACK');
+          return sendError(
+            res,
+            400,
+            '定向版本至少选择一个租户。',
+            'RELEASE_SCOPE',
+          );
+        }
+        const updated = await databaseClient.query(
+          `
+            UPDATE releases
+            SET version=$2,title=$3,new_features=$4,improvements=$5,
+                fixes=$6,known_issues=$7,scope=$8,tenant_ids=$9::jsonb,
+                force_modal=$10
+            WHERE id=$1
+            RETURNING *
+          `,
+          [
+            releaseId,
+            version,
+            cleanText(body.title, 120) || `v${version} 更新`,
+            cleanText(body.newFeatures, 10000),
+            cleanText(body.improvements, 10000),
+            cleanText(body.fixes, 10000),
+            cleanText(body.knownIssues, 10000),
+            scope,
+            JSON.stringify(tenantIds),
+            Boolean(body.forceModal),
+          ],
+        );
+        if (body.resetReads) {
+          await databaseClient.query(
+            `DELETE FROM release_reads WHERE release_id=$1`,
+            [releaseId],
+          );
+        }
+        updatedRelease = updated.rows[0];
+        updatedRelease.previous_scope = existing.scope;
+        updatedRelease.previous_tenant_ids = existing.tenant_ids;
+      } else {
+        deletedRelease = existing;
+        await databaseClient.query(`DELETE FROM releases WHERE id=$1`, [releaseId]);
+      }
+
+      currentVersion = await syncCurrentReleaseVersion(databaseClient);
+      await databaseClient.query('COMMIT');
+    } catch (error) {
+      await databaseClient.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      databaseClient.release();
+    }
+    invalidatePlatformCache();
+
+    const release = updatedRelease || deletedRelease;
+    const previousTenantIds = cleanTenantIds(
+      updatedRelease?.previous_tenant_ids || release.tenant_ids,
+    );
+    const currentTenantIds = cleanTenantIds(updatedRelease?.tenant_ids || []);
+    const notifyAll =
+      release.scope === 'all' || updatedRelease?.previous_scope === 'all';
+    const event = {
+      type: 'release-published',
+      action: updatedRelease ? 'updated' : 'deleted',
+      releaseId,
+      version: updatedRelease?.version || release.version,
+      currentVersion,
+    };
+    if (notifyAll) {
+      publishEvent(event, { targetKind: 'tenant_admin' });
+    } else {
+      const affectedTenantIds = [
+        ...new Set([...previousTenantIds, ...currentTenantIds]),
+      ];
+      for (const tenantId of affectedTenantIds) {
+        publishEvent(event, { tenantId, targetKind: 'tenant_admin' });
+      }
+    }
+    broadcastSuper(event);
+    await writeAudit(
+      req,
+      admin,
+      updatedRelease ? 'release.update' : 'release.delete',
+      {
+        targetType: 'release',
+        targetId: releaseId,
+        metadata: {
+          version: updatedRelease?.version || release.version,
+          currentVersion,
+        },
+      },
+    );
+    return sendJson(res, 200, {
+      ok: true,
+      release: updatedRelease || undefined,
+      currentVersion,
+    });
   }
 
   if (req.method === 'GET' && pathname === '/api/super/features') {
