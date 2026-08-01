@@ -1,8 +1,3 @@
-/**
- * 拓界云客服后端。数据库保存业务数据，R2 保存媒体文件，进程内只保留
- * SSE 连接、短期限流和监控采样。环境变量及部署方式见 README-部署说明.md。
- */
-
 import http from 'node:http';
 import https from 'node:https';
 import { lookup as dnsLookup } from 'node:dns';
@@ -36,7 +31,7 @@ const TOKEN_SECRET_TEXT = process.env.TOKEN_SECRET || '';
 const PUBLIC_API_BASE = String(
   process.env.PUBLIC_API_BASE || 'https://api.ykf000.com',
 ).replace(/\/+$/, '');
-const APP_VERSION = String(process.env.APP_VERSION || '2.0.0').trim();
+const APP_VERSION = String(process.env.APP_VERSION || '2.0.1').trim();
 const SUPPORT_TELEGRAM = String(
   process.env.SUPPORT_TELEGRAM || '@YingYingUu',
 ).trim();
@@ -159,6 +154,12 @@ const ACTIVE_CLEANUP_INTERVAL_MS = envNumber(
   10,
   180,
 ) * 60_000;
+const READINESS_CACHE_MS = envNumber(
+  'READINESS_CACHE_SECONDS',
+  15,
+  5,
+  60,
+) * 1000;
 const MAX_IMAGE_BYTES =
   envNumber('MAX_IMAGE_MB', 8, 1, 16) * 1024 * 1024;
 const MAX_VIDEO_BYTES =
@@ -324,6 +325,7 @@ let nextRateBucketCleanupAt = 0;
 const eventHistory = [];
 const distributorPresenceTimers = new Map();
 const requestLatencies = [];
+const routeCounters = new Map();
 const minuteCounters = {
   requests: 0,
   errors: 0,
@@ -332,12 +334,18 @@ const minuteCounters = {
   uploadFailures: 0,
   licenseFailures: 0,
   telegramWebhookFailures: 0,
+  legacyRequests: 0,
+  fullHistoryReads: 0,
+  fullHistoryMessages: 0,
+  databaseMediaReads: 0,
+  databaseMediaBytes: 0,
 };
 const metricSamples = [];
 const alertState = new Map();
 const tenantConfigCache = new Map();
 const tenantFeatureCache = new Map();
 const tenantAccessCache = new Map();
+const tenantCodeAccessCache = new Map();
 const tenantAdminAccessCache = new Map();
 const superAuthCache = new Map();
 const distributorAuthCache = new Map();
@@ -346,11 +354,15 @@ let approvedOriginCacheExpiresAt = 0;
 let nextEventId = 1;
 let lastCleanupAt = 0;
 let cleanupPromise = null;
+let cleanupFailureCount = 0;
+let nextCleanupRetryAt = 0;
 let activeUploads = 0;
 let reportTimer = null;
 let expiryReminderTimer = null;
+let expiryReminderRescheduleTimer = null;
 let activeMonitorPromise = null;
 let lastPersistedMonitorAt = 0;
+let lastMonitorCounterResetAt = Date.now();
 let activeMaintenancePromise = null;
 let lastCpuUsage = process.cpuUsage();
 let lastCpuSampleAt = process.hrtime.bigint();
@@ -358,11 +370,17 @@ let lastMonitorSnapshot = null;
 let lastPlatformSettings = null;
 let platformSettingsCacheExpiresAt = 0;
 let monitorFailureCount = 0;
+let nextMonitorRetryAt = 0;
 let startedAt = Date.now();
 let providerMetricsCache = {
   expiresAt: 0,
   render: null,
   neon: null,
+};
+let readinessCache = {
+  expiresAt: 0,
+  value: null,
+  promise: null,
 };
 const telegramGenerationClaims = new Map();
 
@@ -378,6 +396,17 @@ function normalizeApiPath(pathname) {
     apiVersion: 2,
     pathname: pathname.replace(/^\/api\/v2(?=\/)/, '/api'),
   };
+}
+
+function monitoredRouteKey(method, pathname) {
+  const normalized = normalizeApiPath(pathname).pathname
+    .replace(
+      /\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?=\/|$)/gi,
+      '/:id',
+    )
+    .replace(/\/\d+(?=\/|$)/g, '/:number')
+    .slice(0, 180);
+  return `${String(method || 'GET').toUpperCase()} ${normalized}`;
 }
 
 function requireLegacyApi(res, apiVersion) {
@@ -445,10 +474,14 @@ function invalidateTenantCaches(tenantId = '') {
 function invalidateTenantAccessCaches(tenantId = '') {
   if (!tenantId) {
     tenantAccessCache.clear();
+    tenantCodeAccessCache.clear();
     tenantAdminAccessCache.clear();
     return;
   }
   tenantAccessCache.delete(tenantId);
+  for (const [code, item] of tenantCodeAccessCache) {
+    if (item?.value?.id === tenantId) tenantCodeAccessCache.delete(code);
+  }
   for (const key of tenantAdminAccessCache.keys()) {
     if (key.startsWith(`${tenantId}:`)) tenantAdminAccessCache.delete(key);
   }
@@ -1254,6 +1287,11 @@ async function initDatabase() {
       ON messages (created_at)
     `);
     await client.query(`
+      CREATE INDEX IF NOT EXISTS messages_expires_at_idx
+      ON messages (expires_at)
+      WHERE expires_at IS NOT NULL
+    `);
+    await client.query(`
       CREATE INDEX IF NOT EXISTS messages_conversation_album_idx
       ON messages (conversation_id, album_id)
       WHERE album_id IS NOT NULL
@@ -1263,8 +1301,39 @@ async function initDatabase() {
       ON attachments (created_at)
     `);
     await client.query(`
+      CREATE INDEX IF NOT EXISTS attachments_expires_at_idx
+      ON attachments (expires_at)
+      WHERE expires_at IS NOT NULL
+    `);
+    await client.query(`
       CREATE INDEX IF NOT EXISTS attachments_conversation_idx
       ON attachments (conversation_id)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS telegram_updates_created_at_idx
+      ON telegram_updates (created_at)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS audit_logs_created_at_idx
+      ON audit_logs (created_at)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS system_metric_samples_created_at_idx
+      ON system_metric_samples (created_at)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS tenants_expiry_reminder_idx
+      ON tenants (access_expires_at)
+      WHERE status='active' AND expiry_reminder_sent_at IS NULL
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS r2_delete_queue_next_attempt_idx
+      ON r2_delete_queue (next_attempt_at,id)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS qr_incidents_cleanup_idx
+      ON qr_incidents (updated_at)
+      WHERE status IN ('resolved','failed')
     `);
 
     await client.query(
@@ -1449,6 +1518,8 @@ async function cleanupExpiredData() {
 
     await client.query('COMMIT');
     lastCleanupAt = Date.now();
+    cleanupFailureCount = 0;
+    nextCleanupRetryAt = 0;
     await processObjectDeleteQueue();
 
     return {
@@ -1468,10 +1539,20 @@ function maybeCleanupExpiredData() {
   if (Date.now() - lastCleanupAt < ACTIVE_CLEANUP_INTERVAL_MS) {
     return Promise.resolve();
   }
+  if (Date.now() < nextCleanupRetryAt) return Promise.resolve();
   if (cleanupPromise) return cleanupPromise;
 
   cleanupPromise = cleanupExpiredData()
-    .catch((error) => console.error('清理过期聊天失败：', error))
+    .catch((error) => {
+      cleanupFailureCount += 1;
+      nextCleanupRetryAt =
+        Date.now() +
+        Math.min(
+          30 * 60_000,
+          60_000 * 2 ** Math.min(cleanupFailureCount - 1, 5),
+        );
+      console.error('清理过期聊天失败：', error);
+    })
     .finally(() => {
       cleanupPromise = null;
     });
@@ -2156,6 +2237,7 @@ function sendJson(res, status, data) {
   const body = JSON.stringify(data);
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Content-Length', String(Buffer.byteLength(body)));
   res.setHeader('Cache-Control', 'no-store');
   res.end(body);
 }
@@ -2474,16 +2556,16 @@ async function readObject(objectKey) {
 
 async function queueObjectDeletes(objectKeys, client = pool) {
   const unique = [...new Set(objectKeys.filter(Boolean))];
-  for (const objectKey of unique) {
-    await client.query(
-      `
-        INSERT INTO r2_delete_queue (object_key)
-        VALUES ($1)
-        ON CONFLICT (object_key) DO NOTHING
-      `,
-      [objectKey],
-    );
-  }
+  if (!unique.length) return;
+  await client.query(
+    `
+      INSERT INTO r2_delete_queue (object_key)
+      SELECT object_key
+      FROM unnest($1::text[]) AS queued(object_key)
+      ON CONFLICT (object_key) DO NOTHING
+    `,
+    [unique],
+  );
 }
 
 async function processObjectDeleteQueue(limit = 50) {
@@ -2498,6 +2580,7 @@ async function processObjectDeleteQueue(limit = 50) {
     `,
     [limit],
   );
+  const deletedIds = [];
   for (const row of result.rows) {
     try {
       await r2.send(
@@ -2506,7 +2589,7 @@ async function processObjectDeleteQueue(limit = 50) {
           Key: row.object_key,
         }),
       );
-      await pool.query(`DELETE FROM r2_delete_queue WHERE id = $1`, [row.id]);
+      deletedIds.push(row.id);
     } catch (error) {
       const attempts = Number(row.attempts || 0) + 1;
       const delayMinutes = Math.min(360, 2 ** Math.min(attempts, 8));
@@ -2521,6 +2604,12 @@ async function processObjectDeleteQueue(limit = 50) {
         [row.id, attempts, cleanText(error.message, 500), delayMinutes],
       );
     }
+  }
+  if (deletedIds.length) {
+    await pool.query(
+      `DELETE FROM r2_delete_queue WHERE id = ANY($1::bigint[])`,
+      [deletedIds],
+    );
   }
 }
 
@@ -2638,7 +2727,10 @@ async function prepareImageUpload(req, { maxBytes, width, height }) {
 async function readStoredRow(row) {
   if (!row) return null;
   if (row.storage === 'r2') return readObject(row.object_key);
-  return Buffer.isBuffer(row.data) ? row.data : null;
+  if (!Buffer.isBuffer(row.data)) return null;
+  minuteCounters.databaseMediaReads += 1;
+  minuteCounters.databaseMediaBytes += row.data.length;
+  return row.data;
 }
 
 function publicMessage(row) {
@@ -3241,6 +3333,9 @@ async function getPublicConversation(id, client = pool, tenantId) {
     [id, MAX_MESSAGES_PER_CONVERSATION],
   );
 
+  minuteCounters.fullHistoryReads += 1;
+  minuteCounters.fullHistoryMessages += messagesResult.rowCount;
+
   return {
     ...conversationBase(conversation),
     messages: messagesResult.rows.map(publicMessage),
@@ -3829,6 +3924,7 @@ async function markConversationRead(conversationId, tenantId, reader) {
         UPDATE conversations
         SET ${unreadColumn} = 0
         WHERE id = $1 AND tenant_id = $2
+          AND ${unreadColumn} <> 0
         RETURNING id
       )
       UPDATE messages AS m
@@ -4157,34 +4253,37 @@ async function insertMediaMessages(
 ) {
   const albumId =
     type === 'image' && attachmentIds.length > 1 ? randomUUID() : null;
-  const rows = [];
-  for (let index = 0; index < attachmentIds.length; index += 1) {
-    const result = await client.query(
-      `
-        INSERT INTO messages (
-          id, conversation_id, role, source, type, text, attachment_id,
-          album_id, album_position, expires_at
-        )
-        VALUES (
-          $1,$2,$3,'manual',$4,$5,$6,$7,$8,
-          NOW() + ($9::text || ' hours')::interval
-        )
-        RETURNING *
-      `,
-      [
-        randomUUID(),
-        conversationId,
-        role,
-        type,
-        index === 0 ? text : '',
-        attachmentIds[index],
-        albumId,
-        index,
-        retentionHours,
-      ],
-    );
-    rows.push(result.rows[0]);
-  }
+  const messageIds = attachmentIds.map(() => randomUUID());
+  const messageTexts = attachmentIds.map((_, index) =>
+    index === 0 ? text : '',
+  );
+  const positions = attachmentIds.map((_, index) => index);
+  const result = await client.query(
+    `
+      INSERT INTO messages (
+        id, conversation_id, role, source, type, text, attachment_id,
+        album_id, album_position, expires_at
+      )
+      SELECT
+        input.id,$5,$6,'manual',$7,input.body_text,input.attachment_id,
+        $8,input.position,NOW() + ($9::text || ' hours')::interval
+      FROM unnest(
+        $1::uuid[],$2::uuid[],$3::text[],$4::int[]
+      ) AS input(id,attachment_id,body_text,position)
+      RETURNING *
+    `,
+    [
+      messageIds,
+      attachmentIds,
+      messageTexts,
+      positions,
+      conversationId,
+      role,
+      type,
+      albumId,
+      retentionHours,
+    ],
+  );
   await client.query(
     `
       UPDATE attachments
@@ -4194,7 +4293,10 @@ async function insertMediaMessages(
     `,
     [attachmentIds, retentionHours],
   );
-  return rows;
+  return result.rows.sort(
+    (left, right) =>
+      Number(left.album_position || 0) - Number(right.album_position || 0),
+  );
 }
 
 async function createUserMessage(
@@ -4876,8 +4978,15 @@ async function getTenantForAdminToken(payload, client = pool) {
 async function getTenantByCode(publicCode, client = pool) {
   const code = cleanText(publicCode, 100);
   if (!code) return null;
+  if (client === pool) {
+    const cached = cacheGet(tenantCodeAccessCache, code);
+    if (cached) return cached;
+  }
   const result = await client.query(`SELECT * FROM tenants WHERE public_code = $1`, [code]);
-  return result.rows[0] || null;
+  const tenant = result.rows[0] || null;
+  return tenant && client === pool
+    ? cacheSet(tenantCodeAccessCache, code, tenant, AUTH_CACHE_MS)
+    : tenant;
 }
 
 function tenantAccessIssue(tenant) {
@@ -5078,8 +5187,101 @@ async function createLicenseRecord(
   throw new Error('生成卡密失败。');
 }
 
+async function createLicenseRecordsBatch(
+  durationCode,
+  count,
+  metadata = {},
+  queryClient = pool,
+) {
+  const duration = LICENSE_DURATIONS[durationCode];
+  if (!duration) throw new Error('卡密时长无效。');
+  const requested = Math.max(1, Math.trunc(Number(count || 1)));
+  const created = [];
+  const generatedByAdminId = isUuid(metadata.generatedByAdminId)
+    ? metadata.generatedByAdminId
+    : null;
+  const generatedByDistributorId = isUuid(metadata.generatedByDistributorId)
+    ? metadata.generatedByDistributorId
+    : null;
+
+  for (let attempt = 0; attempt < 5 && created.length < requested; attempt += 1) {
+    const candidates = Array.from(
+      { length: requested - created.length },
+      () => {
+        const licenseKey = generateLicenseKey();
+        return {
+          id: randomUUID(),
+          licenseKey,
+          keyHash: hashLicenseKey(licenseKey),
+          keyCiphertext: encryptLicenseKey(licenseKey),
+          keySuffix: licenseKey.slice(-5),
+        };
+      },
+    );
+    const result = await queryClient.query(
+      `
+        INSERT INTO license_keys (
+          id,key_hash,key_ciphertext,key_prefix,key_suffix,
+          duration_code,duration_days,telegram_chat_id,telegram_user_id,
+          telegram_username,telegram_display_name,telegram_update_id,
+          generated_by_admin_id,generated_by_distributor_id
+        )
+        SELECT
+          input.id,input.key_hash,input.key_ciphertext,input.key_prefix,
+          input.key_suffix,input.duration_code,input.duration_days,
+          input.telegram_chat_id,input.telegram_user_id,
+          input.telegram_username,input.telegram_display_name,
+          input.telegram_update_id,input.generated_by_admin_id,
+          input.generated_by_distributor_id
+        FROM unnest(
+          $1::uuid[],$2::text[],$3::text[],$4::text[],$5::text[],
+          $6::text[],$7::int[],$8::text[],$9::text[],$10::text[],
+          $11::text[],$12::bigint[],$13::uuid[],$14::uuid[]
+        ) AS input(
+          id,key_hash,key_ciphertext,key_prefix,key_suffix,
+          duration_code,duration_days,telegram_chat_id,telegram_user_id,
+          telegram_username,telegram_display_name,telegram_update_id,
+          generated_by_admin_id,generated_by_distributor_id
+        )
+        ON CONFLICT DO NOTHING
+        RETURNING *
+      `,
+      [
+        candidates.map((item) => item.id),
+        candidates.map((item) => item.keyHash),
+        candidates.map((item) => item.keyCiphertext),
+        candidates.map(() => 'VIP'),
+        candidates.map((item) => item.keySuffix),
+        candidates.map(() => durationCode),
+        candidates.map(() => duration.days),
+        candidates.map(() => cleanText(metadata.telegramChatId, 50)),
+        candidates.map(() => cleanText(metadata.telegramUserId, 50)),
+        candidates.map(() => cleanText(metadata.telegramUsername, 64)),
+        candidates.map(() => cleanText(metadata.telegramDisplayName, 120)),
+        candidates.map(() => null),
+        candidates.map(() => generatedByAdminId),
+        candidates.map(() => generatedByDistributorId),
+      ],
+    );
+    const rowsById = new Map(result.rows.map((row) => [row.id, row]));
+    for (const candidate of candidates) {
+      const row = rowsById.get(candidate.id);
+      if (row) {
+        created.push({ licenseKey: candidate.licenseKey, row, duration });
+      }
+    }
+  }
+  if (created.length !== requested) {
+    throw new Error('生成卡密发生多次唯一值冲突。');
+  }
+  return created;
+}
+
 async function handleTenantLogin(req, res) {
-  if (!rateLimit(req, res, 'tenant-login', 15, 10 * 60_000)) return;
+  if (
+    !rateLimit(req, res, 'tenant-login', 15, 10 * 60_000) ||
+    !rateLimit(req, res, 'tenant-login-global', 120, 60_000, 'global')
+  ) return;
   const body = await readJson(req, 64 * 1024);
   const key = normalizeLicenseKey(body.licenseKey);
   if (!/^VIP-[A-Z2-9]{5}(?:-[A-Z2-9]{5}){3}$/.test(key)) {
@@ -5182,6 +5384,7 @@ async function handleTenantLogin(req, res) {
     targetId: tenant.id,
   }).catch(() => {});
   if (newlyActivated) {
+    requestExpiryReminderReschedule();
     broadcastSuper({ type: 'licenses-updated' });
     broadcastSuper({ type: 'tenants-updated' });
     if (activatedDistributorId) {
@@ -5278,6 +5481,7 @@ async function handleTenantRenew(req, res) {
   } catch (error) { await client.query('ROLLBACK'); throw error; }
   finally { client.release(); }
   updateTenantConnectionsAfterRenewal(tenant.id, newExpiry, newLicense.id);
+  requestExpiryReminderReschedule();
   broadcastSuper({ type: 'licenses-updated' });
   broadcastSuper({ type: 'tenants-updated' });
   if (tenant.owner_distributor_id) {
@@ -5502,21 +5706,44 @@ async function sendTelegramChunks(chatId, lines, message = null) {
   }
 }
 
-async function sendAllLicenses(chatId, message) {
-  const result = await pool.query(`
-    SELECT
-      key_ciphertext, key_prefix, key_suffix, duration_code, duration_days, status,
-      telegram_user_id, telegram_username, telegram_display_name,
-      activated_at, expires_at, revoked_at, created_at
-    FROM license_keys
-    ORDER BY created_at DESC, id DESC
-  `);
-  const rows = result.rows;
+async function sendAllLicenses(chatId, message, requestedPage = 1) {
+  const pageSize = 50;
+  const page = Math.min(
+    10_000,
+    Math.max(1, Math.trunc(Number(requestedPage || 1))),
+  );
+  const offset = (page - 1) * pageSize;
+  const result = await pool.query(
+    `
+      WITH totals AS (
+        SELECT COUNT(*)::int AS total_count FROM license_keys
+      ), page_rows AS (
+        SELECT
+          id,key_ciphertext,key_prefix,key_suffix,duration_code,duration_days,
+          status,telegram_user_id,telegram_username,telegram_display_name,
+          activated_at,expires_at,revoked_at,created_at
+        FROM license_keys
+        ORDER BY created_at DESC,id DESC
+        LIMIT $1 OFFSET $2
+      )
+      SELECT page_rows.*,totals.total_count AS _total_count
+      FROM totals
+      LEFT JOIN page_rows ON TRUE
+      ORDER BY page_rows.created_at DESC,page_rows.id DESC
+    `,
+    [pageSize, offset],
+  );
+  const total = Number(result.rows[0]?._total_count || 0);
+  const rows = result.rows.filter((row) => row.id);
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const lines = [
-    `📋 当前共有 ${rows.length} 张卡密`,
+    `📋 当前共有 ${total} 张卡密｜第 ${page}/${totalPages} 页`,
     '⚠️ 以下包含完整卡密，请勿转发到非授权群。',
     '',
   ];
+  if (!rows.length) {
+    lines.push('该页没有卡密记录。');
+  }
   rows.forEach((row, index) => {
     const fullKey = decryptLicenseKey(row.key_ciphertext);
     const expiry =
@@ -5524,7 +5751,7 @@ async function sendAllLicenses(chatId, message) {
         ? `首次登录后 ${row.duration_days} 天`
         : formatTelegramDate(row.expires_at);
     lines.push(
-      `${index + 1}. ${fullKey || `${licenseHint(row)}（历史卡密可按尾号禁用）`} · ${telegramLicenseStatus(row)}`,
+      `${offset + index + 1}. ${fullKey || `${licenseHint(row)}（历史卡密可按尾号禁用）`} · ${telegramLicenseStatus(row)}`,
       `生成者：${telegramLicenseCreator(row)}`,
       `生成：${formatTelegramDate(row.created_at)}｜到期：${expiry}`,
       ...(row.revoked_at
@@ -5533,6 +5760,9 @@ async function sendAllLicenses(chatId, message) {
       '',
     );
   });
+  if (page < totalPages) {
+    lines.push(`下一页：/keys ${page + 1}`);
+  }
   await sendTelegramChunks(chatId, lines, message);
 }
 
@@ -5913,6 +6143,7 @@ async function handleQrIncidentDomainReply(message, targetDomain) {
     } finally {
       client.release();
     }
+    invalidateTenantCaches();
     invalidateApprovedOrigins();
     await refreshApprovedOrigins(true);
     publishEvent(
@@ -5985,10 +6216,14 @@ async function processTelegramUpdate(update) {
     const revokeMatch = raw.match(
       /^(?:\/revoke(?:@[A-Za-z0-9_]+)?|禁用卡密)\s+(.+)$/i,
     );
-    const isList =
-      raw === '查看卡密' ||
-      raw === '查看所有卡密' ||
-      ['/licenses', '/keys'].includes(command);
+    const listMatch = raw.match(
+      /^(?:查看(?:所有)?卡密|\/(?:licenses|keys)(?:@[A-Za-z0-9_]+)?)(?:\s+(\d+))?$/i,
+    );
+    const isList = Boolean(listMatch);
+    const listPage = Math.min(
+      10_000,
+      Math.max(1, Math.trunc(Number(listMatch?.[1] || 1))),
+    );
     const qrDomainReply = parseQrIncidentDomainReply(raw);
 
     if (
@@ -6022,7 +6257,7 @@ async function processTelegramUpdate(update) {
           '生成卡密：发送“生成卡密”或 /key',
           '禁用卡密：禁用卡密 VIP-XXXXX-XXXXX-XXXXX-XXXXX',
           '历史卡密：也可发送“禁用卡密 尾号5位”',
-          '查看卡密：发送“查看卡密”或 /licenses',
+          '查看卡密：发送“查看卡密”或 /licenses，每页 50 张',
           '二维码异常：回复异常消息并发送“更换域名wxmb2.netlify.app”',
         ].join('\n'),
         ...telegramThread(message),
@@ -6130,7 +6365,7 @@ async function processTelegramUpdate(update) {
     }
 
     if (isList) {
-      await sendAllLicenses(chatId, message);
+      await sendAllLicenses(chatId, message, listPage);
       return;
     }
   }
@@ -6484,21 +6719,59 @@ async function collectMonitorSnapshot({ persist = true } = {}) {
       (memory.rss / (INSTANCE_MEMORY_MB * 1024 * 1024)) * 100,
     ).toFixed(2),
   );
-  const requestCount = minuteCounters.requests;
+  const counterSnapshot = { ...minuteCounters };
+  const counterWindowSeconds = Math.max(
+    60,
+    (Date.now() - lastMonitorCounterResetAt) / 1000,
+  );
+  const counterWindowMinutes = counterWindowSeconds / 60;
+  const perMinute = (value) =>
+    Number((Number(value || 0) / counterWindowMinutes).toFixed(2));
+  const topRoutes = [...routeCounters.entries()]
+    .map(([route, value]) => ({
+      route,
+      requests: Number(value.requests || 0),
+      errors: Number(value.errors || 0),
+      responseBytes: Number(value.responseBytes || 0),
+    }))
+    .sort(
+      (left, right) =>
+        right.responseBytes - left.responseBytes ||
+        right.requests - left.requests,
+    )
+    .slice(0, 12);
+  const requestCount = counterSnapshot.requests;
   const errorRate = requestCount
-    ? Number(((minuteCounters.errors / requestCount) * 100).toFixed(2))
+    ? Number(((counterSnapshot.errors / requestCount) * 100).toFixed(2))
     : 0;
   const snapshot = {
     at: nowIso(),
     uptimeSeconds: Math.trunc((Date.now() - startedAt) / 1000),
     application: {
       cpuPercent,
+      monitorIntervalMinutes: ACTIVE_MONITOR_INTERVAL_MS / 60_000,
+      monitorCacheMinutes: MONITOR_CACHE_MS / 60_000,
       memoryRssBytes: memory.rss,
       memoryHeapBytes: memory.heapUsed,
       memoryLimitBytes: INSTANCE_MEMORY_MB * 1024 * 1024,
       memoryPercent,
-      requestsPerMinute: requestCount,
-      errorsPerMinute: minuteCounters.errors,
+      sampleWindowSeconds: Number(counterWindowSeconds.toFixed(1)),
+      requestsInWindow: requestCount,
+      errorsInWindow: counterSnapshot.errors,
+      messagesInWindow: counterSnapshot.messages,
+      uploadsInWindow: counterSnapshot.uploads,
+      uploadFailuresInWindow: counterSnapshot.uploadFailures,
+      licenseFailuresInWindow: counterSnapshot.licenseFailures,
+      telegramWebhookFailuresInWindow:
+        counterSnapshot.telegramWebhookFailures,
+      legacyRequestsInWindow: counterSnapshot.legacyRequests,
+      fullHistoryReadsInWindow: counterSnapshot.fullHistoryReads,
+      fullHistoryMessagesInWindow: counterSnapshot.fullHistoryMessages,
+      databaseMediaReadsInWindow: counterSnapshot.databaseMediaReads,
+      databaseMediaBytesInWindow: counterSnapshot.databaseMediaBytes,
+      topRoutes,
+      requestsPerMinute: perMinute(requestCount),
+      errorsPerMinute: perMinute(counterSnapshot.errors),
       errorRate,
       averageResponseMs: requestLatencies.length
         ? Number(
@@ -6509,9 +6782,9 @@ async function collectMonitorSnapshot({ persist = true } = {}) {
           )
         : 0,
       p95ResponseMs: percentile(requestLatencies, 95),
-      messagesPerMinute: minuteCounters.messages,
-      uploadsPerMinute: minuteCounters.uploads,
-      uploadFailuresPerMinute: minuteCounters.uploadFailures,
+      messagesPerMinute: perMinute(counterSnapshot.messages),
+      uploadsPerMinute: perMinute(counterSnapshot.uploads),
+      uploadFailuresPerMinute: perMinute(counterSnapshot.uploadFailures),
       activeUploads,
       sseConnections: sseClients.size,
       onlineTenants: new Set(
@@ -6524,9 +6797,10 @@ async function collectMonitorSnapshot({ persist = true } = {}) {
           .filter((client) => client.kind === 'user')
           .map((client) => client.conversationId),
       ).size,
-      licenseFailuresPerMinute: minuteCounters.licenseFailures,
+      licenseFailuresPerMinute: perMinute(counterSnapshot.licenseFailures),
       telegramWebhookFailuresPerMinute:
-        minuteCounters.telegramWebhookFailures,
+        perMinute(counterSnapshot.telegramWebhookFailures),
+      legacyRequestsPerMinute: perMinute(counterSnapshot.legacyRequests),
     },
     database: {
       connected: true,
@@ -6554,6 +6828,7 @@ async function collectMonitorSnapshot({ persist = true } = {}) {
       mediaBytes: Number(business.rows[0]?.media_bytes || 0),
       r2DeleteQueue: Number(business.rows[0]?.delete_queue || 0),
       r2Enabled: R2_ENABLED,
+      cleanupIntervalMinutes: ACTIVE_CLEANUP_INTERVAL_MS / 60_000,
       cleanupLastRunAt: lastCleanupAt
         ? new Date(lastCleanupAt).toISOString()
         : null,
@@ -6574,10 +6849,14 @@ async function collectMonitorSnapshot({ persist = true } = {}) {
     );
     lastPersistedMonitorAt = Date.now();
   }
-  for (const key of Object.keys(minuteCounters)) minuteCounters[key] = 0;
-  requestLatencies.length = 0;
+  if (persist) {
+    for (const key of Object.keys(minuteCounters)) minuteCounters[key] = 0;
+    requestLatencies.length = 0;
+    routeCounters.clear();
+    lastMonitorCounterResetAt = Date.now();
+  }
   broadcastSuper({ type: 'monitor-updated', monitor: snapshot });
-  await evaluateAlerts(snapshot);
+  if (persist) await evaluateAlerts(snapshot);
   return snapshot;
 }
 
@@ -6596,7 +6875,7 @@ async function getMonitorSnapshotCached({ force = false, persist = false } = {})
   activeMonitorPromise = collectMonitorSnapshot({ persist })
     .catch((error) => {
       console.error('监控采集失败：', error.message);
-      handleMonitorFailure(error).catch(() => {});
+      if (persist) handleMonitorFailure(error).catch(() => {});
       if (lastMonitorSnapshot) return lastMonitorSnapshot;
       throw error;
     })
@@ -6614,6 +6893,7 @@ function scheduleActiveDatabaseWork(pathname) {
   ) return;
   if (
     Date.now() - lastPersistedMonitorAt >= ACTIVE_MONITOR_INTERVAL_MS &&
+    Date.now() >= nextMonitorRetryAt &&
     !activeMonitorPromise
   ) {
     setTimeout(() => {
@@ -6622,6 +6902,7 @@ function scheduleActiveDatabaseWork(pathname) {
   }
   if (
     Date.now() - lastCleanupAt >= ACTIVE_CLEANUP_INTERVAL_MS &&
+    Date.now() >= nextCleanupRetryAt &&
     !activeMaintenancePromise
   ) {
     activeMaintenancePromise = Promise.resolve()
@@ -6646,6 +6927,7 @@ async function sendTelegramAlert(text) {
 
 async function evaluateAlerts(snapshot) {
   monitorFailureCount = 0;
+  nextMonitorRetryAt = 0;
   const settings = await getPlatformSettings();
   const options = settings.alertSettings || {};
   const number = (key, fallback, minimum, maximum) => {
@@ -6662,6 +6944,10 @@ async function evaluateAlerts(snapshot) {
   const uploadFailureThreshold = number('uploadFailures', 3, 1, 1000);
   const consecutiveChecks = number('consecutiveChecks', 2, 1, 10);
   const cooldownMinutes = number('cooldownMinutes', 60, 5, 1440);
+  const cleanupAlertAfterMinutes = Math.max(
+    45,
+    Math.ceil((ACTIVE_CLEANUP_INTERVAL_MS * 2) / 60_000),
+  );
   const enabled = (code) => options[`${code}Enabled`] !== false;
   const checks = [
     {
@@ -6698,9 +6984,9 @@ async function evaluateAlerts(snapshot) {
       code: 'r2',
       active:
         enabled('r2') &&
-        snapshot.application.uploadFailuresPerMinute >=
+        snapshot.application.uploadFailuresInWindow >=
           uploadFailureThreshold,
-      text: `媒体上传连续失败 ${snapshot.application.uploadFailuresPerMinute} 次`,
+      text: `媒体上传失败 ${snapshot.application.uploadFailuresInWindow} 次（当前采样窗口）`,
     },
     {
       code: 'render',
@@ -6722,16 +7008,16 @@ async function evaluateAlerts(snapshot) {
       code: 'cleanup',
       active:
         enabled('cleanup') &&
-        lastCleanupAt > 0 &&
-        Date.now() - lastCleanupAt > 15 * 60_000,
-      text: '消息与媒体清理任务超过15分钟未成功运行',
+        Date.now() - (lastCleanupAt || startedAt) >
+          cleanupAlertAfterMinutes * 60_000,
+      text: `消息与媒体清理任务超过${cleanupAlertAfterMinutes}分钟未成功运行`,
     },
     {
       code: 'telegram',
       active:
         enabled('telegram') &&
-        snapshot.application.telegramWebhookFailuresPerMinute > 0,
-      text: `Telegram Webhook 处理失败 ${snapshot.application.telegramWebhookFailuresPerMinute} 次`,
+        snapshot.application.telegramWebhookFailuresInWindow > 0,
+      text: `Telegram Webhook 处理失败 ${snapshot.application.telegramWebhookFailuresInWindow} 次（当前采样窗口）`,
     },
   ];
   for (const check of checks) {
@@ -6755,6 +7041,12 @@ async function evaluateAlerts(snapshot) {
 
 async function handleMonitorFailure(error) {
   monitorFailureCount += 1;
+  nextMonitorRetryAt =
+    Date.now() +
+    Math.min(
+      15 * 60_000,
+      30_000 * 2 ** Math.min(monitorFailureCount - 1, 5),
+    );
   if (monitorFailureCount !== 2) return;
   await sendTelegramAlert(
     [
@@ -6791,6 +7083,15 @@ function offsetIsoDate(dateText, offsetDays) {
   )
     .toISOString()
     .slice(0, 10);
+}
+
+function sampleRequestTotal(sample) {
+  const application = sample?.application || {};
+  if (Number.isFinite(Number(application.requestsInWindow))) {
+    return Number(application.requestsInWindow);
+  }
+  // 2.0.0 旧样本虽命名为“每分钟”，实际保存的是整个采样窗口总数。
+  return Number(application.requestsPerMinute || 0);
 }
 
 async function getYesterdaySystemAssessment() {
@@ -6898,8 +7199,7 @@ async function getYesterdaySystemAssessment() {
     (item) => item.database?.poolWaiting,
   );
   const totalRequests = samples.reduce(
-    (sum, item) =>
-      sum + Number(item.application?.requestsPerMinute || 0),
+    (sum, item) => sum + sampleRequestTotal(item),
     0,
   );
   const insufficient = sampleCount < 4;
@@ -7039,8 +7339,7 @@ async function buildDailyReport(reportDate, timeZone) {
         ) / sampleMetrics.length
       : 0;
   const totalRequests = sampleMetrics.reduce(
-    (sum, item) =>
-      sum + Number(item.application?.requestsPerMinute || 0),
+    (sum, item) => sum + sampleRequestTotal(item),
     0,
   );
   const abnormalSamples = sampleMetrics.filter(
@@ -7433,6 +7732,17 @@ async function scheduleNextReport() {
     }
   }, nextReportDelay(settings));
   reportTimer.unref();
+}
+
+function requestExpiryReminderReschedule() {
+  if (expiryReminderRescheduleTimer) return;
+  expiryReminderRescheduleTimer = setTimeout(() => {
+    expiryReminderRescheduleTimer = null;
+    scheduleNextExpiryReminder().catch((error) =>
+      console.error('到期提醒调度失败：', error.message),
+    );
+  }, 250);
+  expiryReminderRescheduleTimer.unref();
 }
 
 async function scheduleNextExpiryReminder() {
@@ -8241,7 +8551,10 @@ async function getDistributorDashboard(distributorId) {
 }
 
 async function handleDistributorLogin(req, res) {
-  if (!rateLimit(req, res, 'distributor-login', 12, 15 * 60_000)) return;
+  if (
+    !rateLimit(req, res, 'distributor-login', 12, 15 * 60_000) ||
+    !rateLimit(req, res, 'distributor-login-global', 60, 60_000, 'global')
+  ) return;
   const body = await readJson(req, 32 * 1024);
   const username = normalizeDistributorUsername(body.username);
   const result = username
@@ -8419,15 +8732,14 @@ async function handleDistributorRoutes(req, res, url, pathname, apiVersion = 1) 
           'DISTRIBUTOR_QUOTA',
         );
       }
-      for (let index = 0; index < count; index += 1) {
-        created.push(
-          await createLicenseRecord(
-            durationCode,
-            { generatedByDistributorId: distributor.id },
-            client,
-          ),
-        );
-      }
+      created.push(
+        ...(await createLicenseRecordsBatch(
+          durationCode,
+          count,
+          { generatedByDistributorId: distributor.id },
+          client,
+        )),
+      );
       after = before - count;
       await client.query(
         `
@@ -8660,7 +8972,10 @@ async function handleDistributorRoutes(req, res, url, pathname, apiVersion = 1) 
 }
 
 async function handleSuperLogin(req, res) {
-  if (!rateLimit(req, res, 'super-login', 10, 15 * 60_000)) return;
+  if (
+    !rateLimit(req, res, 'super-login', 10, 15 * 60_000) ||
+    !rateLimit(req, res, 'super-login-global', 60, 60_000, 'global')
+  ) return;
   const body = await readJson(req, 32 * 1024);
   const username = cleanText(body.username, 80).toLowerCase();
   const result = await pool.query(
@@ -8854,7 +9169,11 @@ async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
           : undefined,
       monitor:
         lastMonitorSnapshot ||
-        (await getMonitorSnapshotCached({ persist: false })),
+        (await getMonitorSnapshotCached({
+          persist:
+            Date.now() - lastPersistedMonitorAt >=
+            ACTIVE_MONITOR_INTERVAL_MS,
+        })),
     });
   }
 
@@ -9218,16 +9537,15 @@ async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
     if (!LICENSE_DURATIONS[body.durationCode]) {
       return sendError(res, 400, '卡密时长无效。', 'LICENSE_DURATION');
     }
-    const licenses = [];
-    for (let index = 0; index < count; index += 1) {
-      const created = await createLicenseRecord(body.durationCode, {
-        generatedByAdminId: admin.id,
-      });
-      licenses.push({
+    const createdLicenses = await createLicenseRecordsBatch(
+      body.durationCode,
+      count,
+      { generatedByAdminId: admin.id },
+    );
+    const licenses = createdLicenses.map((created) => ({
         ...publicLicenseRow(created.row),
         fullKey: created.licenseKey,
-      });
-    }
+      }));
     await writeAudit(req, admin, 'license.create', {
       targetType: 'license_batch',
       targetId: body.durationCode,
@@ -9378,6 +9696,7 @@ async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
       if (row.tenant_id && disconnectPayload) {
         disconnectTenant(row.tenant_id, disconnectPayload);
       }
+      if (row.tenant_id) invalidateTenantAccessCaches(row.tenant_id);
       await writeAudit(req, admin, `license.${body.action}`, {
         targetType: 'license',
         targetId: licenseId,
@@ -9656,6 +9975,7 @@ if (body.action === 'assignDistributor') {
       );
       broadcast({ type: 'settings-updated' }, null, tenantId);
     }
+   invalidateTenantCaches(tenantId);
    invalidateTenantAccessCaches(tenantId);
    await writeAudit(
   req,
@@ -9919,6 +10239,7 @@ return sendJson(res, 200, { ok: true });
         `UPDATE platform_settings SET current_version=$1,updated_at=NOW() WHERE id=1`,
         [version],
       );
+      invalidatePlatformCache();
     }
     await writeAudit(req, admin, 'release.publish', {
       targetType: 'release',
@@ -10540,6 +10861,7 @@ return sendJson(res, 200, { ok: true });
       } finally {
         client.release();
       }
+      invalidateTenantCaches();
       invalidateApprovedOrigins();
       await refreshApprovedOrigins(true);
       await writeAudit(req, admin, 'template.update', {
@@ -10594,11 +10916,18 @@ return sendJson(res, 200, { ok: true });
     });
   }
   if (req.method === 'GET' && pathname === '/api/super/monitor') {
+    const forceRefresh = url.searchParams.get('refresh') === '1';
+    if (
+      forceRefresh &&
+      !rateLimit(req, res, 'super-monitor-refresh', 6, 60_000, admin.id)
+    ) return;
     return sendJson(res, 200, {
       ok: true,
       monitor: await getMonitorSnapshotCached({
-        force: url.searchParams.get('refresh') === '1',
-        persist: false,
+        force: forceRefresh,
+        persist:
+          Date.now() - lastPersistedMonitorAt >=
+          ACTIVE_MONITOR_INTERVAL_MS,
       }),
     });
   }
@@ -10690,6 +11019,38 @@ return sendJson(res, 200, { ok: true });
   return sendError(res, 404, '超级管理员接口不存在。', 'NOT_FOUND');
 }
 
+async function getReadinessStatus() {
+  if (
+    readinessCache.value &&
+    readinessCache.expiresAt > Date.now()
+  ) {
+    return readinessCache.value;
+  }
+  if (readinessCache.promise) return readinessCache.promise;
+
+  const readinessPromise = pool.query(`
+    SELECT
+      NOW() AS now,
+      EXISTS(
+        SELECT 1 FROM super_admins WHERE enabled=TRUE LIMIT 1
+      ) AS super_admin_ready
+  `).then((result) => ({
+    superAdminReady: Boolean(result.rows[0]?.super_admin_ready),
+    databaseTime: new Date(result.rows[0].now).toISOString(),
+  }));
+  readinessCache.promise = readinessPromise;
+  try {
+    const value = await readinessPromise;
+    readinessCache.value = value;
+    readinessCache.expiresAt = Date.now() + READINESS_CACHE_MS;
+    return value;
+  } finally {
+    if (readinessCache.promise === readinessPromise) {
+      readinessCache.promise = null;
+    }
+  }
+}
+
 async function router(req, res) {
   setCommonHeaders(req, res);
 
@@ -10722,13 +11083,7 @@ async function router(req, res) {
   }
 
   if (req.method === 'GET' && rawPathname === '/health/ready') {
-    const result = await pool.query(`
-      SELECT
-        NOW() AS now,
-        EXISTS(
-          SELECT 1 FROM super_admins WHERE enabled=TRUE LIMIT 1
-        ) AS super_admin_ready
-    `);
+    const readiness = await getReadinessStatus();
     return sendJson(res, 200, {
       ok: true,
       service: 'tuojie-cloud-service',
@@ -10736,8 +11091,9 @@ async function router(req, res) {
       database: 'neon-postgresql',
       mediaStorage: R2_ENABLED ? 'cloudflare-r2' : 'postgres-fallback',
       telegramBotEnabled: TELEGRAM_ENABLED,
-      superAdminReady: Boolean(result.rows[0]?.super_admin_ready),
-      databaseTime: new Date(result.rows[0].now).toISOString(),
+      superAdminReady: readiness.superAdminReady,
+      databaseTime: readiness.databaseTime,
+      cacheSeconds: READINESS_CACHE_MS / 1000,
     });
   }
 
@@ -10846,7 +11202,10 @@ async function router(req, res) {
   }
 
   if (req.method === 'POST' && pathname === '/api/user/session') {
-    if (!rateLimit(req, res, 'new-session', 20, 60_000)) return;
+    if (
+      !rateLimit(req, res, 'new-session', 20, 60_000) ||
+      !rateLimit(req, res, 'new-session-global', 600, 60_000, 'global')
+    ) return;
     const body = await readJson(req, 64 * 1024);
     const tenant = await getTenantByCode(body.tenantCode);
     if (!tenant) {
@@ -11129,9 +11488,24 @@ async function router(req, res) {
       }
     }
     if (payload.kind === 'user') {
-      const conversation = await getConversationRow(payload.conversationId, pool, false, payload.tenantId);
-      if (!conversation || !authorizeConversation(payload, conversation)) return sendError(res,401,'会话已失效。','AUTH');
-      await touchConversation(conversation.id,{},req,payload.tenantId);
+      if (
+        !isUuid(payload.conversationId) ||
+        !cleanText(payload.visitorKey, 200)
+      ) {
+        return sendError(res, 401, '会话已失效。', 'AUTH');
+      }
+      if (apiVersion < 2) {
+        const conversation = await getConversationRow(
+          payload.conversationId,
+          pool,
+          false,
+          payload.tenantId,
+        );
+        if (!conversation || !authorizeConversation(payload, conversation)) {
+          return sendError(res, 401, '会话已失效。', 'AUTH');
+        }
+        await touchConversation(conversation.id, {}, req, payload.tenantId);
+      }
     }
     const connectionIdentity =
       payload.kind === 'super_admin'
@@ -11224,7 +11598,15 @@ async function router(req, res) {
     );
     if (payload.kind === 'tenant_admin') {
       await pool.query(
-        `UPDATE tenants SET last_admin_online_at=NOW() WHERE id=$1`,
+        `
+          UPDATE tenants
+          SET last_admin_online_at=NOW()
+          WHERE id=$1
+            AND (
+              last_admin_online_at IS NULL
+              OR last_admin_online_at < NOW() - INTERVAL '1 minute'
+            )
+        `,
         [payload.tenantId],
       );
     }
@@ -11509,7 +11891,6 @@ async function router(req, res) {
               }
             : undefined,
       });
-      invalidateTenantCaches();
     }
 
     if (req.method === 'GET' && pathname === '/api/admin/config') {
@@ -12247,10 +12628,19 @@ async function router(req, res) {
 const server = http.createServer((req, res) => {
   const requestStartedAt = performance.now();
   const requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const requestPath = normalizeApiPath(
-    requestUrl.pathname.replace(/\/+$/, '') || '/',
-  ).pathname;
+  const rawRequestPath = requestUrl.pathname.replace(/\/+$/, '') || '/';
+  const requestPath = normalizeApiPath(rawRequestPath).pathname;
   minuteCounters.requests += 1;
+  if (
+    rawRequestPath.startsWith('/api/') &&
+    !rawRequestPath.startsWith('/api/v2/') &&
+    rawRequestPath !== '/api/v2' &&
+    rawRequestPath !== '/api/telegram/webhook' &&
+    !rawRequestPath.startsWith('/api/public/') &&
+    rawRequestPath !== '/api/public'
+  ) {
+    minuteCounters.legacyRequests += 1;
+  }
   res.once('finish', () => {
     const duration = performance.now() - requestStartedAt;
     requestLatencies.push(duration);
@@ -12258,6 +12648,19 @@ const server = http.createServer((req, res) => {
       requestLatencies.splice(0, requestLatencies.length - 5000);
     }
     if (res.statusCode >= 400) minuteCounters.errors += 1;
+    let routeKey = monitoredRouteKey(req.method, rawRequestPath);
+    if (!routeCounters.has(routeKey) && routeCounters.size >= 200) {
+      routeKey = `${String(req.method || 'GET').toUpperCase()} /api/:other`;
+    }
+    const routeMetric = routeCounters.get(routeKey) || {
+      requests: 0,
+      errors: 0,
+      responseBytes: 0,
+    };
+    routeMetric.requests += 1;
+    if (res.statusCode >= 400) routeMetric.errors += 1;
+    routeMetric.responseBytes += Number(res.getHeader('Content-Length') || 0);
+    routeCounters.set(routeKey, routeMetric);
     if (res.statusCode < 500) scheduleActiveDatabaseWork(requestPath);
   });
   router(req, res).catch((error) => {
