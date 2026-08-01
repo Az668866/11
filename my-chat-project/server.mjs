@@ -40,6 +40,9 @@ const APP_VERSION = String(process.env.APP_VERSION || '1.8.1').trim();
 const SUPPORT_TELEGRAM = String(
   process.env.SUPPORT_TELEGRAM || '@YingYingUu',
 ).trim();
+const CUSTOMER_SERVICE_TELEGRAM = String(
+  process.env.CUSTOMER_SERVICE_TELEGRAM || '@kjwh8',
+).trim();
 const SUPER_ADMIN_USERNAME = String(
   process.env.SUPER_ADMIN_USERNAME || '',
 ).trim();
@@ -85,6 +88,9 @@ const RENDER_SERVICE_ID = String(process.env.RENDER_SERVICE_ID || '').trim();
 const NEON_API_KEY = String(process.env.NEON_API_KEY || '').trim();
 const NEON_PROJECT_ID = String(process.env.NEON_PROJECT_ID || '').trim();
 const NEON_ORG_ID = String(process.env.NEON_ORG_ID || '').trim();
+const NETLIFY_AUTH_TOKEN = String(
+  process.env.NETLIFY_AUTH_TOKEN || '',
+).trim();
 const INSTANCE_MEMORY_MB = envNumber(
   'INSTANCE_MEMORY_MB',
   2048,
@@ -466,6 +472,7 @@ async function initDatabase() {
         name TEXT NOT NULL,
         base_url TEXT NOT NULL,
         origin TEXT NOT NULL,
+        netlify_site_id TEXT NOT NULL DEFAULT '',
         cover_asset_id UUID REFERENCES assets(id) ON DELETE SET NULL,
         client_version TEXT NOT NULL DEFAULT '1.8.1',
         min_backend_version TEXT NOT NULL DEFAULT '1.8.1',
@@ -487,6 +494,10 @@ async function initDatabase() {
     await client.query(`
       ALTER TABLE frontend_templates
       ADD COLUMN IF NOT EXISTS selection_closed BOOLEAN NOT NULL DEFAULT FALSE
+    `);
+    await client.query(`
+      ALTER TABLE frontend_templates
+      ADD COLUMN IF NOT EXISTS netlify_site_id TEXT NOT NULL DEFAULT ''
     `);
     await client.query(`DROP INDEX IF EXISTS frontend_templates_origin_unique_idx`);
     await client.query(`
@@ -547,6 +558,7 @@ async function initDatabase() {
         brand_name TEXT NOT NULL DEFAULT '拓界云客服',
         current_version TEXT NOT NULL DEFAULT '1.8.1',
         support_telegram TEXT NOT NULL DEFAULT '@YingYingUu',
+        customer_service_telegram TEXT NOT NULL DEFAULT '@kjwh8',
         telegram_group_id TEXT NOT NULL DEFAULT '',
         report_time TEXT NOT NULL DEFAULT '09:00',
         report_timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',
@@ -555,6 +567,10 @@ async function initDatabase() {
         alert_settings JSONB NOT NULL DEFAULT '{}'::jsonb,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
+    `);
+    await client.query(`
+      ALTER TABLE platform_settings
+      ADD COLUMN IF NOT EXISTS customer_service_telegram TEXT NOT NULL DEFAULT '@kjwh8'
     `);
     await client.query(`
       INSERT INTO platform_settings (
@@ -733,6 +749,36 @@ async function initDatabase() {
         update_id BIGINT PRIMARY KEY,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS qr_incidents (
+        id UUID PRIMARY KEY,
+        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        template_id UUID NOT NULL REFERENCES frontend_templates(id) ON DELETE CASCADE,
+        status TEXT NOT NULL DEFAULT 'open'
+          CHECK (status IN ('open','processing','resolved','failed')),
+        reported_base_url TEXT NOT NULL,
+        requested_base_url TEXT NOT NULL DEFAULT '',
+        telegram_chat_id TEXT,
+        telegram_message_id BIGINT,
+        resolved_by_telegram_user_id TEXT,
+        error TEXT NOT NULL DEFAULT '',
+        reported_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        processing_started_at TIMESTAMPTZ,
+        resolved_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS qr_incidents_active_unique_idx
+      ON qr_incidents (tenant_id, template_id)
+      WHERE status IN ('open','processing')
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS qr_incidents_telegram_message_idx
+      ON qr_incidents (telegram_chat_id, telegram_message_id)
+      WHERE telegram_message_id IS NOT NULL
     `);
 
     await client.query(`
@@ -1159,6 +1205,11 @@ async function cleanupExpiredData() {
     );
 
     await client.query(`DELETE FROM telegram_updates WHERE created_at < NOW() - INTERVAL '30 days'`);
+    await client.query(`
+      DELETE FROM qr_incidents
+      WHERE status IN ('resolved','failed')
+        AND updated_at < NOW() - INTERVAL '180 days'
+    `);
     await client.query(`DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL '7 days'`);
     await client.query(`DELETE FROM system_metric_samples WHERE created_at < NOW() - INTERVAL '7 days'`);
     await queueObjectDeletes(objectKeys, client);
@@ -2419,7 +2470,8 @@ async function getTemplateCatalog(
   const result = await client.query(
     `
       SELECT
-        ft.id, ft.name, ft.base_url, ft.origin, ft.cover_asset_id,
+        ft.id, ft.name, ft.base_url, ft.origin, ft.netlify_site_id,
+        ft.cover_asset_id,
         ft.client_version, ft.min_backend_version, ft.status,
         ft.selection_closed, ft.sort_order, ft.recommended, ft.is_default,
         ft.test_tenant_ids,
@@ -2427,7 +2479,13 @@ async function getTemplateCatalog(
           SELECT COUNT(*)::int
           FROM tenant_config tc
           WHERE tc.frontend_template_id = ft.id
-        ) AS usage_count
+        ) AS usage_count,
+        (
+          SELECT COUNT(*)::int
+          FROM qr_incidents qi
+          WHERE qi.template_id = ft.id
+            AND qi.status IN ('open','processing')
+        ) AS active_incident_count
       FROM frontend_templates ft
       WHERE $1::boolean
          OR (
@@ -2470,6 +2528,9 @@ async function getTemplateCatalog(
     baseUrl: row.base_url,
     displayUrl: row.base_url.replace(/^https:\/\//i, '').replace(/\/$/, ''),
     origin: row.origin,
+    ...(isSuper
+      ? { netlifySiteId: row.netlify_site_id || '' }
+      : { netlifyReady: Boolean(row.netlify_site_id && NETLIFY_AUTH_TOKEN) }),
     coverUrl: row.cover_asset_id
       ? `${PUBLIC_API_BASE}/api/public/assets/${row.cover_asset_id}`
       : '',
@@ -2484,6 +2545,7 @@ async function getTemplateCatalog(
       ? row.test_tenant_ids
       : [],
     usageCount: Number(row.usage_count || 0),
+    activeIncidentCount: Number(row.active_incident_count || 0),
   }));
 }
 
@@ -2504,7 +2566,12 @@ async function getPlatformSettings(client = pool) {
       brandName: row.brand_name || '拓界云客服',
       currentVersion: row.current_version || APP_VERSION,
       supportTelegram: row.support_telegram || SUPPORT_TELEGRAM,
+      technicalSupportTelegram:
+        row.support_telegram || SUPPORT_TELEGRAM,
+      customerServiceTelegram:
+        row.customer_service_telegram || CUSTOMER_SERVICE_TELEGRAM,
       telegramGroupId: row.telegram_group_id || '',
+      netlifyConfigured: Boolean(NETLIFY_AUTH_TOKEN),
       reportTime: row.report_time || '09:00',
       reportTimezone: row.report_timezone || 'Asia/Shanghai',
       dailyReportEnabled: Boolean(row.daily_report_enabled),
@@ -3123,6 +3190,15 @@ function broadcast(payload, conversationId = null, tenantId = null) {
 
 function broadcastSuper(payload) {
   publishEvent(payload, { targetKind: 'super_admin' });
+}
+
+function scheduleSuperPresenceUpdate() {
+  if (scheduleSuperPresenceUpdate.timer) return;
+  scheduleSuperPresenceUpdate.timer = setTimeout(() => {
+    scheduleSuperPresenceUpdate.timer = null;
+    broadcastSuper({ type: 'tenant-presence-updated' });
+  }, 300);
+  scheduleSuperPresenceUpdate.timer.unref();
 }
 
 function replayEvents(client, lastEventId) {
@@ -4011,10 +4087,10 @@ function sendTenantAccessError(res, tenant, audience = 'admin') {
       ok: false,
       error:
         audience === 'admin'
-          ? `你的卡密已被禁用，如有疑问请联系 Telegram ${SUPPORT_TELEGRAM}。`
+          ? `你的卡密已被禁用，如有疑问请联系 Telegram ${CUSTOMER_SERVICE_TELEGRAM}。`
           : '该客服服务已停用，请联系商家。',
       code: issue,
-      supportTelegram: SUPPORT_TELEGRAM,
+      supportTelegram: CUSTOMER_SERVICE_TELEGRAM,
     });
   }
   return sendError(
@@ -4241,7 +4317,7 @@ async function handleTenantLogin(req, res) {
       const accessIssue = tenantAccessIssue(tenant);
       if (accessIssue === 'LICENSE_REVOKED') {
         throw requestError(
-          `你的卡密已被禁用，如有疑问请联系 Telegram ${SUPPORT_TELEGRAM}。`,
+          `你的卡密已被禁用，如有疑问请联系 Telegram ${CUSTOMER_SERVICE_TELEGRAM}。`,
           403,
           'LICENSE_REVOKED',
         );
@@ -4576,6 +4652,398 @@ async function sendAllLicenses(chatId, message) {
   await sendTelegramChunks(chatId, lines, message);
 }
 
+function normalizeNetlifySiteId(value) {
+  const siteId = cleanText(value, 120);
+  return /^[a-z0-9][a-z0-9-]{0,119}$/i.test(siteId) ? siteId : '';
+}
+
+function normalizeNetlifyDomain(value) {
+  let domain = cleanText(value, 300).trim().toLowerCase();
+  domain = domain
+    .replace(/^https?:\/\//i, '')
+    .replace(/[/?#].*$/, '')
+    .replace(/\.+$/, '');
+  return /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.netlify\.app$/i.test(domain)
+    ? domain
+    : '';
+}
+
+function parseQrIncidentDomainReply(value) {
+  const raw = cleanText(value, 500).trim();
+  const match = raw.match(/^更换域名\s*(.+)$/i);
+  if (!match) return { matched: false, domain: '' };
+  return { matched: true, domain: normalizeNetlifyDomain(match[1]) };
+}
+
+function displayTemplateDomain(value) {
+  try {
+    return new URL(value).hostname;
+  } catch {
+    return cleanText(value, 300) || '未知域名';
+  }
+}
+
+async function sendTelegramReply(message, text) {
+  return telegramApi('sendMessage', {
+    chat_id: message.chat.id,
+    text,
+    reply_parameters: {
+      message_id: message.message_id,
+      allow_sending_without_reply: true,
+    },
+    ...telegramThread(message),
+  });
+}
+
+async function updateNetlifySiteDomain(siteId, domain) {
+  if (!NETLIFY_AUTH_TOKEN) {
+    throw new Error('服务器尚未配置 NETLIFY_AUTH_TOKEN。');
+  }
+  const normalizedSiteId = normalizeNetlifySiteId(siteId);
+  const normalizedDomain = normalizeNetlifyDomain(domain);
+  if (!normalizedSiteId || !normalizedDomain) {
+    throw new Error('Netlify Site ID 或目标域名格式无效。');
+  }
+  const siteName = normalizedDomain.slice(0, -'.netlify.app'.length);
+  const response = await fetch(
+    `https://api.netlify.com/api/v1/sites/${encodeURIComponent(normalizedSiteId)}`,
+    {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${NETLIFY_AUTH_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ name: siteName }),
+      signal: AbortSignal.timeout(20_000),
+    },
+  );
+  const result = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(
+      cleanText(
+        result?.message || result?.error || `Netlify 返回状态 ${response.status}`,
+        300,
+      ),
+    );
+  }
+  const returnedName = cleanText(result?.name, 120).toLowerCase();
+  if (returnedName && returnedName !== siteName) {
+    throw new Error('Netlify 返回的站点名称与目标域名不一致。');
+  }
+  return `https://${normalizedDomain}/`;
+}
+
+async function createQrIncidentReport(tenant, template) {
+  if (!TELEGRAM_ENABLED) {
+    throw requestError(
+      'Telegram 机器人尚未启用，请联系平台管理员。',
+      503,
+      'TELEGRAM_DISABLED',
+    );
+  }
+  const settings = await getPlatformSettings();
+  if (!settings.telegramGroupId) {
+    throw requestError(
+      '平台尚未设置 Telegram 异常通知群。',
+      503,
+      'TELEGRAM_GROUP',
+    );
+  }
+  const existing = await pool.query(
+    `
+      SELECT id,status,reported_at
+      FROM qr_incidents
+      WHERE tenant_id=$1 AND template_id=$2
+        AND status IN ('open','processing')
+      ORDER BY reported_at DESC
+      LIMIT 1
+    `,
+    [tenant.id, template.id],
+  );
+  if (existing.rows[0]) {
+    return {
+      id: existing.rows[0].id,
+      duplicate: true,
+      status: existing.rows[0].status,
+    };
+  }
+
+  const incidentId = randomUUID();
+  try {
+    await pool.query(
+      `
+        INSERT INTO qr_incidents (
+          id,tenant_id,template_id,reported_base_url,status
+        ) VALUES ($1,$2,$3,$4,'open')
+      `,
+      [incidentId, tenant.id, template.id, template.base_url],
+    );
+  } catch (error) {
+    if (error?.code !== '23505') throw error;
+    const concurrent = await pool.query(
+      `
+        SELECT id,status
+        FROM qr_incidents
+        WHERE tenant_id=$1 AND template_id=$2
+          AND status IN ('open','processing')
+        ORDER BY reported_at DESC
+        LIMIT 1
+      `,
+      [tenant.id, template.id],
+    );
+    if (concurrent.rows[0]) {
+      return {
+        id: concurrent.rows[0].id,
+        duplicate: true,
+        status: concurrent.rows[0].status,
+      };
+    }
+    throw error;
+  }
+
+  const domain = displayTemplateDomain(template.base_url);
+  const netlifyState = !NETLIFY_AUTH_TOKEN
+    ? '服务器未配置访问令牌'
+    : template.netlify_site_id
+      ? '已就绪'
+      : '该模板未填写 Netlify Site ID';
+  try {
+    const sent = await telegramApi('sendMessage', {
+      chat_id: settings.telegramGroupId,
+      text: [
+        '🚨 二维码异常',
+        '',
+        `租户：${tenant.name || '未命名租户'}（${tenant.public_code}）`,
+        `模板：${template.name}`,
+        `异常域名：${domain}`,
+        `Netlify 自动更换：${netlifyState}`,
+        `异常编号：${incidentId}`,
+        '',
+        '处理时请直接回复本条消息，例如：',
+        '更换域名wxmb2.netlify.app',
+      ].join('\n'),
+      link_preview_options: { is_disabled: true },
+    });
+    await pool.query(
+      `
+        UPDATE qr_incidents
+        SET telegram_chat_id=$2,telegram_message_id=$3,updated_at=NOW()
+        WHERE id=$1
+      `,
+      [incidentId, String(settings.telegramGroupId), sent.message_id],
+    );
+  } catch (error) {
+    await pool.query(
+      `
+        UPDATE qr_incidents
+        SET status='failed',error=$2,updated_at=NOW()
+        WHERE id=$1
+      `,
+      [incidentId, cleanText(error.message, 500)],
+    ).catch(() => {});
+    throw requestError(
+      '异常信息发送失败，请联系平台管理员检查机器人设置。',
+      502,
+      'TELEGRAM_SEND',
+    );
+  }
+  broadcastSuper({ type: 'qr-incident-updated' });
+  return { id: incidentId, duplicate: false, status: 'open' };
+}
+
+async function handleQrIncidentDomainReply(message, targetDomain) {
+  const repliedMessageId = Number(message.reply_to_message?.message_id);
+  if (!Number.isSafeInteger(repliedMessageId)) {
+    await sendTelegramReply(
+      message,
+      '请直接回复机器人发送的“二维码异常”消息，再输入：更换域名wxmb2.netlify.app',
+    );
+    return;
+  }
+  if (!targetDomain) {
+    await sendTelegramReply(
+      message,
+      '域名格式不正确。请使用：更换域名wxmb2.netlify.app',
+    );
+    return;
+  }
+  const incidentResult = await pool.query(
+    `
+      SELECT
+        qi.*,ft.name AS template_name,ft.base_url AS current_base_url,
+        ft.netlify_site_id,t.name AS tenant_name,t.public_code
+      FROM qr_incidents qi
+      JOIN frontend_templates ft ON ft.id=qi.template_id
+      JOIN tenants t ON t.id=qi.tenant_id
+      WHERE qi.telegram_chat_id=$1 AND qi.telegram_message_id=$2
+      ORDER BY qi.reported_at DESC
+      LIMIT 1
+    `,
+    [String(message.chat.id), repliedMessageId],
+  );
+  const incident = incidentResult.rows[0];
+  if (!incident) {
+    await sendTelegramReply(
+      message,
+      '没有找到这条异常记录，请确认回复的是机器人发送的二维码异常消息。',
+    );
+    return;
+  }
+  if (incident.status === 'resolved') {
+    await sendTelegramReply(
+      message,
+      `这条异常已经处理完成，当前域名：${displayTemplateDomain(incident.requested_base_url || incident.current_base_url)}`,
+    );
+    return;
+  }
+  if (incident.status === 'processing') {
+    await sendTelegramReply(message, '这条异常正在处理中，请勿重复提交。');
+    return;
+  }
+  if (!NETLIFY_AUTH_TOKEN) {
+    await sendTelegramReply(
+      message,
+      '无法自动更换：服务器尚未配置 NETLIFY_AUTH_TOKEN。',
+    );
+    return;
+  }
+  if (!normalizeNetlifySiteId(incident.netlify_site_id)) {
+    await sendTelegramReply(
+      message,
+      '无法自动更换：请先在超级后台“前端模板”中填写此模板的 Netlify Site ID。',
+    );
+    return;
+  }
+  const currentDomain = displayTemplateDomain(incident.current_base_url);
+  if (!normalizeNetlifyDomain(currentDomain)) {
+    await sendTelegramReply(
+      message,
+      `当前模板域名 ${currentDomain} 不是 netlify.app 域名，已停止自动操作。`,
+    );
+    return;
+  }
+  const collision = await pool.query(
+    `SELECT id,name FROM frontend_templates WHERE base_url=$1 AND id<>$2 LIMIT 1`,
+    [`https://${targetDomain}/`, incident.template_id],
+  );
+  if (collision.rows[0]) {
+    await sendTelegramReply(
+      message,
+      `目标域名已被模板“${collision.rows[0].name}”使用，请换一个域名。`,
+    );
+    return;
+  }
+
+  let claimed;
+  try {
+    claimed = await pool.query(
+      `
+        UPDATE qr_incidents
+        SET status='processing',requested_base_url=$2,
+            resolved_by_telegram_user_id=$3,
+            processing_started_at=NOW(),error='',updated_at=NOW()
+        WHERE id=$1 AND status IN ('open','failed')
+        RETURNING id
+      `,
+      [incident.id, `https://${targetDomain}/`, String(message.from?.id || '')],
+    );
+  } catch (error) {
+    if (error?.code === '23505') {
+      await sendTelegramReply(
+        message,
+        '此租户和模板已有另一条异常正在处理，请先完成最新异常。',
+      );
+      return;
+    }
+    throw error;
+  }
+  if (!claimed.rows[0]) {
+    await sendTelegramReply(message, '异常状态已经变化，请刷新消息后重试。');
+    return;
+  }
+
+  try {
+    const nextBaseUrl = currentDomain === targetDomain
+      ? `https://${targetDomain}/`
+      : await updateNetlifySiteDomain(incident.netlify_site_id, targetDomain);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `
+          UPDATE frontend_templates
+          SET base_url=$2,origin=$3,updated_at=NOW()
+          WHERE id=$1
+        `,
+        [incident.template_id, nextBaseUrl, new URL(nextBaseUrl).origin],
+      );
+      await client.query(
+        `
+          UPDATE qr_incidents
+          SET status='resolved',requested_base_url=$2,resolved_at=NOW(),
+              error='',updated_at=NOW()
+          WHERE id=$1
+        `,
+        [incident.id, nextBaseUrl],
+      );
+      await client.query(
+        `
+          INSERT INTO audit_logs (action,target_type,target_id,metadata)
+          VALUES ('frontend_template.netlify_domain_change','frontend_template',$1,$2::jsonb)
+        `,
+        [
+          incident.template_id,
+          JSON.stringify({
+            incidentId: incident.id,
+            tenantId: incident.tenant_id,
+            oldDomain: currentDomain,
+            newDomain: targetDomain,
+            telegramUserId: String(message.from?.id || ''),
+          }),
+        ],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    invalidateApprovedOrigins();
+    await refreshApprovedOrigins(true);
+    publishEvent(
+      { type: 'frontend_catalog_updated' },
+      { targetKind: 'tenant_admin' },
+    );
+    broadcastSuper({ type: 'frontend_catalog_updated' });
+    broadcastSuper({ type: 'qr-incident-updated' });
+    await sendTelegramReply(
+      message,
+      [
+        '✅ 域名已更换并同步',
+        `租户：${incident.tenant_name || '未命名租户'}（${incident.public_code}）`,
+        `模板：${incident.template_name}`,
+        `旧域名：${currentDomain}`,
+        `新域名：${targetDomain}`,
+        '超级后台和租户后台已通过实时连接同步，无需轮询。',
+      ].join('\n'),
+    );
+  } catch (error) {
+    await pool.query(
+      `
+        UPDATE qr_incidents
+        SET status='failed',error=$2,updated_at=NOW()
+        WHERE id=$1
+      `,
+      [incident.id, cleanText(error.message, 500)],
+    ).catch(() => {});
+    await sendTelegramReply(
+      message,
+      `❌ 自动更换失败：${cleanText(error.message, 300)}\n请检查 Netlify 令牌、Site ID 和目标域名后，重新回复本异常消息。`,
+    );
+  }
+}
+
 async function processTelegramUpdate(update) {
   const message = update?.message;
   const callback = update?.callback_query;
@@ -4599,8 +5067,15 @@ async function processTelegramUpdate(update) {
       raw === '查看卡密' ||
       raw === '查看所有卡密' ||
       ['/licenses', '/keys'].includes(command);
+    const qrDomainReply = parseQrIncidentDomainReply(raw);
 
-    if (!isHelp && !isGenerate && !revokeMatch && !isList) return;
+    if (
+      !isHelp &&
+      !isGenerate &&
+      !revokeMatch &&
+      !isList &&
+      !qrDomainReply.matched
+    ) return;
 
     if (!telegramOperatorAllowed(chat, userId)) {
       await telegramApi('sendMessage', {
@@ -4608,6 +5083,11 @@ async function processTelegramUpdate(update) {
         text: '⛔ 当前用户或群组未被授权使用此机器人。',
         ...telegramThread(message),
       });
+      return;
+    }
+
+    if (qrDomainReply.matched) {
+      await handleQrIncidentDomainReply(message, qrDomainReply.domain);
       return;
     }
 
@@ -4621,6 +5101,7 @@ async function processTelegramUpdate(update) {
           '禁用卡密：禁用卡密 VIP-XXXXX-XXXXX-XXXXX-XXXXX',
           '历史卡密：也可发送“禁用卡密 尾号5位”',
           '查看卡密：发送“查看卡密”或 /licenses',
+          '二维码异常：回复异常消息并发送“更换域名wxmb2.netlify.app”',
         ].join('\n'),
         ...telegramThread(message),
       });
@@ -4713,8 +5194,8 @@ async function processTelegramUpdate(update) {
         disconnectTenant(revokedTenantId, {
           type: 'license-revoked',
           message:
-            `你的卡密已被禁用，如有疑问请联系 Telegram ${SUPPORT_TELEGRAM}。`,
-          supportTelegram: SUPPORT_TELEGRAM,
+            `你的卡密已被禁用，如有疑问请联系 Telegram ${CUSTOMER_SERVICE_TELEGRAM}。`,
+          supportTelegram: CUSTOMER_SERVICE_TELEGRAM,
           at: nowIso(),
         });
       }
@@ -4780,6 +5261,7 @@ async function processTelegramUpdate(update) {
         telegramUpdateId: update.update_id,
       });
       await showTelegramGeneratedLicense(callback, created);
+      broadcastSuper({ type: 'licenses-updated' });
     } catch (error) {
       if (generationClaim.key) {
         telegramGenerationClaims.delete(generationClaim.key);
@@ -5993,8 +6475,66 @@ function publicLicenseRow(row) {
   };
 }
 
+async function getRealtimeTenantPresence() {
+  const presence = new Map();
+  for (const client of sseClients) {
+    if (!isUuid(client.tenantId)) continue;
+    if (!['tenant_admin', 'user'].includes(client.kind)) continue;
+    const item = presence.get(client.tenantId) || {
+      tenantId: client.tenantId,
+      adminDevices: 0,
+      visitorIds: new Set(),
+    };
+    if (client.kind === 'tenant_admin') item.adminDevices += 1;
+    if (client.kind === 'user' && client.conversationId) {
+      item.visitorIds.add(client.conversationId);
+    }
+    presence.set(client.tenantId, item);
+  }
+  const tenantIds = [...presence.keys()];
+  const tenantRows = tenantIds.length
+    ? (
+        await pool.query(
+          `SELECT id,name,public_code FROM tenants WHERE id=ANY($1::uuid[])`,
+          [tenantIds],
+        )
+      ).rows
+    : [];
+  const tenantMeta = new Map(tenantRows.map((row) => [row.id, row]));
+  const tenants = [...presence.values()]
+    .map((item) => {
+      const row = tenantMeta.get(item.tenantId) || {};
+      return {
+        tenantId: item.tenantId,
+        name: row.name || '未命名租户',
+        publicCode: row.public_code || '',
+        adminDevices: item.adminDevices,
+        onlineVisitors: item.visitorIds.size,
+        chatting: item.visitorIds.size > 0,
+      };
+    })
+    .sort((left, right) =>
+      Number(right.chatting) - Number(left.chatting) ||
+      right.adminDevices - left.adminDevices ||
+      left.name.localeCompare(right.name, 'zh-CN'),
+    );
+  return {
+    onlineTenantCount: tenants.filter((item) => item.adminDevices > 0).length,
+    onlineTenantDevices: tenants.reduce(
+      (sum, item) => sum + item.adminDevices,
+      0,
+    ),
+    chattingTenantCount: tenants.filter((item) => item.chatting).length,
+    onlineVisitors: tenants.reduce(
+      (sum, item) => sum + item.onlineVisitors,
+      0,
+    ),
+    tenants,
+  };
+}
+
 async function getSuperDashboard() {
-  const [result, yesterday] = await Promise.all([
+  const [result, yesterday, presence] = await Promise.all([
     pool.query(`
       SELECT
       (SELECT COUNT(*)::int FROM license_keys) AS license_total,
@@ -6017,6 +6557,7 @@ async function getSuperDashboard() {
         (SELECT COALESCE(SUM(size),0)::bigint FROM assets) AS media_bytes
     `),
     getYesterdaySystemAssessment(),
+    getRealtimeTenantPresence(),
   ]);
   const row = result.rows[0];
   return {
@@ -6033,6 +6574,7 @@ async function getSuperDashboard() {
     mediaBytes: Number(row.media_bytes || 0),
     sseConnections: sseClients.size,
     yesterday,
+    presence,
   };
 }
 
@@ -6059,6 +6601,9 @@ async function getSuperTenants() {
       l.expires_at,
       l.status AS license_status,
       l.generated_by_admin_id,
+      l.telegram_user_id,
+      l.telegram_username,
+      l.telegram_display_name,
       sa.username AS generated_by_username,
       tc.retention_hours,
       tc.frontend_template_id,
@@ -6116,7 +6661,9 @@ async function getSuperTenants() {
     licenseId: row.license_id || null,
     maskedKey: row.license_id ? licenseHint(row) : '',
     licenseStatus: row.license_status || '',
-    generator: row.generated_by_username || 'Telegram/历史记录',
+    generator:
+      row.generated_by_username ||
+      telegramLicenseCreator(row),
     retentionHours: Number(row.retention_hours || 24),
     frontendTemplateId: row.frontend_template_id || null,
     frontendTemplateName: row.frontend_template_name || '',
@@ -6127,6 +6674,15 @@ async function getSuperTenants() {
       (client) =>
         client.kind === 'tenant_admin' && client.tenantId === row.id,
     ).length,
+    onlineVisitors: new Set(
+      [...sseClients]
+        .filter(
+          (client) =>
+            client.kind === 'user' && client.tenantId === row.id,
+        )
+        .map((client) => client.conversationId)
+        .filter(Boolean),
+    ).size,
   }));
 }
 
@@ -6428,8 +6984,8 @@ async function handleSuperRoutes(req, res, url, pathname) {
             );
             disconnectPayload = {
               type: 'license-revoked',
-              message: `你的卡密已被禁用，如有疑问请联系 Telegram ${SUPPORT_TELEGRAM}。`,
-              supportTelegram: SUPPORT_TELEGRAM,
+              message: `你的卡密已被禁用，如有疑问请联系 Telegram ${CUSTOMER_SERVICE_TELEGRAM}。`,
+              supportTelegram: CUSTOMER_SERVICE_TELEGRAM,
               at: nowIso(),
             };
           }
@@ -7122,6 +7678,15 @@ async function handleSuperRoutes(req, res, url, pathname) {
     }
     parsed.hash = '';
     const baseUrl = parsed.toString();
+    const netlifySiteId = normalizeNetlifySiteId(body.netlifySiteId);
+    if (body.netlifySiteId && !netlifySiteId) {
+      return sendError(
+        res,
+        400,
+        'Netlify Site ID 格式无效。',
+        'NETLIFY_SITE_ID',
+      );
+    }
     const id = randomUUID();
     const isDefault = Boolean(body.isDefault);
     const status = isDefault
@@ -7140,16 +7705,18 @@ async function handleSuperRoutes(req, res, url, pathname) {
       await client.query(
         `
           INSERT INTO frontend_templates (
-            id,name,base_url,origin,client_version,min_backend_version,
+            id,name,base_url,origin,netlify_site_id,
+            client_version,min_backend_version,
             status,selection_closed,sort_order,recommended,is_default,
             test_tenant_ids
-          ) VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE,$8,$9,$10,$11::jsonb)
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE,$9,$10,$11,$12::jsonb)
         `,
         [
           id,
           cleanText(body.name, 80) || parsed.hostname,
           baseUrl,
           parsed.origin,
+          netlifySiteId,
           cleanText(body.clientVersion, 30) || APP_VERSION,
           cleanText(body.minBackendVersion, 30) || APP_VERSION,
           status,
@@ -7314,6 +7881,7 @@ async function handleSuperRoutes(req, res, url, pathname) {
       const body = await readJson(req, 64 * 1024);
       let baseUrl = null;
       let origin = null;
+      let netlifySiteId = null;
       if (body.baseUrl !== undefined) {
         try {
           const parsed = new URL(cleanText(body.baseUrl, 500));
@@ -7323,6 +7891,17 @@ async function handleSuperRoutes(req, res, url, pathname) {
           origin = parsed.origin;
         } catch {
           return sendError(res, 400, '模板必须使用有效 HTTPS 地址。', 'TEMPLATE_URL');
+        }
+      }
+      if (body.netlifySiteId !== undefined) {
+        netlifySiteId = normalizeNetlifySiteId(body.netlifySiteId);
+        if (body.netlifySiteId && !netlifySiteId) {
+          return sendError(
+            res,
+            400,
+            'Netlify Site ID 格式无效。',
+            'NETLIFY_SITE_ID',
+          );
         }
       }
       const status = body.status === undefined
@@ -7437,14 +8016,15 @@ async function handleSuperRoutes(req, res, url, pathname) {
             SET name=COALESCE($2,name),
                 base_url=COALESCE($3,base_url),
                 origin=COALESCE($4,origin),
-                client_version=COALESCE($5,client_version),
-                min_backend_version=COALESCE($6,min_backend_version),
-                status=COALESCE($7,status),
-                selection_closed=COALESCE($8,selection_closed),
-                sort_order=COALESCE($9,sort_order),
-                recommended=COALESCE($10,recommended),
-                is_default=CASE WHEN $11::boolean THEN TRUE ELSE is_default END,
-                test_tenant_ids=COALESCE($12::jsonb,test_tenant_ids),
+                netlify_site_id=COALESCE($5,netlify_site_id),
+                client_version=COALESCE($6,client_version),
+                min_backend_version=COALESCE($7,min_backend_version),
+                status=COALESCE($8,status),
+                selection_closed=COALESCE($9,selection_closed),
+                sort_order=COALESCE($10,sort_order),
+                recommended=COALESCE($11,recommended),
+                is_default=CASE WHEN $12::boolean THEN TRUE ELSE is_default END,
+                test_tenant_ids=COALESCE($13::jsonb,test_tenant_ids),
                 updated_at=NOW()
             WHERE id=$1
           `,
@@ -7453,6 +8033,7 @@ async function handleSuperRoutes(req, res, url, pathname) {
             body.name === undefined ? null : cleanText(body.name, 80),
             baseUrl,
             origin,
+            netlifySiteId,
             body.clientVersion === undefined
               ? null : cleanText(body.clientVersion, 30),
             body.minBackendVersion === undefined
@@ -7536,12 +8117,13 @@ async function handleSuperRoutes(req, res, url, pathname) {
         UPDATE platform_settings
         SET brand_name=COALESCE($1,brand_name),
             support_telegram=COALESCE($2,support_telegram),
-            telegram_group_id=COALESCE($3,telegram_group_id),
-            report_time=COALESCE($4,report_time),
-            report_timezone=COALESCE($5,report_timezone),
-            daily_report_enabled=COALESCE($6,daily_report_enabled),
-            weekly_report_enabled=COALESCE($7,weekly_report_enabled),
-            alert_settings=COALESCE($8::jsonb,alert_settings),
+            customer_service_telegram=COALESCE($3,customer_service_telegram),
+            telegram_group_id=COALESCE($4,telegram_group_id),
+            report_time=COALESCE($5,report_time),
+            report_timezone=COALESCE($6,report_timezone),
+            daily_report_enabled=COALESCE($7,daily_report_enabled),
+            weekly_report_enabled=COALESCE($8,weekly_report_enabled),
+            alert_settings=COALESCE($9::jsonb,alert_settings),
             updated_at=NOW()
         WHERE id=1
       `,
@@ -7549,6 +8131,8 @@ async function handleSuperRoutes(req, res, url, pathname) {
         body.brandName === undefined ? null : cleanText(body.brandName, 80),
         body.supportTelegram === undefined
           ? null : cleanText(body.supportTelegram, 80),
+        body.customerServiceTelegram === undefined
+          ? null : cleanText(body.customerServiceTelegram, 80),
         body.telegramGroupId === undefined
           ? null : cleanText(body.telegramGroupId, 80),
         body.reportTime === undefined ? null : reportTime,
@@ -8028,6 +8612,9 @@ async function router(req, res) {
           : new Date(tenant.access_expires_at).getTime(),
     };
     sseClients.add(client);
+    if (['tenant_admin', 'user'].includes(payload.kind)) {
+      scheduleSuperPresenceUpdate();
+    }
     replayEvents(
       client,
       req.headers['last-event-id'] || url.searchParams.get('lastEventId'),
@@ -8059,7 +8646,11 @@ async function router(req, res) {
       );
     }
     req.on('close', () => {
-      sseClients.delete(client);
+      const removed = sseClients.delete(client);
+      if (
+        removed &&
+        ['tenant_admin', 'user'].includes(payload.kind)
+      ) scheduleSuperPresenceUpdate();
       if (payload.kind !== 'user') return;
       setTimeout(() => {
         if (
@@ -8447,6 +9038,83 @@ async function router(req, res) {
         payload.tenantId,
       );
       return sendJson(res, 200, { ok: true });
+    }
+
+    if (req.method === 'POST' && pathname === '/api/admin/qr-incident') {
+      if (
+        !rateLimit(
+          req,
+          res,
+          'qr-incident',
+          6,
+          10 * 60_000,
+          payload.tenantId,
+        )
+      ) return;
+      const body = await readJson(req, 16 * 1024);
+      const config = await getConfig(payload.tenantId);
+      const templateId = cleanText(
+        body.templateId || config.settings.frontendTemplateId,
+        80,
+      );
+      if (!isUuid(templateId)) {
+        return sendError(
+          res,
+          400,
+          '用户端模板无效。',
+          'FRONTEND_TEMPLATE',
+        );
+      }
+      const templateResult = await pool.query(
+        `
+          SELECT id,name,base_url,netlify_site_id
+          FROM frontend_templates
+          WHERE id=$1
+            AND (
+              (
+                status='enabled'
+                AND (
+                  selection_closed=FALSE
+                  OR EXISTS (
+                    SELECT 1 FROM tenant_config selected
+                    WHERE selected.tenant_id=$2
+                      AND selected.frontend_template_id=frontend_templates.id
+                  )
+                )
+              )
+              OR (
+                status='testing'
+                AND EXISTS (
+                  SELECT 1
+                  FROM jsonb_array_elements_text(test_tenant_ids) allowed(id)
+                  WHERE allowed.id=$2::text
+                )
+              )
+            )
+        `,
+        [templateId, payload.tenantId],
+      );
+      const template = templateResult.rows[0];
+      if (!template) {
+        return sendError(
+          res,
+          404,
+          '用户端模板不可用。',
+          'FRONTEND_TEMPLATE',
+        );
+      }
+      const incident = await createQrIncidentReport(activeTenant, template);
+      await writeAudit(req, null, 'tenant.qr_incident.report', {
+        targetType: 'frontend_template',
+        targetId: template.id,
+        metadata: { incidentId: incident.id, duplicate: incident.duplicate },
+      }).catch(() => {});
+      return sendJson(res, incident.duplicate ? 200 : 201, {
+        ok: true,
+        incidentId: incident.id,
+        duplicate: incident.duplicate,
+        status: incident.status,
+      });
     }
 
     if (req.method === 'GET' && pathname === '/api/admin/qr') {
