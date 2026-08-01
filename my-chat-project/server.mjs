@@ -6934,6 +6934,8 @@ async function getSuperTenants() {
       l.telegram_display_name,
       sa.username AS generated_by_username,
       d.username AS generated_by_distributor_username,
+      owner_d.username AS owner_distributor_username,
+      owner_d.display_name AS owner_distributor_display_name,
       tc.retention_hours,
       tc.frontend_template_id,
       ft.name AS frontend_template_name,
@@ -6952,6 +6954,7 @@ async function getSuperTenants() {
     ) l ON TRUE
     LEFT JOIN super_admins sa ON sa.id = l.generated_by_admin_id
     LEFT JOIN distributors d ON d.id = l.generated_by_distributor_id
+    LEFT JOIN distributors owner_d ON owner_d.id = t.owner_distributor_id
     LEFT JOIN tenant_config tc ON tc.tenant_id = t.id
     LEFT JOIN frontend_templates ft ON ft.id = tc.frontend_template_id
     LEFT JOIN LATERAL (
@@ -6999,6 +7002,8 @@ async function getSuperTenants() {
       telegramLicenseCreator(row),
     generatedByDistributorId: row.generated_by_distributor_id || null,
     ownerDistributorId: row.owner_distributor_id || null,
+    ownerDistributorUsername: row.owner_distributor_username || '',
+    ownerDistributorName: row.owner_distributor_display_name || '',
     retentionHours: Number(row.retention_hours || 24),
     frontendTemplateId: row.frontend_template_id || null,
     frontendTemplateName: row.frontend_template_name || '',
@@ -8508,9 +8513,76 @@ async function handleSuperRoutes(req, res, url, pathname) {
     if (!tenantOwnerResult.rows[0]) {
       return sendError(res, 404, '租户不存在。', 'NOT_FOUND');
     }
-    const ownerDistributorId =
-      tenantOwnerResult.rows[0].owner_distributor_id;
-    if (body.action === 'forceLogout') {
+   const oldOwnerDistributorId =
+  tenantOwnerResult.rows[0].owner_distributor_id;
+let nextOwnerDistributorId = oldOwnerDistributorId;
+
+if (body.action === 'assignDistributor') {
+  requireRole(admin, 'manager');
+
+  const requestedDistributorId = cleanText(
+    body.distributorId,
+    80,
+  ) || null;
+
+  if (
+    requestedDistributorId &&
+    !isUuid(requestedDistributorId)
+  ) {
+    return sendError(
+      res,
+      400,
+      '二级代理账号无效。',
+      'DISTRIBUTOR_ID',
+    );
+  }
+
+  if (requestedDistributorId) {
+    const distributorResult = await pool.query(
+      `
+        SELECT id,enabled
+        FROM distributors
+        WHERE id=$1
+      `,
+      [requestedDistributorId],
+    );
+
+    const targetDistributor = distributorResult.rows[0];
+
+    if (!targetDistributor) {
+      return sendError(
+        res,
+        404,
+        '二级代理不存在。',
+        'DISTRIBUTOR_NOT_FOUND',
+      );
+    }
+
+    if (
+      !targetDistributor.enabled &&
+      targetDistributor.id !== oldOwnerDistributorId
+    ) {
+      return sendError(
+        res,
+        409,
+        '不能把租户划给已停用的代理。',
+        'DISTRIBUTOR_DISABLED',
+      );
+    }
+  }
+
+  await pool.query(
+    `
+      UPDATE tenants
+      SET owner_distributor_id=$2,
+          updated_at=NOW()
+      WHERE id=$1
+    `,
+    [tenantId, requestedDistributorId],
+  );
+
+  nextOwnerDistributorId = requestedDistributorId;
+} else if (body.action === 'forceLogout') {
       await pool.query(
         `UPDATE tenants SET session_version=session_version+1,updated_at=NOW() WHERE id=$1`,
         [tenantId],
@@ -8629,19 +8701,44 @@ async function handleSuperRoutes(req, res, url, pathname) {
       );
       broadcast({ type: 'settings-updated' }, null, tenantId);
     }
-    await writeAudit(req, admin, 'tenant.update', {
-      targetType: 'tenant',
-      targetId: tenantId,
-      metadata: { action: body.action || 'settings' },
-    });
-    broadcastSuper({ type: 'tenants-updated' });
-    if (ownerDistributorId) {
-      broadcastDistributor(
-        { type: 'distributor-tenants-updated' },
-        ownerDistributorId,
-      );
-    }
-    return sendJson(res, 200, { ok: true });
+   await writeAudit(
+  req,
+  admin,
+  body.action === 'assignDistributor'
+    ? 'tenant.assign_distributor'
+    : 'tenant.update',
+  {
+    targetType: 'tenant',
+    targetId: tenantId,
+    metadata: {
+      action: body.action || 'settings',
+      fromDistributorId: oldOwnerDistributorId || null,
+      toDistributorId: nextOwnerDistributorId || null,
+    },
+  },
+);
+
+broadcastSuper({ type: 'tenants-updated' });
+
+if (body.action === 'assignDistributor') {
+  broadcastSuper({ type: 'distributors-updated' });
+}
+
+for (
+  const distributorId of new Set(
+    [
+      oldOwnerDistributorId,
+      nextOwnerDistributorId,
+    ].filter((id) => isUuid(id)),
+  )
+) {
+  broadcastDistributor(
+    { type: 'distributor-tenants-updated' },
+    distributorId,
+  );
+}
+
+return sendJson(res, 200, { ok: true });
   }
 
   if (req.method === 'GET' && pathname === '/api/super/announcements') {
