@@ -36,7 +36,7 @@ const TOKEN_SECRET_TEXT = process.env.TOKEN_SECRET || '';
 const PUBLIC_API_BASE = String(
   process.env.PUBLIC_API_BASE || 'https://api.ykf000.com',
 ).replace(/\/+$/, '');
-const APP_VERSION = String(process.env.APP_VERSION || '1.8.1').trim();
+const APP_VERSION = String(process.env.APP_VERSION || '2.0.0').trim();
 const SUPPORT_TELEGRAM = String(
   process.env.SUPPORT_TELEGRAM || '@YingYingUu',
 ).trim();
@@ -124,6 +124,41 @@ function envNumber(name, fallback, min, max) {
     ? Math.min(max, Math.max(min, parsed))
     : fallback;
 }
+const LEGACY_API_ENABLED = process.env.LEGACY_API_ENABLED !== 'false';
+const API_PAGE_DEFAULT = Math.trunc(
+  envNumber('API_PAGE_DEFAULT', 50, 20, 100),
+);
+const API_PAGE_MAX = Math.trunc(envNumber('API_PAGE_MAX', 100, 50, 200));
+const CONFIG_CACHE_MS = envNumber(
+  'CONFIG_CACHE_SECONDS',
+  300,
+  30,
+  3600,
+) * 1000;
+const AUTH_CACHE_MS = envNumber(
+  'AUTH_CACHE_SECONDS',
+  15,
+  5,
+  60,
+) * 1000;
+const MONITOR_CACHE_MS = envNumber(
+  'MONITOR_CACHE_MINUTES',
+  10,
+  5,
+  60,
+) * 60_000;
+const ACTIVE_MONITOR_INTERVAL_MS = envNumber(
+  'ACTIVE_MONITOR_MINUTES',
+  15,
+  5,
+  60,
+) * 60_000;
+const ACTIVE_CLEANUP_INTERVAL_MS = envNumber(
+  'ACTIVE_CLEANUP_MINUTES',
+  30,
+  10,
+  180,
+) * 60_000;
 const MAX_IMAGE_BYTES =
   envNumber('MAX_IMAGE_MB', 8, 1, 16) * 1024 * 1024;
 const MAX_VIDEO_BYTES =
@@ -138,7 +173,7 @@ const MAX_CONVERSATIONS = Math.trunc(
   envNumber('MAX_CONVERSATIONS', 1000, 10, 10_000),
 );
 const MAX_MESSAGES_PER_CONVERSATION = Math.trunc(
-  envNumber('MAX_MESSAGES_PER_CONVERSATION', 500, 100, 5000),
+  envNumber('MAX_MESSAGES_PER_CONVERSATION', 100, 50, 500),
 );
 const MAX_SSE_CONNECTIONS = Math.trunc(
   envNumber('MAX_SSE_CONNECTIONS', 500, 50, 2000),
@@ -285,6 +320,7 @@ pool.on('error', (error) => {
 
 const sseClients = new Set();
 const rateBuckets = new Map();
+let nextRateBucketCleanupAt = 0;
 const eventHistory = [];
 const distributorPresenceTimers = new Map();
 const requestLatencies = [];
@@ -299,18 +335,28 @@ const minuteCounters = {
 };
 const metricSamples = [];
 const alertState = new Map();
+const tenantConfigCache = new Map();
+const tenantFeatureCache = new Map();
+const tenantAccessCache = new Map();
+const tenantAdminAccessCache = new Map();
+const superAuthCache = new Map();
+const distributorAuthCache = new Map();
 let approvedOriginCache = new Set(STATIC_ALLOWED_ORIGINS);
 let approvedOriginCacheExpiresAt = 0;
 let nextEventId = 1;
 let lastCleanupAt = 0;
 let cleanupPromise = null;
 let activeUploads = 0;
-let metricTimer = null;
 let reportTimer = null;
+let expiryReminderTimer = null;
+let activeMonitorPromise = null;
+let lastPersistedMonitorAt = 0;
+let activeMaintenancePromise = null;
 let lastCpuUsage = process.cpuUsage();
 let lastCpuSampleAt = process.hrtime.bigint();
 let lastMonitorSnapshot = null;
 let lastPlatformSettings = null;
+let platformSettingsCacheExpiresAt = 0;
 let monitorFailureCount = 0;
 let startedAt = Date.now();
 let providerMetricsCache = {
@@ -322,6 +368,94 @@ const telegramGenerationClaims = new Map();
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function normalizeApiPath(pathname) {
+  if (!pathname.startsWith('/api/v2/')) {
+    return { apiVersion: 1, pathname };
+  }
+  return {
+    apiVersion: 2,
+    pathname: pathname.replace(/^\/api\/v2(?=\/)/, '/api'),
+  };
+}
+
+function requireLegacyApi(res, apiVersion) {
+  if (apiVersion >= 2 || LEGACY_API_ENABLED) return true;
+  sendError(
+    res,
+    410,
+    '旧版接口已关闭，请更新客户端模板。',
+    'LEGACY_API_DISABLED',
+  );
+  return false;
+}
+
+function pageLimit(url, fallback = API_PAGE_DEFAULT) {
+  const parsed = Number(url.searchParams.get('limit') || fallback);
+  return Math.min(
+    API_PAGE_MAX,
+    Math.max(1, Number.isFinite(parsed) ? Math.trunc(parsed) : fallback),
+  );
+}
+
+function encodeCursor(value) {
+  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
+}
+
+function decodeCursor(value) {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(
+      Buffer.from(String(value), 'base64url').toString('utf8'),
+    );
+    if (!parsed || typeof parsed !== 'object') return null;
+    const at = new Date(parsed.at);
+    if (!Number.isFinite(at.getTime()) || !isUuid(parsed.id)) return null;
+    return { at: at.toISOString(), id: parsed.id };
+  } catch {
+    return null;
+  }
+}
+
+function cacheGet(cache, key) {
+  const item = cache.get(key);
+  if (!item || item.expiresAt <= Date.now()) {
+    if (item) cache.delete(key);
+    return null;
+  }
+  return item.value;
+}
+
+function cacheSet(cache, key, value, ttl = CONFIG_CACHE_MS) {
+  cache.set(key, { value, expiresAt: Date.now() + ttl });
+  return value;
+}
+
+function invalidateTenantCaches(tenantId = '') {
+  if (tenantId) {
+    tenantConfigCache.delete(tenantId);
+    tenantFeatureCache.delete(tenantId);
+    return;
+  }
+  tenantConfigCache.clear();
+  tenantFeatureCache.clear();
+}
+
+function invalidateTenantAccessCaches(tenantId = '') {
+  if (!tenantId) {
+    tenantAccessCache.clear();
+    tenantAdminAccessCache.clear();
+    return;
+  }
+  tenantAccessCache.delete(tenantId);
+  for (const key of tenantAdminAccessCache.keys()) {
+    if (key.startsWith(`${tenantId}:`)) tenantAdminAccessCache.delete(key);
+  }
+}
+
+function invalidatePlatformCache() {
+  platformSettingsCacheExpiresAt = 0;
 }
 
 function defaultConfig() {
@@ -678,12 +812,24 @@ async function initDatabase() {
       ON license_keys (generated_by_distributor_id, created_at DESC)
     `);
     await client.query(`
+      CREATE INDEX IF NOT EXISTS license_keys_distributor_page_idx
+      ON license_keys (generated_by_distributor_id, created_at DESC, id DESC)
+    `);
+    await client.query(`
       CREATE INDEX IF NOT EXISTS tenants_distributor_created_idx
       ON tenants (owner_distributor_id, created_at DESC)
     `);
     await client.query(`
+      CREATE INDEX IF NOT EXISTS tenants_distributor_page_idx
+      ON tenants (owner_distributor_id, updated_at DESC, id DESC)
+    `);
+    await client.query(`
       CREATE INDEX IF NOT EXISTS distributor_quota_logs_created_idx
       ON distributor_quota_logs (distributor_id, created_at DESC)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS distributor_quota_logs_page_idx
+      ON distributor_quota_logs (distributor_id, id DESC)
     `);
 
     await client.query(`
@@ -1069,12 +1215,21 @@ async function initDatabase() {
       ON conversations (tenant_id, updated_at DESC)
     `);
     await client.query(`
+      CREATE INDEX IF NOT EXISTS conversations_tenant_page_idx
+      ON conversations (tenant_id, updated_at DESC, id DESC)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS tenants_updated_page_idx
+      ON tenants (updated_at DESC, id DESC)
+    `);
+    await client.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS conversations_tenant_visitor_unique_idx
       ON conversations (tenant_id, visitor_key_hash)
       WHERE tenant_id IS NOT NULL
     `);
     await client.query(`CREATE INDEX IF NOT EXISTS license_keys_tenant_idx ON license_keys (tenant_id, created_at DESC)`);
     await client.query(`CREATE INDEX IF NOT EXISTS license_keys_created_at_idx ON license_keys (created_at DESC)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS license_keys_page_idx ON license_keys (created_at DESC, id DESC)`);
     await client.query(`CREATE INDEX IF NOT EXISTS license_keys_suffix_idx ON license_keys (key_suffix)`);
     await client.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS license_keys_telegram_update_unique_idx
@@ -1084,6 +1239,10 @@ async function initDatabase() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS messages_conversation_created_idx
       ON messages (conversation_id, created_at ASC)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS messages_conversation_page_idx
+      ON messages (conversation_id, created_at DESC, id DESC)
     `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS messages_unread_idx
@@ -1306,14 +1465,17 @@ async function cleanupExpiredData() {
 }
 
 function maybeCleanupExpiredData() {
-  if (Date.now() - lastCleanupAt < 10 * 60 * 1000) return;
-  if (cleanupPromise) return;
+  if (Date.now() - lastCleanupAt < ACTIVE_CLEANUP_INTERVAL_MS) {
+    return Promise.resolve();
+  }
+  if (cleanupPromise) return cleanupPromise;
 
   cleanupPromise = cleanupExpiredData()
     .catch((error) => console.error('清理过期聊天失败：', error))
     .finally(() => {
       cleanupPromise = null;
     });
+  return cleanupPromise;
 }
 
 function base64url(input) {
@@ -1571,6 +1733,9 @@ async function authenticateSuper(req) {
     !isUuid(payload.adminId) ||
     !Number.isInteger(payload.sessionVersion)
   ) return null;
+  const cacheKey = `${payload.adminId}:${payload.sessionVersion}`;
+  const cached = cacheGet(superAuthCache, cacheKey);
+  if (cached) return cached;
   const result = await pool.query(
     `
       SELECT id, username, role, enabled, session_version, last_login_at
@@ -1584,7 +1749,7 @@ async function authenticateSuper(req) {
     !admin?.enabled ||
     Number(admin.session_version) !== payload.sessionVersion
   ) return null;
-  return {
+  const authenticatedAdmin = {
     id: admin.id,
     username: admin.username,
     role: admin.role,
@@ -1592,6 +1757,8 @@ async function authenticateSuper(req) {
       ? new Date(admin.last_login_at).toISOString()
       : null,
   };
+  cacheSet(superAuthCache, cacheKey, authenticatedAdmin, AUTH_CACHE_MS);
+  return authenticatedAdmin;
 }
 
 async function authenticateDistributor(req) {
@@ -1601,6 +1768,9 @@ async function authenticateDistributor(req) {
     !isUuid(payload.distributorId) ||
     !Number.isInteger(payload.sessionVersion)
   ) return null;
+  const cacheKey = `${payload.distributorId}:${payload.sessionVersion}`;
+  const cached = cacheGet(distributorAuthCache, cacheKey);
+  if (cached) return cached;
   const result = await pool.query(
     `
       SELECT
@@ -1616,7 +1786,7 @@ async function authenticateDistributor(req) {
     !distributor?.enabled ||
     Number(distributor.session_version) !== payload.sessionVersion
   ) return null;
-  return {
+  const authenticatedDistributor = {
     id: distributor.id,
     username: distributor.username,
     displayName: distributor.display_name || '',
@@ -1634,6 +1804,13 @@ async function authenticateDistributor(req) {
       : null,
     createdAt: new Date(distributor.created_at).toISOString(),
   };
+  cacheSet(
+    distributorAuthCache,
+    cacheKey,
+    authenticatedDistributor,
+    AUTH_CACHE_MS,
+  );
+  return authenticatedDistributor;
 }
 
 const ROLE_LEVEL = Object.freeze({
@@ -1935,7 +2112,7 @@ async function refreshApprovedOrigins(force = false) {
     if (!approvedOriginCache.size) throw error;
   }
   approvedOriginCache = origins;
-  approvedOriginCacheExpiresAt = Date.now() + 60_000;
+  approvedOriginCacheExpiresAt = Date.now() + CONFIG_CACHE_MS;
 }
 
 function invalidateApprovedOrigins() {
@@ -2203,6 +2380,12 @@ function cloudflareVisitorLocation(req) {
 function rateLimit(req, res, name, max, windowMs, identity = '') {
   const key = `${name}:${identity || requestIp(req)}`;
   const now = Date.now();
+  if (now >= nextRateBucketCleanupAt) {
+    for (const [bucketKey, value] of rateBuckets) {
+      if (value.resetAt < now) rateBuckets.delete(bucketKey);
+    }
+    nextRateBucketCleanupAt = now + 10 * 60_000;
+  }
   const current = rateBuckets.get(key);
 
   if (!current || current.resetAt <= now) {
@@ -2222,13 +2405,6 @@ function rateLimit(req, res, name, max, windowMs, identity = '') {
 
   return true;
 }
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, value] of rateBuckets) {
-    if (value.resetAt < now) rateBuckets.delete(key);
-  }
-}, 10 * 60 * 1000).unref();
 
 function mediaContentMatchesMime(data, mime) {
   if (!Buffer.isBuffer(data)) return false;
@@ -2581,6 +2757,10 @@ async function createTenantConfig(tenantId, client = pool) {
 
 async function getConfig(tenantId, client = pool) {
   if (!tenantId) throw new Error('缺少租户标识。');
+  if (client === pool) {
+    const cached = cacheGet(tenantConfigCache, tenantId);
+    if (cached) return cached;
+  }
   const result = await client.query(
     `
       SELECT
@@ -2601,7 +2781,7 @@ async function getConfig(tenantId, client = pool) {
     await createTenantConfig(tenantId, client);
     return getConfig(tenantId, client);
   }
-  return {
+  const config = {
     cannedReplies: result.rows[0].canned_replies || [],
     autoReplies: result.rows[0].auto_replies || [],
     settings: {
@@ -2615,6 +2795,9 @@ async function getConfig(tenantId, client = pool) {
         result.rows[0].frontend_base_url || DEFAULT_USER_SITE_URL,
     },
   };
+  return client === pool
+    ? cacheSet(tenantConfigCache, tenantId, config)
+    : config;
 }
 
 async function getTemplateCatalog(
@@ -2712,6 +2895,13 @@ function tenantEntryUrl(settings, publicCode) {
 }
 
 async function getPlatformSettings(client = pool) {
+  if (
+    client === pool &&
+    lastPlatformSettings &&
+    platformSettingsCacheExpiresAt > Date.now()
+  ) {
+    return lastPlatformSettings;
+  }
   try {
     const result = await client.query(
       `SELECT * FROM platform_settings WHERE id = 1`,
@@ -2733,6 +2923,9 @@ async function getPlatformSettings(client = pool) {
       weeklyReportEnabled: Boolean(row.weekly_report_enabled),
       alertSettings: row.alert_settings || {},
     };
+    if (client === pool) {
+      platformSettingsCacheExpiresAt = Date.now() + CONFIG_CACHE_MS;
+    }
     return lastPlatformSettings;
   } catch (error) {
     if (lastPlatformSettings) return lastPlatformSettings;
@@ -2778,6 +2971,10 @@ function featureFlagAllowsTenant(row, tenantId) {
 
 async function tenantFeatureEnabled(code, tenantId, client = pool) {
   if (!SUPPORTED_FEATURE_FLAGS.has(code) || !isUuid(tenantId)) return false;
+  if (client === pool) {
+    const states = await getTenantFeatureStates(tenantId, pool);
+    return Boolean(states[code]);
+  }
   const result = await client.query(
     `
       SELECT
@@ -2819,6 +3016,10 @@ async function requireTenantFeature(code, tenantId, client = pool) {
 }
 
 async function getTenantFeatureStates(tenantId, client = pool) {
+  if (client === pool) {
+    const cached = cacheGet(tenantFeatureCache, tenantId);
+    if (cached) return cached;
+  }
   const result = await client.query(
     `
       SELECT
@@ -2843,7 +3044,7 @@ async function getTenantFeatureStates(tenantId, client = pool) {
     [[...SUPPORTED_FEATURE_FLAGS], tenantId],
   );
   const rows = new Map(result.rows.map((row) => [row.code, row]));
-  return Object.fromEntries(
+  const states = Object.fromEntries(
     [...SUPPORTED_FEATURE_FLAGS].map((code) => {
       const row = rows.get(code);
       return [
@@ -2856,6 +3057,9 @@ async function getTenantFeatureStates(tenantId, client = pool) {
       ];
     }),
   );
+  return client === pool
+    ? cacheSet(tenantFeatureCache, tenantId, states)
+    : states;
 }
 
 async function getTenantNotices(tenantId, client = pool) {
@@ -3043,6 +3247,116 @@ async function getPublicConversation(id, client = pool, tenantId) {
   };
 }
 
+async function getConversationMessagePage(
+  id,
+  tenantId,
+  { cursor = null, limit = API_PAGE_DEFAULT } = {},
+  client = pool,
+) {
+  if (!isUuid(id) || !isUuid(tenantId)) return null;
+  const conversationResult = await client.query(
+    `SELECT * FROM conversations WHERE id=$1 AND tenant_id=$2`,
+    [id, tenantId],
+  );
+  const conversation = conversationResult.rows[0];
+  if (!conversation) return null;
+  const decoded = decodeCursor(cursor);
+  const result = await client.query(
+    `
+      WITH page_base AS (
+        SELECT *
+        FROM messages
+        WHERE conversation_id=$1
+          AND (
+            $3::timestamptz IS NULL
+            OR (created_at,id) < ($3::timestamptz,$4::uuid)
+          )
+        ORDER BY created_at DESC,id DESC
+        LIMIT ($2::int + 1)
+      ),
+      chosen AS (
+        SELECT * FROM page_base
+        ORDER BY created_at DESC,id DESC
+        LIMIT $2
+      ),
+      chosen_albums AS (
+        SELECT DISTINCT album_id
+        FROM chosen
+        WHERE album_id IS NOT NULL
+      )
+      SELECT
+        m.*,
+        ((SELECT COUNT(*) FROM page_base) > $2)::boolean AS _has_more
+      FROM messages m
+      WHERE m.conversation_id=$1
+        AND (
+          m.id IN (SELECT id FROM chosen)
+          OR m.album_id IN (SELECT album_id FROM chosen_albums)
+        )
+      ORDER BY
+        m.created_at ASC,
+        CASE WHEN m.source='auto' THEN 1 ELSE 0 END ASC,
+        m.album_position ASC,
+        m.id ASC
+    `,
+    [id, limit, decoded?.at || null, decoded?.id || null],
+  );
+  const rows = result.rows;
+  const earliest = rows.reduce((current, row) => {
+    if (!current) return row;
+    if (new Date(row.created_at).getTime() < new Date(current.created_at).getTime()) {
+      return row;
+    }
+    if (
+      new Date(row.created_at).getTime() === new Date(current.created_at).getTime() &&
+      row.id < current.id
+    ) return row;
+    return current;
+  }, null);
+  const hasMore = Boolean(rows[0]?._has_more);
+  return {
+    ...conversationBase(conversation),
+    messages: rows.map(publicMessage),
+    messagePage: {
+      limit,
+      hasMore,
+      nextCursor:
+        hasMore && earliest
+          ? encodeCursor({
+              at: new Date(earliest.created_at).toISOString(),
+              id: earliest.id,
+            })
+          : null,
+    },
+  };
+}
+
+async function getConversationSummaryById(id, tenantId, client = pool) {
+  if (!isUuid(id) || !isUuid(tenantId)) return null;
+  const result = await client.query(
+    `
+      SELECT
+        c.*,
+        latest.id AS latest_id,
+        latest.type AS latest_type,
+        latest.text AS latest_text,
+        latest.role AS latest_role,
+        latest.created_at AS latest_created_at
+      FROM conversations c
+      LEFT JOIN LATERAL (
+        SELECT m.id,m.type,m.text,m.role,m.created_at
+        FROM messages m
+        WHERE m.conversation_id=c.id
+        ORDER BY m.created_at DESC,m.id DESC
+        LIMIT 1
+      ) latest ON TRUE
+      WHERE c.id=$1 AND c.tenant_id=$2
+    `,
+    [id, tenantId],
+  );
+  return result.rows[0] ? conversationSummary(result.rows[0]) : null;
+}
+
 async function getAllSummaries(tenantId) {
   const result = await pool.query(`
     SELECT
@@ -3067,6 +3381,82 @@ async function getAllSummaries(tenantId) {
     ORDER BY c.updated_at DESC
   `, [tenantId]);
   return result.rows.map(conversationSummary);
+}
+
+async function getAllSummariesPage(
+  tenantId,
+  { cursor = null, limit = API_PAGE_DEFAULT, search = '' } = {},
+) {
+  if (!isUuid(tenantId)) {
+    return {
+      items: [],
+      nextCursor: null,
+      hasMore: false,
+      totals: { all: 0, open: 0, unread: 0 },
+    };
+  }
+  const decoded = decodeCursor(cursor);
+  const keyword = cleanText(search, 120).trim();
+  const result = await pool.query(
+    `
+      SELECT
+        c.*,
+        latest.id AS latest_id,
+        latest.type AS latest_type,
+        latest.text AS latest_text,
+        latest.role AS latest_role,
+        latest.created_at AS latest_created_at,
+        COUNT(*) OVER()::int AS _total_count,
+        COUNT(*) FILTER (WHERE c.status='open') OVER()::int AS _open_count,
+        COALESCE(SUM(c.unread_admin) OVER(),0)::int AS _unread_count
+      FROM conversations c
+      LEFT JOIN LATERAL (
+        SELECT m.id,m.type,m.text,m.role,m.created_at
+        FROM messages m
+        WHERE m.conversation_id=c.id
+        ORDER BY m.created_at DESC,m.id DESC
+        LIMIT 1
+      ) latest ON TRUE
+      WHERE c.tenant_id=$1
+        AND (
+          $2::timestamptz IS NULL
+          OR (c.updated_at,c.id) < ($2::timestamptz,$3::uuid)
+        )
+        AND (
+          $4::text=''
+          OR c.visitor_name ILIKE '%' || $4 || '%'
+          OR c.visitor_note ILIKE '%' || $4 || '%'
+          OR c.ip_address ILIKE '%' || $4 || '%'
+          OR c.ip_location ILIKE '%' || $4 || '%'
+          OR COALESCE(latest.text,'') ILIKE '%' || $4 || '%'
+        )
+      ORDER BY c.updated_at DESC,c.id DESC
+      LIMIT ($5::int + 1)
+    `,
+    [tenantId, decoded?.at || null, decoded?.id || null, keyword, limit],
+  );
+  const hasMore = result.rows.length > limit;
+  const pageRows = result.rows.slice(0, limit);
+  const last = pageRows.at(-1);
+  const totalsRow = pageRows[0] || {};
+  return {
+    items: pageRows.map(conversationSummary),
+    nextCursor:
+      hasMore && last
+        ? encodeCursor({
+            at: new Date(last.updated_at).toISOString(),
+            id: last.id,
+          })
+        : null,
+    hasMore,
+    totals: decoded
+      ? null
+      : {
+          all: Number(totalsRow._total_count || 0),
+          open: Number(totalsRow._open_count || 0),
+          unread: Number(totalsRow._unread_count || 0),
+        },
+  };
 }
 
 function authorizeConversation(payload, conversation) {
@@ -3297,6 +3687,10 @@ function sendSse(res, payload, id = null) {
 }
 
 function clientAcceptsEvent(client, event) {
+  if (
+    event.apiVersion &&
+    Number(client.apiVersion || 1) !== Number(event.apiVersion)
+  ) return false;
   if (event.targetKind && client.kind !== event.targetKind) return false;
   if (
     event.distributorId &&
@@ -3318,6 +3712,7 @@ function publishEvent(
     tenantId = null,
     distributorId = null,
     targetKind = null,
+    apiVersion = null,
     keepHistory = true,
   } = {},
 ) {
@@ -3328,6 +3723,7 @@ function publishEvent(
     tenantId,
     distributorId,
     targetKind,
+    apiVersion,
   };
   if (keepHistory) {
     eventHistory.push(event);
@@ -3349,6 +3745,30 @@ function broadcast(payload, conversationId = null, tenantId = null) {
   publishEvent(payload, { conversationId, tenantId });
 }
 
+function broadcastVersion(
+  payload,
+  apiVersion,
+  conversationId = null,
+  tenantId = null,
+) {
+  if (!isUuid(tenantId)) return;
+  publishEvent(payload, {
+    conversationId,
+    tenantId,
+    apiVersion,
+  });
+}
+
+function hasLegacyConversationClient(conversationId, tenantId) {
+  return [...sseClients].some(
+    (client) =>
+      Number(client.apiVersion || 1) === 1 &&
+      client.tenantId === tenantId &&
+      (client.kind === 'tenant_admin' ||
+        client.conversationId === conversationId),
+  );
+}
+
 function broadcastSuper(payload) {
   publishEvent(payload, { targetKind: 'super_admin' });
 }
@@ -3368,7 +3788,10 @@ function scheduleDistributorPresenceUpdate(distributorId) {
   const timer = setTimeout(() => {
     distributorPresenceTimers.delete(distributorId);
     broadcastDistributor(
-      { type: 'distributor-presence-updated' },
+      {
+        type: 'distributor-presence-updated',
+        presence: getDistributorPresenceSnapshot(distributorId),
+      },
       distributorId,
     );
   }, 300);
@@ -3380,7 +3803,10 @@ function scheduleSuperPresenceUpdate() {
   if (scheduleSuperPresenceUpdate.timer) return;
   scheduleSuperPresenceUpdate.timer = setTimeout(() => {
     scheduleSuperPresenceUpdate.timer = null;
-    broadcastSuper({ type: 'tenant-presence-updated' });
+    broadcastSuper({
+      type: 'tenant-presence-updated',
+      presence: getRealtimePresenceSnapshot(),
+    });
   }, 300);
   scheduleSuperPresenceUpdate.timer.unref();
 }
@@ -3438,6 +3864,7 @@ async function markConversationRead(conversationId, tenantId, reader) {
 
 function disconnectTenant(tenantId, payload) {
   if (!tenantId) return;
+  invalidateTenantAccessCaches(tenantId);
   for (const client of sseClients) {
     if (client.tenantId !== tenantId) continue;
     try {
@@ -3450,6 +3877,11 @@ function disconnectTenant(tenantId, payload) {
 
 function disconnectDistributor(distributorId, payload = {}) {
   if (!isUuid(distributorId)) return;
+  for (const key of distributorAuthCache.keys()) {
+    if (key.startsWith(`${distributorId}:`)) {
+      distributorAuthCache.delete(key);
+    }
+  }
   for (const client of sseClients) {
     if (
       client.kind !== 'distributor' ||
@@ -3473,6 +3905,7 @@ function updateTenantConnectionsAfterRenewal(
   accessExpiresAt,
   activeLicenseId,
 ) {
+  invalidateTenantAccessCaches(tenantId);
   const expiry = new Date(accessExpiresAt).getTime();
   for (const client of sseClients) {
     if (client.tenantId !== tenantId) continue;
@@ -3675,15 +4108,6 @@ function parseMessageInput(body = {}) {
   return { type: requestedType, text, attachmentIds };
 }
 
-async function getTenantRetentionHours(tenantId, client = pool) {
-  const result = await client.query(
-    `SELECT retention_hours FROM tenant_config WHERE tenant_id = $1`,
-    [tenantId],
-  );
-  const hours = Number(result.rows[0]?.retention_hours || 24);
-  return RETENTION_OPTIONS.has(hours) ? hours : 24;
-}
-
 async function lockPendingAttachments(
   client,
   conversationId,
@@ -3773,7 +4197,25 @@ async function insertMediaMessages(
   return rows;
 }
 
-async function createUserMessage(conversationId, body, tenantId) {
+async function createUserMessage(
+  conversationId,
+  body,
+  tenantId,
+  { includeConversation = true } = {},
+) {
+  const input = parseMessageInput(body);
+  const [config, featureStates] = await Promise.all([
+    getConfig(tenantId),
+    getTenantFeatureStates(tenantId),
+  ]);
+  if (input.type !== 'text' && !featureStates.media_album) {
+    throw requestError(
+      '此功能当前未向该租户开放。',
+      403,
+      'FEATURE_DISABLED',
+    );
+  }
+  const retentionHours = Number(config.settings.retentionHours || 24);
   const client = await pool.connect();
 
   try {
@@ -3791,11 +4233,6 @@ async function createUserMessage(conversationId, body, tenantId) {
       throw requestError('此会话已结束。', 409, 'CLOSED');
     }
 
-    const input = parseMessageInput(body);
-    if (input.type !== 'text') {
-      await requireTenantFeature('media_album', tenantId, client);
-    }
-    const retentionHours = await getTenantRetentionHours(tenantId, client);
     let messageRows;
     if (input.type === 'text') {
       const result = await client.query(
@@ -3831,18 +4268,20 @@ async function createUserMessage(conversationId, body, tenantId) {
       );
     }
 
-    await client.query(
+    let updatedConversation = (
+      await client.query(
       `
         UPDATE conversations
         SET unread_admin = unread_admin + 1, updated_at = NOW()
         WHERE id = $1 AND tenant_id = $2
+        RETURNING *
       `,
       [conversationId, tenantId],
-    );
+      )
+    ).rows[0];
 
     let autoReplyRow = null;
     if (input.type === 'text') {
-      const config = await getConfig(conversation.tenant_id, client);
       const cooldownSeconds = Math.min(
         3600,
         Math.max(0, Number(config.settings.autoReplyCooldownSeconds ?? 20)),
@@ -3855,7 +4294,7 @@ async function createUserMessage(conversationId, body, tenantId) {
         Date.now() - lastAutoReplyAt >= cooldownSeconds * 1000;
       const replyText =
         cooldownPassed &&
-        (await tenantFeatureEnabled('auto_reply', tenantId, client))
+        featureStates.auto_reply
         ? matchAutoReply(config, input.text)
         : '';
 
@@ -3882,33 +4321,48 @@ async function createUserMessage(conversationId, body, tenantId) {
           ],
         );
         autoReplyRow = autoResult.rows[0];
-        await client.query(
+        updatedConversation = (
+          await client.query(
           `
             UPDATE conversations
             SET unread_user = unread_user + 1,
                 last_auto_reply_at = NOW(),
                 updated_at = NOW()
             WHERE id = $1 AND tenant_id = $2
+            RETURNING *
           `,
           [conversationId, tenantId],
-        );
+          )
+        ).rows[0];
       }
     }
 
     await client.query('COMMIT');
     minuteCounters.messages +=
       messageRows.length + (autoReplyRow ? 1 : 0);
-    const publicConversation = await getPublicConversation(
-      conversationId,
-      pool,
-      conversation.tenant_id,
-    );
     const messages = messageRows.map(publicMessage);
+    const latestRow = autoReplyRow || messageRows.at(-1);
+    const summary = conversationSummary({
+      ...updatedConversation,
+      latest_id: latestRow?.id,
+      latest_type: latestRow?.type,
+      latest_text: latestRow?.text,
+      latest_role: latestRow?.role,
+      latest_created_at: latestRow?.created_at,
+    });
+    const publicConversation = includeConversation
+      ? await getPublicConversation(
+          conversationId,
+          pool,
+          conversation.tenant_id,
+        )
+      : summary;
     return {
       message: messages[0],
       messages,
       autoReply: autoReplyRow ? publicMessage(autoReplyRow) : null,
       conversation: publicConversation,
+      summary,
     };
   } catch (error) {
     await client.query('ROLLBACK');
@@ -3918,7 +4372,25 @@ async function createUserMessage(conversationId, body, tenantId) {
   }
 }
 
-async function createAdminMessage(conversationId, body, tenantId) {
+async function createAdminMessage(
+  conversationId,
+  body,
+  tenantId,
+  { includeConversation = true } = {},
+) {
+  const input = parseMessageInput(body);
+  const [config, featureStates] = await Promise.all([
+    getConfig(tenantId),
+    getTenantFeatureStates(tenantId),
+  ]);
+  if (input.type !== 'text' && !featureStates.media_album) {
+    throw requestError(
+      '此功能当前未向该租户开放。',
+      403,
+      'FEATURE_DISABLED',
+    );
+  }
+  const retentionHours = Number(config.settings.retentionHours || 24);
   const client = await pool.connect();
 
   try {
@@ -3936,11 +4408,6 @@ async function createAdminMessage(conversationId, body, tenantId) {
       throw requestError('此会话已结束。', 409, 'CLOSED');
     }
 
-    const input = parseMessageInput(body);
-    if (input.type !== 'text') {
-      await requireTenantFeature('media_album', tenantId, client);
-    }
-    const retentionHours = await getTenantRetentionHours(tenantId, client);
     let messageRows;
     if (input.type === 'text') {
       const result = await client.query(
@@ -3976,33 +4443,100 @@ async function createAdminMessage(conversationId, body, tenantId) {
       );
     }
 
-    await client.query(
+    const updatedConversation = (
+      await client.query(
       `
         UPDATE conversations
         SET unread_user = unread_user + 1, updated_at = NOW()
         WHERE id = $1 AND tenant_id = $2
+        RETURNING *
       `,
       [conversationId, tenantId],
-    );
+      )
+    ).rows[0];
 
     await client.query('COMMIT');
     minuteCounters.messages += messageRows.length;
-    const publicConversation = await getPublicConversation(
-      conversationId,
-      pool,
-      conversation.tenant_id,
-    );
     const messages = messageRows.map(publicMessage);
+    const latestRow = messageRows.at(-1);
+    const summary = conversationSummary({
+      ...updatedConversation,
+      latest_id: latestRow?.id,
+      latest_type: latestRow?.type,
+      latest_text: latestRow?.text,
+      latest_role: latestRow?.role,
+      latest_created_at: latestRow?.created_at,
+    });
+    const publicConversation = includeConversation
+      ? await getPublicConversation(
+          conversationId,
+          pool,
+          conversation.tenant_id,
+        )
+      : summary;
     return {
       message: messages[0],
       messages,
       conversation: publicConversation,
+      summary,
     };
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
   } finally {
     client.release();
+  }
+}
+
+async function broadcastMessageResult(
+  result,
+  trigger,
+  conversationId,
+  tenantId,
+  requestApiVersion,
+) {
+  const appended = [
+    ...(result.messages || []),
+    ...(result.autoReply ? [result.autoReply] : []),
+  ];
+  broadcastVersion(
+    {
+      type: 'messages-appended',
+      trigger,
+      conversationId,
+      messages: appended,
+      summary: result.summary || result.conversation,
+    },
+    2,
+    conversationId,
+    tenantId,
+  );
+
+  let legacyConversation =
+    requestApiVersion < 2 && Array.isArray(result.conversation?.messages)
+      ? result.conversation
+      : null;
+  if (
+    !legacyConversation &&
+    hasLegacyConversationClient(conversationId, tenantId)
+  ) {
+    legacyConversation = await getPublicConversation(
+      conversationId,
+      pool,
+      tenantId,
+    );
+  }
+  if (legacyConversation) {
+    broadcastVersion(
+      {
+        type: 'conversation-updated',
+        trigger,
+        conversation: legacyConversation,
+      },
+      1,
+      conversationId,
+      tenantId,
+    );
   }
 }
 
@@ -4087,7 +4621,66 @@ async function refreshConversationCounters(
   );
 }
 
-async function deleteAdminMessage(conversationId, messageId, tenantId) {
+async function finishAdminMessageMutation({
+  type,
+  conversationId,
+  tenantId,
+  messageIds,
+  message = null,
+  requestApiVersion = 1,
+}) {
+  const summary = await getConversationSummaryById(
+    conversationId,
+    tenantId,
+  );
+  const delta = {
+    type,
+    conversationId,
+    messageIds,
+    ...(message ? { message } : {}),
+    ...(summary ? { summary } : {}),
+  };
+  broadcastVersion(delta, 2, conversationId, tenantId);
+
+  let legacyConversation = null;
+  if (
+    requestApiVersion < 2 ||
+    hasLegacyConversationClient(conversationId, tenantId)
+  ) {
+    legacyConversation = await getPublicConversation(
+      conversationId,
+      pool,
+      tenantId,
+    );
+    if (legacyConversation) {
+      broadcastVersion(
+        { ...delta, conversation: legacyConversation },
+        1,
+        conversationId,
+        tenantId,
+      );
+    }
+  }
+
+  return requestApiVersion >= 2
+    ? {
+        messageIds,
+        ...(message ? { message } : {}),
+        ...(summary ? { summary } : {}),
+      }
+    : {
+        messageIds,
+        ...(message ? { message } : {}),
+        conversation: legacyConversation,
+      };
+}
+
+async function deleteAdminMessage(
+  conversationId,
+  messageId,
+  tenantId,
+  requestApiVersion = 1,
+) {
   const client = await pool.connect();
   const objectKeys = [];
   let messageIds = [];
@@ -4136,29 +4729,26 @@ async function deleteAdminMessage(conversationId, messageId, tenantId) {
     client.release();
   }
   processObjectDeleteQueue().catch(() => {});
-  const conversation = await getPublicConversation(
-    conversationId,
-    pool,
-    tenantId,
-  );
-  broadcast(
-    {
-      type: 'message-deleted',
-      conversationId,
-      messageIds,
-      conversation,
-    },
+  return finishAdminMessageMutation({
+    type: 'message-deleted',
     conversationId,
     tenantId,
-  );
-  return { messageIds, conversation };
+    messageIds,
+    requestApiVersion,
+  });
 }
 
-async function recallAdminMessage(conversationId, messageId, tenantId) {
+async function recallAdminMessage(
+  conversationId,
+  messageId,
+  tenantId,
+  requestApiVersion = 1,
+) {
   const client = await pool.connect();
   const objectKeys = [];
   let messageIds = [];
   let recalledMessageId = '';
+  let recalledMessage = null;
   try {
     await client.query('BEGIN');
     const rows = await selectAdminMessageGroup(
@@ -4190,7 +4780,7 @@ async function recallAdminMessage(conversationId, messageId, tenantId) {
         [messageIds, recalledMessageId],
       );
     }
-    await client.query(
+    const recalled = await client.query(
       `
         UPDATE messages
         SET type = 'text',
@@ -4200,9 +4790,13 @@ async function recallAdminMessage(conversationId, messageId, tenantId) {
             album_position = 0,
             recalled_at = NOW()
         WHERE id = $1
+        RETURNING *
       `,
       [recalledMessageId],
     );
+    recalledMessage = recalled.rows[0]
+      ? publicMessage(recalled.rows[0])
+      : null;
     if (attachmentIds.length) {
       await client.query(
         `DELETE FROM attachments WHERE id = ANY($1::uuid[])`,
@@ -4219,40 +4813,41 @@ async function recallAdminMessage(conversationId, messageId, tenantId) {
     client.release();
   }
   processObjectDeleteQueue().catch(() => {});
-  const conversation = await getPublicConversation(
-    conversationId,
-    pool,
-    tenantId,
-  );
-  const message = conversation.messages.find(
-    (item) => item.id === recalledMessageId,
-  );
-  broadcast(
-    {
-      type: 'message-recalled',
-      conversationId,
-      messageIds,
-      message,
-      conversation,
-    },
+  return finishAdminMessageMutation({
+    type: 'message-recalled',
     conversationId,
     tenantId,
-  );
-  return { messageIds, message, conversation };
+    messageIds,
+    message: recalledMessage,
+    requestApiVersion,
+  });
 }
 
 
 async function getTenantById(tenantId, client = pool, forUpdate = false) {
   if (!isUuid(tenantId)) return null;
+  if (client === pool && !forUpdate) {
+    const cached = cacheGet(tenantAccessCache, tenantId);
+    if (cached) return cached;
+  }
   const result = await client.query(
     `SELECT * FROM tenants WHERE id = $1 ${forUpdate ? 'FOR UPDATE' : ''}`,
     [tenantId],
   );
-  return result.rows[0] || null;
+  const tenant = result.rows[0] || null;
+  if (tenant && client === pool && !forUpdate) {
+    cacheSet(tenantAccessCache, tenantId, tenant, AUTH_CACHE_MS);
+  }
+  return tenant;
 }
 
 async function getTenantForAdminToken(payload, client = pool) {
   if (!isUuid(payload?.tenantId) || !isUuid(payload?.licenseId)) return null;
+  const cacheKey = `${payload.tenantId}:${payload.licenseId}:${Number(payload.sessionVersion || 0)}`;
+  if (client === pool) {
+    const cached = cacheGet(tenantAdminAccessCache, cacheKey);
+    if (cached) return cached;
+  }
   const result = await client.query(
     `
       SELECT t.*
@@ -4270,7 +4865,12 @@ async function getTenantForAdminToken(payload, client = pool) {
       Number(payload.sessionVersion || 0),
     ],
   );
-  return result.rows[0] || null;
+  const tenant = result.rows[0] || null;
+  if (tenant && client === pool) {
+    cacheSet(tenantAdminAccessCache, cacheKey, tenant, AUTH_CACHE_MS);
+    cacheSet(tenantAccessCache, tenant.id, tenant, AUTH_CACHE_MS);
+  }
+  return tenant;
 }
 
 async function getTenantByCode(publicCode, client = pool) {
@@ -5972,12 +6572,64 @@ async function collectMonitorSnapshot({ persist = true } = {}) {
       `INSERT INTO system_metric_samples (metrics) VALUES ($1::jsonb)`,
       [JSON.stringify(snapshot)],
     );
+    lastPersistedMonitorAt = Date.now();
   }
   for (const key of Object.keys(minuteCounters)) minuteCounters[key] = 0;
   requestLatencies.length = 0;
   broadcastSuper({ type: 'monitor-updated', monitor: snapshot });
   await evaluateAlerts(snapshot);
   return snapshot;
+}
+
+async function getMonitorSnapshotCached({ force = false, persist = false } = {}) {
+  const sampledAt = lastMonitorSnapshot?.at
+    ? new Date(lastMonitorSnapshot.at).getTime()
+    : 0;
+  if (
+    !force &&
+    lastMonitorSnapshot &&
+    Date.now() - sampledAt < MONITOR_CACHE_MS
+  ) {
+    return lastMonitorSnapshot;
+  }
+  if (activeMonitorPromise) return activeMonitorPromise;
+  activeMonitorPromise = collectMonitorSnapshot({ persist })
+    .catch((error) => {
+      console.error('监控采集失败：', error.message);
+      handleMonitorFailure(error).catch(() => {});
+      if (lastMonitorSnapshot) return lastMonitorSnapshot;
+      throw error;
+    })
+    .finally(() => {
+      activeMonitorPromise = null;
+    });
+  return activeMonitorPromise;
+}
+
+function scheduleActiveDatabaseWork(pathname) {
+  if (!pathname.startsWith('/api/')) return;
+  if (
+    pathname === '/api/telegram/webhook' ||
+    pathname.startsWith('/api/public/')
+  ) return;
+  if (
+    Date.now() - lastPersistedMonitorAt >= ACTIVE_MONITOR_INTERVAL_MS &&
+    !activeMonitorPromise
+  ) {
+    setTimeout(() => {
+      getMonitorSnapshotCached({ force: true, persist: true }).catch(() => {});
+    }, 0).unref();
+  }
+  if (
+    Date.now() - lastCleanupAt >= ACTIVE_CLEANUP_INTERVAL_MS &&
+    !activeMaintenancePromise
+  ) {
+    activeMaintenancePromise = Promise.resolve()
+      .then(() => maybeCleanupExpiredData())
+      .finally(() => {
+        activeMaintenancePromise = null;
+      });
+  }
 }
 
 async function sendTelegramAlert(text) {
@@ -6187,18 +6839,23 @@ async function getYesterdaySystemAssessment() {
   const latest = samples.at(-1) || {};
   const previousLatest = previousSamples.at(-1) || {};
   const sampleCount = samples.length;
+  const sampleIntervalMinutes = Math.max(
+    1,
+    Math.round(ACTIVE_MONITOR_INTERVAL_MS / 60_000),
+  );
+  const expectedSamples = Math.ceil(1440 / sampleIntervalMinutes);
   const coveragePercent = Number(
-    Math.min(100, (sampleCount / 1440) * 100).toFixed(1),
+    Math.min(100, (sampleCount / expectedSamples) * 100).toFixed(1),
   );
   const cpuHighMinutes = samples.filter(
     (item) => Number(item.application?.cpuPercent || 0) >= 80,
-  ).length;
+  ).length * sampleIntervalMinutes;
   const memoryHighMinutes = samples.filter(
     (item) => Number(item.application?.memoryPercent || 0) >= 85,
-  ).length;
+  ).length * sampleIntervalMinutes;
   const databaseWaitingMinutes = samples.filter(
     (item) => Number(item.database?.poolWaiting || 0) > 0,
-  ).length;
+  ).length * sampleIntervalMinutes;
   const cpuAverage = Number(
     average((item) => item.application?.cpuPercent).toFixed(1),
   );
@@ -6245,7 +6902,7 @@ async function getYesterdaySystemAssessment() {
       sum + Number(item.application?.requestsPerMinute || 0),
     0,
   );
-  const insufficient = sampleCount < 60;
+  const insufficient = sampleCount < 4;
   let serverStatus = 'healthy';
   if (
     cpuAverage >= 70 ||
@@ -6398,7 +7055,12 @@ async function buildDailyReport(reportDate, timeZone) {
     timeZone,
     version: monitor.version,
     availabilityPercent: Number(
-      Math.min(100, (sampleMetrics.length / 1440) * 100).toFixed(2),
+      Math.min(
+        100,
+        (sampleMetrics.length /
+          Math.ceil(1440 / (ACTIVE_MONITOR_INTERVAL_MS / 60_000))) *
+          100,
+      ).toFixed(2),
     ),
     sampleCount: sampleMetrics.length,
     totalRequests,
@@ -6446,7 +7108,7 @@ async function buildDailyReport(reportDate, timeZone) {
     '📊 拓界云每日运行报告',
     `日期：${data.date}`,
     `当前版本：v${data.version}`,
-    `采样可用率：${data.availabilityPercent}%（${data.sampleCount}/1440）`,
+    `采样可用率：${data.availabilityPercent}%（${data.sampleCount}/${Math.ceil(1440 / (ACTIVE_MONITOR_INTERVAL_MS / 60_000))}）`,
     '',
     `CPU：平均 ${data.cpuAverage}%｜峰值 ${data.cpuPeak}%`,
     `内存：平均 ${data.memoryAverage}%｜峰值 ${data.memoryPeak}%`,
@@ -6726,34 +7388,89 @@ async function processExpiryReminders() {
   return result.rowCount;
 }
 
-function startBackgroundJobs() {
-  setInterval(() => maybeCleanupExpiredData(), 5 * 60_000).unref();
-  setInterval(
-    () => processObjectDeleteQueue().catch(() => {}),
-    5 * 60_000,
-  ).unref();
-  processExpiryReminders().catch(() => {});
-  setInterval(
-    () => processExpiryReminders().catch(() => {}),
-    60 * 60_000,
-  ).unref();
-  metricTimer = setInterval(
-    () =>
-      collectMonitorSnapshot().catch((error) => {
-        console.error('监控采集失败：', error.message);
-        handleMonitorFailure(error).catch(() => {});
-      }),
-    60_000,
-  );
-  metricTimer.unref();
-  reportTimer = setInterval(
-    () =>
-      runScheduledReport().catch((error) =>
-        console.error('Telegram 日报发送失败：', error.message),
-      ),
-    60_000,
-  );
+function nextReportDelay(settings) {
+  const [targetHour, targetMinute] = String(settings.reportTime || '09:00')
+    .split(':')
+    .map(Number);
+  const start = new Date();
+  start.setSeconds(0, 0);
+  start.setMinutes(start.getMinutes() + 1);
+  for (let offset = 0; offset < 2 * 24 * 60; offset += 1) {
+    const candidate = new Date(start.getTime() + offset * 60_000);
+    try {
+      const parts = timezoneParts(
+        candidate,
+        settings.reportTimezone || 'Asia/Shanghai',
+      );
+      if (
+        Number(parts.hour) === targetHour &&
+        Number(parts.minute) === targetMinute
+      ) return Math.max(1000, candidate.getTime() - Date.now());
+    } catch {
+      return 60 * 60_000;
+    }
+  }
+  return 24 * 60 * 60_000;
+}
+
+async function scheduleNextReport() {
+  if (reportTimer) clearTimeout(reportTimer);
+  reportTimer = null;
+  const settings = await getPlatformSettings();
+  if (
+    (!settings.dailyReportEnabled && !settings.weeklyReportEnabled) ||
+    !settings.telegramGroupId ||
+    !TELEGRAM_ENABLED
+  ) return;
+  reportTimer = setTimeout(async () => {
+    reportTimer = null;
+    try {
+      await runScheduledReport();
+    } catch (error) {
+      console.error('Telegram 日报发送失败：', error.message);
+    } finally {
+      scheduleNextReport().catch(() => {});
+    }
+  }, nextReportDelay(settings));
   reportTimer.unref();
+}
+
+async function scheduleNextExpiryReminder() {
+  if (expiryReminderTimer) clearTimeout(expiryReminderTimer);
+  expiryReminderTimer = null;
+  await processExpiryReminders();
+  const result = await pool.query(`
+    SELECT MIN(access_expires_at - INTERVAL '3 days') AS remind_at
+    FROM tenants
+    WHERE status='active'
+      AND access_expires_at > NOW()
+      AND expiry_reminder_sent_at IS NULL
+  `);
+  const remindAt = result.rows[0]?.remind_at
+    ? new Date(result.rows[0].remind_at).getTime()
+    : 0;
+  const delay = remindAt
+    ? Math.min(
+        24 * 60 * 60_000,
+        Math.max(1000, remindAt - Date.now() + 1000),
+      )
+    : 24 * 60 * 60_000;
+  expiryReminderTimer = setTimeout(() => {
+    scheduleNextExpiryReminder().catch((error) =>
+      console.error('到期提醒调度失败：', error.message),
+    );
+  }, delay);
+  expiryReminderTimer.unref();
+}
+
+function startBackgroundJobs() {
+  processObjectDeleteQueue().catch(() => {});
+  scheduleNextExpiryReminder().catch((error) =>
+    console.error('到期提醒调度失败：', error.message),
+  );
+  scheduleNextReport().catch((error) =>
+    console.error('Telegram 报告调度失败：', error.message),
+  );
 }
 
 function effectiveLicenseStatus(row) {
@@ -6766,10 +7483,12 @@ function effectiveLicenseStatus(row) {
 }
 
 function publicLicenseRow(row) {
+  const fullKey = decryptLicenseKey(row.key_ciphertext) || licenseHint(row);
   return {
     id: row.id,
     tenantId: row.tenant_id || null,
-    maskedKey: licenseHint(row),
+    maskedKey: fullKey,
+    fullKey,
     durationCode: row.duration_code,
     durationDays: Number(row.duration_days),
     status: effectiveLicenseStatus(row),
@@ -6801,7 +7520,7 @@ function publicLicenseRow(row) {
   };
 }
 
-async function getRealtimeTenantPresence() {
+function getRealtimePresenceSnapshot() {
   const presence = new Map();
   for (const client of sseClients) {
     if (!isUuid(client.tenantId)) continue;
@@ -6817,33 +7536,12 @@ async function getRealtimeTenantPresence() {
     }
     presence.set(client.tenantId, item);
   }
-  const tenantIds = [...presence.keys()];
-  const tenantRows = tenantIds.length
-    ? (
-        await pool.query(
-          `SELECT id,name,public_code FROM tenants WHERE id=ANY($1::uuid[])`,
-          [tenantIds],
-        )
-      ).rows
-    : [];
-  const tenantMeta = new Map(tenantRows.map((row) => [row.id, row]));
-  const tenants = [...presence.values()]
-    .map((item) => {
-      const row = tenantMeta.get(item.tenantId) || {};
-      return {
-        tenantId: item.tenantId,
-        name: row.name || '未命名租户',
-        publicCode: row.public_code || '',
-        adminDevices: item.adminDevices,
-        onlineVisitors: item.visitorIds.size,
-        chatting: item.visitorIds.size > 0,
-      };
-    })
-    .sort((left, right) =>
-      Number(right.chatting) - Number(left.chatting) ||
-      right.adminDevices - left.adminDevices ||
-      left.name.localeCompare(right.name, 'zh-CN'),
-    );
+  const tenants = [...presence.values()].map((item) => ({
+    tenantId: item.tenantId,
+    adminDevices: item.adminDevices,
+    onlineVisitors: item.visitorIds.size,
+    chatting: item.visitorIds.size > 0,
+  }));
   return {
     onlineTenantCount: tenants.filter((item) => item.adminDevices > 0).length,
     onlineTenantDevices: tenants.reduce(
@@ -6855,6 +7553,68 @@ async function getRealtimeTenantPresence() {
       (sum, item) => sum + item.onlineVisitors,
       0,
     ),
+    tenants,
+  };
+}
+
+function getDistributorPresenceSnapshot(distributorId) {
+  const presence = new Map();
+  for (const client of sseClients) {
+    if (client.ownerDistributorId !== distributorId) continue;
+    if (!isUuid(client.tenantId)) continue;
+    if (!['tenant_admin', 'user'].includes(client.kind)) continue;
+    const item = presence.get(client.tenantId) || {
+      tenantId: client.tenantId,
+      adminDevices: 0,
+      visitorIds: new Set(),
+    };
+    if (client.kind === 'tenant_admin') item.adminDevices += 1;
+    if (client.kind === 'user' && client.conversationId) {
+      item.visitorIds.add(client.conversationId);
+    }
+    presence.set(client.tenantId, item);
+  }
+  const tenants = [...presence.values()].map((item) => ({
+    tenantId: item.tenantId,
+    adminDevices: item.adminDevices,
+    onlineVisitors: item.visitorIds.size,
+  }));
+  return {
+    onlineTenants: tenants.filter((item) => item.adminDevices > 0).length,
+    chattingTenants: tenants.filter((item) => item.onlineVisitors > 0).length,
+    tenants,
+  };
+}
+
+async function getRealtimeTenantPresence() {
+  const snapshot = getRealtimePresenceSnapshot();
+  const tenantIds = snapshot.tenants.map((item) => item.tenantId);
+  const tenantRows = tenantIds.length
+    ? (
+        await pool.query(
+          `SELECT id,name,public_code FROM tenants WHERE id=ANY($1::uuid[])`,
+          [tenantIds],
+        )
+      ).rows
+    : [];
+  const tenantMeta = new Map(tenantRows.map((row) => [row.id, row]));
+  const tenants = snapshot.tenants
+    .map((item) => {
+      const row = tenantMeta.get(item.tenantId) || {};
+      return {
+        ...item,
+        tenantId: item.tenantId,
+        name: row.name || '未命名租户',
+        publicCode: row.public_code || '',
+      };
+    })
+    .sort((left, right) =>
+      Number(right.chatting) - Number(left.chatting) ||
+      right.adminDevices - left.adminDevices ||
+      left.name.localeCompare(right.name, 'zh-CN'),
+    );
+  return {
+    ...snapshot,
     tenants,
   };
 }
@@ -6904,7 +7664,21 @@ async function getSuperDashboard() {
   };
 }
 
-async function getSuperLicenses() {
+async function getSuperLicenses(
+  { cursor = null, limit = 2000, search = '', status = '' } = {},
+) {
+  const decoded = decodeCursor(cursor);
+  const keyword = cleanText(search, 120).trim();
+  const requestedStatus = [
+    'unused',
+    'active',
+    'expired',
+    'revoked',
+    'archived',
+    'superseded',
+  ].includes(status)
+    ? status
+    : '';
   const result = await pool.query(`
     SELECT
       l.*, t.name AS tenant_name, sa.username AS generated_by_username,
@@ -6913,50 +7687,109 @@ async function getSuperLicenses() {
     LEFT JOIN tenants t ON t.id = l.tenant_id
     LEFT JOIN super_admins sa ON sa.id = l.generated_by_admin_id
     LEFT JOIN distributors d ON d.id = l.generated_by_distributor_id
-    ORDER BY l.created_at DESC
-    LIMIT 2000
-  `);
+    WHERE (
+      $1::timestamptz IS NULL
+      OR (l.created_at,l.id) < ($1::timestamptz,$2::uuid)
+    )
+      AND (
+        $3::text=''
+        OR ($3='active' AND l.status='active' AND l.expires_at>NOW())
+        OR ($3='expired' AND l.status='active' AND l.expires_at<=NOW())
+        OR ($3 NOT IN ('active','expired') AND l.status=$3)
+      )
+      AND (
+        $4::text=''
+        OR t.name ILIKE '%' || $4 || '%'
+        OR COALESCE(sa.username,'') ILIKE '%' || $4 || '%'
+        OR COALESCE(d.username,'') ILIKE '%' || $4 || '%'
+        OR COALESCE(l.key_suffix,'') ILIKE '%' || $4 || '%'
+      )
+    ORDER BY l.created_at DESC,l.id DESC
+    LIMIT $5
+  `, [decoded?.at || null, decoded?.id || null, requestedStatus, keyword, limit]);
   return result.rows.map(publicLicenseRow);
 }
 
-async function getSuperTenants() {
+async function getSuperLicensePage(options = {}) {
+  const limit = Math.min(API_PAGE_MAX, Math.max(1, options.limit || API_PAGE_DEFAULT));
+  const rows = await getSuperLicenses({ ...options, limit: limit + 1 });
+  const hasMore = rows.length > limit;
+  const items = rows.slice(0, limit);
+  const last = items.at(-1);
+  return {
+    items,
+    hasMore,
+    nextCursor:
+      hasMore && last
+        ? encodeCursor({ at: last.createdAt, id: last.id })
+        : null,
+  };
+}
+
+async function getSuperTenants(
+  { cursor = null, limit = 10000, search = '' } = {},
+) {
+  const decoded = decodeCursor(cursor);
+  const keyword = cleanText(search, 120).trim();
   const result = await pool.query(`
+    WITH tenant_page AS MATERIALIZED (
+      SELECT
+        t.*,
+        l.id AS license_id,
+        l.key_prefix,
+        l.key_suffix,
+        l.key_ciphertext,
+        l.expires_at,
+        l.status AS license_status,
+        l.generated_by_admin_id,
+        l.generated_by_distributor_id,
+        l.telegram_user_id,
+        l.telegram_username,
+        l.telegram_display_name,
+        sa.username AS generated_by_username,
+        d.username AS generated_by_distributor_username,
+        owner_d.username AS owner_distributor_username,
+        owner_d.display_name AS owner_distributor_display_name,
+        tc.retention_hours,
+        tc.frontend_template_id,
+        ft.name AS frontend_template_name
+      FROM tenants t
+      LEFT JOIN LATERAL (
+        SELECT *
+        FROM license_keys
+        WHERE tenant_id = t.id
+        ORDER BY
+          CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+          created_at DESC
+        LIMIT 1
+      ) l ON TRUE
+      LEFT JOIN super_admins sa ON sa.id = l.generated_by_admin_id
+      LEFT JOIN distributors d ON d.id = l.generated_by_distributor_id
+      LEFT JOIN distributors owner_d ON owner_d.id = t.owner_distributor_id
+      LEFT JOIN tenant_config tc ON tc.tenant_id = t.id
+      LEFT JOIN frontend_templates ft ON ft.id = tc.frontend_template_id
+      WHERE (
+        $1::timestamptz IS NULL
+        OR (t.updated_at,t.id) < ($1::timestamptz,$2::uuid)
+      )
+        AND (
+          $3::text=''
+          OR t.name ILIKE '%' || $3 || '%'
+          OR t.note ILIKE '%' || $3 || '%'
+          OR t.public_code ILIKE '%' || $3 || '%'
+          OR COALESCE(l.key_suffix,'') ILIKE '%' || $3 || '%'
+          OR COALESCE(owner_d.username,'') ILIKE '%' || $3 || '%'
+          OR COALESCE(owner_d.display_name,'') ILIKE '%' || $3 || '%'
+        )
+      ORDER BY t.updated_at DESC,t.id DESC
+      LIMIT $4
+    )
     SELECT
       t.*,
-      l.id AS license_id,
-      l.key_prefix,
-      l.key_suffix,
-      l.expires_at,
-      l.status AS license_status,
-      l.generated_by_admin_id,
-      l.telegram_user_id,
-      l.telegram_username,
-      l.telegram_display_name,
-      sa.username AS generated_by_username,
-      d.username AS generated_by_distributor_username,
-      owner_d.username AS owner_distributor_username,
-      owner_d.display_name AS owner_distributor_display_name,
-      tc.retention_hours,
-      tc.frontend_template_id,
-      ft.name AS frontend_template_name,
       COALESCE(today.visitors,0)::int AS visitors_today,
       COALESCE(today.messages,0)::int AS messages_today,
       COALESCE(media.bytes,0)::bigint AS media_bytes
-    FROM tenants t
-    LEFT JOIN LATERAL (
-      SELECT *
-      FROM license_keys
-      WHERE tenant_id = t.id
-      ORDER BY
-        CASE WHEN status = 'active' THEN 0 ELSE 1 END,
-        created_at DESC
-      LIMIT 1
-    ) l ON TRUE
-    LEFT JOIN super_admins sa ON sa.id = l.generated_by_admin_id
-    LEFT JOIN distributors d ON d.id = l.generated_by_distributor_id
-    LEFT JOIN distributors owner_d ON owner_d.id = t.owner_distributor_id
-    LEFT JOIN tenant_config tc ON tc.tenant_id = t.id
-    LEFT JOIN frontend_templates ft ON ft.id = tc.frontend_template_id
+    FROM tenant_page t
     LEFT JOIN LATERAL (
       SELECT
         COUNT(DISTINCT c.id) FILTER (
@@ -6975,8 +7808,8 @@ async function getSuperTenants() {
       JOIN attachments a ON a.conversation_id = c.id
       WHERE c.tenant_id = t.id
     ) media ON TRUE
-    ORDER BY t.updated_at DESC
-  `);
+    ORDER BY t.updated_at DESC,t.id DESC
+  `, [decoded?.at || null, decoded?.id || null, keyword, limit]);
   return result.rows.map((row) => ({
     id: row.id,
     publicCode: row.public_code,
@@ -6985,6 +7818,7 @@ async function getSuperTenants() {
     status: row.status,
     accessExpiresAt: new Date(row.access_expires_at).toISOString(),
     createdAt: new Date(row.created_at).toISOString(),
+    updatedAt: new Date(row.updated_at).toISOString(),
     lastAdminOnlineAt: row.last_admin_online_at
       ? new Date(row.last_admin_online_at).toISOString()
       : null,
@@ -6992,7 +7826,9 @@ async function getSuperTenants() {
       ? new Date(row.expiry_reminder_sent_at).toISOString()
       : null,
     licenseId: row.license_id || null,
-    maskedKey: row.license_id ? licenseHint(row) : '',
+    maskedKey: row.license_id
+      ? decryptLicenseKey(row.key_ciphertext) || licenseHint(row)
+      : '',
     licenseStatus: row.license_status || '',
     generator:
       row.generated_by_username ||
@@ -7024,6 +7860,22 @@ async function getSuperTenants() {
         .filter(Boolean),
     ).size,
   }));
+}
+
+async function getSuperTenantPage(options = {}) {
+  const limit = Math.min(API_PAGE_MAX, Math.max(1, options.limit || API_PAGE_DEFAULT));
+  const rows = await getSuperTenants({ ...options, limit: limit + 1 });
+  const hasMore = rows.length > limit;
+  const items = rows.slice(0, limit);
+  const last = items.at(-1);
+  return {
+    items,
+    hasMore,
+    nextCursor:
+      hasMore && last
+        ? encodeCursor({ at: last.updatedAt, id: last.id })
+        : null,
+  };
 }
 
 function normalizeDistributorUsername(value) {
@@ -7201,24 +8053,43 @@ function publicDistributorLicenseRow(row, distributorId) {
   };
 }
 
-async function getDistributorLicenses(distributorId) {
+async function getDistributorLicenses(distributorId, options = {}) {
+  const maxLimit = options.legacy ? 2000 : API_PAGE_MAX;
+  const limit = Math.min(maxLimit, Math.max(1, options.limit || API_PAGE_DEFAULT));
+  const cursor = decodeCursor(options.cursor);
   const result = await pool.query(
     `
       SELECT l.*,t.name AS tenant_name,t.owner_distributor_id
       FROM license_keys l
       LEFT JOIN tenants t ON t.id=l.tenant_id
       WHERE l.generated_by_distributor_id=$1
-      ORDER BY l.created_at DESC
-      LIMIT 2000
+        AND (
+          $2::timestamptz IS NULL OR
+          (l.created_at,l.id) < ($2::timestamptz,$3::uuid)
+        )
+      ORDER BY l.created_at DESC,l.id DESC
+      LIMIT $4
     `,
-    [distributorId],
+    [distributorId, cursor?.at || null, cursor?.id || null, limit + 1],
   );
-  return result.rows.map((row) =>
+  const hasMore = result.rows.length > limit;
+  const items = result.rows.slice(0, limit).map((row) =>
     publicDistributorLicenseRow(row, distributorId),
   );
+  const last = items.at(-1);
+  return {
+    items,
+    hasMore,
+    nextCursor: hasMore && last
+      ? encodeCursor({ at: last.createdAt, id: last.id })
+      : null,
+  };
 }
 
-async function getDistributorTenants(distributorId) {
+async function getDistributorTenants(distributorId, options = {}) {
+  const maxLimit = options.legacy ? 2000 : API_PAGE_MAX;
+  const limit = Math.min(maxLimit, Math.max(1, options.limit || API_PAGE_DEFAULT));
+  const cursor = decodeCursor(options.cursor);
   const result = await pool.query(
     `
       SELECT
@@ -7237,12 +8108,17 @@ async function getDistributorTenants(distributorId) {
         LIMIT 1
       ) l ON TRUE
       WHERE t.owner_distributor_id=$1
-      ORDER BY t.updated_at DESC
-      LIMIT 2000
+        AND (
+          $2::timestamptz IS NULL OR
+          (t.updated_at,t.id) < ($2::timestamptz,$3::uuid)
+        )
+      ORDER BY t.updated_at DESC,t.id DESC
+      LIMIT $4
     `,
-    [distributorId],
+    [distributorId, cursor?.at || null, cursor?.id || null, limit + 1],
   );
-  return result.rows.map((row) => {
+  const hasMore = result.rows.length > limit;
+  const items = result.rows.slice(0, limit).map((row) => {
     const onlineDevices = [...sseClients].filter(
       (client) =>
         client.kind === 'tenant_admin' && client.tenantId === row.id,
@@ -7263,6 +8139,7 @@ async function getDistributorTenants(distributorId) {
       note: row.note || '',
       status: row.status,
       createdAt: new Date(row.created_at).toISOString(),
+      updatedAt: new Date(row.updated_at).toISOString(),
       accessExpiresAt: new Date(row.access_expires_at).toISOString(),
       lastAdminOnlineAt: row.last_admin_online_at
         ? new Date(row.last_admin_online_at).toISOString()
@@ -7296,6 +8173,14 @@ async function getDistributorTenants(distributorId) {
       ),
     };
   });
+  const last = items.at(-1);
+  return {
+    items,
+    hasMore,
+    nextCursor: hasMore && last
+      ? encodeCursor({ at: last.updatedAt, id: last.id })
+      : null,
+  };
 }
 
 async function getDistributorDashboard(distributorId) {
@@ -7416,7 +8301,7 @@ async function handleDistributorLogin(req, res) {
   });
 }
 
-async function handleDistributorRoutes(req, res, url, pathname) {
+async function handleDistributorRoutes(req, res, url, pathname, apiVersion = 1) {
   if (req.method === 'POST' && pathname === '/api/distributor/login') {
     return handleDistributorLogin(req, res);
   }
@@ -7446,9 +8331,17 @@ async function handleDistributorRoutes(req, res, url, pathname) {
   }
 
   if (req.method === 'GET' && pathname === '/api/distributor/licenses') {
+    const page = await getDistributorLicenses(distributor.id, {
+      cursor: apiVersion >= 2 ? url.searchParams.get('cursor') : null,
+      limit: apiVersion >= 2 ? pageLimit(url) : 2000,
+      legacy: apiVersion < 2,
+    });
     return sendJson(res, 200, {
       ok: true,
-      licenses: await getDistributorLicenses(distributor.id),
+      licenses: page.items,
+      page: apiVersion >= 2
+        ? { nextCursor: page.nextCursor, hasMore: page.hasMore }
+        : undefined,
     });
   }
 
@@ -7616,25 +8509,50 @@ async function handleDistributorRoutes(req, res, url, pathname) {
   }
 
   if (req.method === 'GET' && pathname === '/api/distributor/tenants') {
+    const page = await getDistributorTenants(distributor.id, {
+      cursor: apiVersion >= 2 ? url.searchParams.get('cursor') : null,
+      limit: apiVersion >= 2 ? pageLimit(url) : 2000,
+      legacy: apiVersion < 2,
+    });
     return sendJson(res, 200, {
       ok: true,
-      tenants: await getDistributorTenants(distributor.id),
+      tenants: page.items,
+      page: apiVersion >= 2
+        ? { nextCursor: page.nextCursor, hasMore: page.hasMore }
+        : undefined,
     });
   }
 
   if (req.method === 'GET' && pathname === '/api/distributor/quota-logs') {
+    const logLimit = apiVersion >= 2 ? pageLimit(url, 100) : 500;
+    const rawCursor = Number(url.searchParams.get('cursor'));
+    const logCursor = apiVersion >= 2 && Number.isSafeInteger(rawCursor) && rawCursor > 0
+      ? rawCursor
+      : null;
     const result = await pool.query(
       `
-        SELECT duration_code,action,change_amount,balance_before,
+        SELECT id,duration_code,action,change_amount,balance_before,
                balance_after,reason,created_at
         FROM distributor_quota_logs
         WHERE distributor_id=$1
-        ORDER BY created_at DESC
-        LIMIT 500
+          AND ($2::bigint IS NULL OR id<$2)
+        ORDER BY id DESC
+        LIMIT $3
       `,
-      [distributor.id],
+      [distributor.id, logCursor, apiVersion >= 2 ? logLimit + 1 : logLimit],
     );
-    return sendJson(res, 200, { ok: true, logs: result.rows });
+    const hasMore = apiVersion >= 2 && result.rows.length > logLimit;
+    const logs = result.rows.slice(0, logLimit);
+    return sendJson(res, 200, {
+      ok: true,
+      logs,
+      page: apiVersion >= 2
+        ? {
+            hasMore,
+            nextCursor: hasMore ? String(logs.at(-1)?.id || '') : null,
+          }
+        : undefined,
+    });
   }
 
   const licenseMatch = pathname.match(
@@ -7854,7 +8772,7 @@ function parseIsoDate(value, allowNull = true) {
   return date.toISOString();
 }
 
-async function handleSuperRoutes(req, res, url, pathname) {
+async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
   if (req.method === 'POST' && pathname === '/api/super/login') {
     return handleSuperLogin(req, res);
   }
@@ -7888,7 +8806,7 @@ async function handleSuperRoutes(req, res, url, pathname) {
       releases,
       featureCatalog,
       featureFlags,
-      tenants,
+      tenantResult,
     ] = await Promise.all([
       getSuperDashboard(),
       getPlatformSettings(),
@@ -7911,7 +8829,9 @@ async function handleSuperRoutes(req, res, url, pathname) {
       `),
       pool.query(`SELECT * FROM feature_catalog ORDER BY category,name`),
       pool.query(`SELECT * FROM feature_flags ORDER BY code`),
-      getSuperTenants(),
+      apiVersion >= 2
+        ? getSuperTenantPage({ limit: pageLimit(url) })
+        : getSuperTenants(),
     ]);
     return sendJson(res, 200, {
       ok: true,
@@ -7924,10 +8844,17 @@ async function handleSuperRoutes(req, res, url, pathname) {
       releases: releases.rows,
       featureCatalog: featureCatalog.rows,
       featureFlags: featureFlags.rows,
-      tenants,
+      tenants: apiVersion >= 2 ? tenantResult.items : tenantResult,
+      tenantPage:
+        apiVersion >= 2
+          ? {
+              nextCursor: tenantResult.nextCursor,
+              hasMore: tenantResult.hasMore,
+            }
+          : undefined,
       monitor:
         lastMonitorSnapshot ||
-        (await collectMonitorSnapshot({ persist: false })),
+        (await getMonitorSnapshotCached({ persist: false })),
     });
   }
 
@@ -8238,6 +9165,11 @@ async function handleSuperRoutes(req, res, url, pathname) {
           passwordReset: Boolean(password),
         },
       });
+      for (const key of distributorAuthCache.keys()) {
+        if (key.startsWith(`${distributorId}:`)) {
+          distributorAuthCache.delete(key);
+        }
+      }
       if (invalidateSession) disconnectDistributor(distributorId);
       else {
         broadcastDistributor(
@@ -8262,9 +9194,21 @@ async function handleSuperRoutes(req, res, url, pathname) {
     });
   }
   if (req.method === 'GET' && pathname === '/api/super/licenses') {
+    const page = apiVersion >= 2
+      ? await getSuperLicensePage({
+          cursor: url.searchParams.get('cursor'),
+          limit: pageLimit(url),
+          search: url.searchParams.get('search') || '',
+          status: url.searchParams.get('status') || '',
+        })
+      : null;
     return sendJson(res, 200, {
       ok: true,
-      licenses: await getSuperLicenses(),
+      licenses: apiVersion >= 2 ? page.items : await getSuperLicenses(),
+      page:
+        apiVersion >= 2
+          ? { nextCursor: page.nextCursor, hasMore: page.hasMore }
+          : undefined,
     });
   }
   if (req.method === 'POST' && pathname === '/api/super/licenses') {
@@ -8494,9 +9438,20 @@ async function handleSuperRoutes(req, res, url, pathname) {
   }
 
   if (req.method === 'GET' && pathname === '/api/super/tenants') {
+    const page = apiVersion >= 2
+      ? await getSuperTenantPage({
+          cursor: url.searchParams.get('cursor'),
+          limit: pageLimit(url),
+          search: url.searchParams.get('search') || '',
+        })
+      : null;
     return sendJson(res, 200, {
       ok: true,
-      tenants: await getSuperTenants(),
+      tenants: apiVersion >= 2 ? page.items : await getSuperTenants(),
+      page:
+        apiVersion >= 2
+          ? { nextCursor: page.nextCursor, hasMore: page.hasMore }
+          : undefined,
     });
   }
   const tenantMatch = pathname.match(
@@ -8701,6 +9656,7 @@ if (body.action === 'assignDistributor') {
       );
       broadcast({ type: 'settings-updated' }, null, tenantId);
     }
+   invalidateTenantAccessCaches(tenantId);
    await writeAudit(
   req,
   admin,
@@ -8722,6 +9678,11 @@ broadcastSuper({ type: 'tenants-updated' });
 
 if (body.action === 'assignDistributor') {
   broadcastSuper({ type: 'distributors-updated' });
+  for (const liveClient of sseClients) {
+    if (liveClient.tenantId === tenantId) {
+      liveClient.ownerDistributorId = nextOwnerDistributorId;
+    }
+  }
 }
 
 for (
@@ -8736,6 +9697,7 @@ for (
     { type: 'distributor-tenants-updated' },
     distributorId,
   );
+  scheduleDistributorPresenceUpdate(distributorId);
 }
 
 return sendJson(res, 200, { ok: true });
@@ -9029,6 +9991,7 @@ return sendJson(res, 200, { ok: true });
       targetType: 'feature',
       targetId: id,
     });
+    invalidateTenantCaches();
     publishEvent(
       { type: 'feature-catalog-updated' },
       { targetKind: 'tenant_admin' },
@@ -9083,6 +10046,7 @@ return sendJson(res, 200, { ok: true });
       targetType: 'feature',
       targetId: featureMatch[1],
     });
+    invalidateTenantCaches();
     publishEvent(
       { type: 'feature-catalog-updated' },
       { targetKind: 'tenant_admin' },
@@ -9166,6 +10130,7 @@ return sendJson(res, 200, { ok: true });
       targetType: 'feature_flag',
       targetId: code,
     });
+    invalidateTenantCaches();
     publishEvent(
       { type: 'feature-flags-updated' },
       { targetKind: 'tenant_admin' },
@@ -9257,6 +10222,7 @@ return sendJson(res, 200, { ok: true });
       targetId: id,
       metadata: { origin: parsed.origin },
     });
+    invalidateTenantCaches();
     publishEvent(
       { type: 'frontend_catalog_updated' },
       { targetKind: 'tenant_admin' },
@@ -9590,6 +10556,12 @@ return sendJson(res, 200, { ok: true });
   }
 
   if (req.method === 'GET' && pathname === '/api/super/audit') {
+    const auditLimit = apiVersion >= 2 ? pageLimit(url, 100) : 1000;
+    const rawCursor = Number(url.searchParams.get('cursor'));
+    const auditCursor =
+      apiVersion >= 2 && Number.isSafeInteger(rawCursor) && rawCursor > 0
+        ? rawCursor
+        : null;
     const result = await pool.query(`
       SELECT
         al.*,
@@ -9603,17 +10575,31 @@ return sendJson(res, 200, { ok: true });
       FROM audit_logs al
       LEFT JOIN super_admins sa ON sa.id=al.actor_admin_id
       LEFT JOIN distributors d ON d.id=al.actor_distributor_id
-      ORDER BY al.created_at DESC
-      LIMIT 1000
-    `);
-    return sendJson(res, 200, { ok: true, logs: result.rows });
+      WHERE ($1::bigint IS NULL OR al.id < $1)
+      ORDER BY al.id DESC
+      LIMIT $2
+    `, [auditCursor, apiVersion >= 2 ? auditLimit + 1 : auditLimit]);
+    const hasMore = apiVersion >= 2 && result.rows.length > auditLimit;
+    const logs = result.rows.slice(0, auditLimit);
+    return sendJson(res, 200, {
+      ok: true,
+      logs,
+      page:
+        apiVersion >= 2
+          ? {
+              hasMore,
+              nextCursor: hasMore ? String(logs.at(-1)?.id || '') : null,
+            }
+          : undefined,
+    });
   }
   if (req.method === 'GET' && pathname === '/api/super/monitor') {
     return sendJson(res, 200, {
       ok: true,
-      monitor:
-        lastMonitorSnapshot ||
-        (await collectMonitorSnapshot({ persist: false })),
+      monitor: await getMonitorSnapshotCached({
+        force: url.searchParams.get('refresh') === '1',
+        persist: false,
+      }),
     });
   }
   if (req.method === 'GET' && pathname === '/api/super/platform') {
@@ -9676,6 +10662,8 @@ return sendJson(res, 200, { ok: true });
       targetType: 'platform',
       targetId: '1',
     });
+    invalidatePlatformCache();
+    scheduleNextReport().catch(() => {});
     broadcastSuper({ type: 'platform-updated' });
     publishEvent(
       { type: 'platform-updated' },
@@ -9703,9 +10691,57 @@ return sendJson(res, 200, { ok: true });
 }
 
 async function router(req, res) {
-  maybeCleanupExpiredData();
-  await refreshApprovedOrigins();
   setCommonHeaders(req, res);
+
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const rawPathname = url.pathname.replace(/\/+$/, '') || '/';
+
+  if (req.method === 'GET' && rawPathname === '/health/live') {
+    return sendJson(res, 200, {
+      ok: true,
+      service: 'tuojie-cloud-service',
+      version: APP_VERSION,
+      databaseCheck: false,
+      at: nowIso(),
+    });
+  }
+
+  if (req.method === 'GET' && rawPathname === '/health') {
+    return sendJson(res, 200, {
+      ok: true,
+      service: 'tuojie-cloud-service',
+      version: APP_VERSION,
+      database: 'neon-postgresql',
+      mediaStorage: R2_ENABLED ? 'cloudflare-r2' : 'postgres-fallback',
+      defaultRetentionHours: RETENTION_HOURS,
+      telegramBotEnabled: TELEGRAM_ENABLED,
+      databaseCheck: false,
+      readinessEndpoint: '/health/ready',
+      at: nowIso(),
+    });
+  }
+
+  if (req.method === 'GET' && rawPathname === '/health/ready') {
+    const result = await pool.query(`
+      SELECT
+        NOW() AS now,
+        EXISTS(
+          SELECT 1 FROM super_admins WHERE enabled=TRUE LIMIT 1
+        ) AS super_admin_ready
+    `);
+    return sendJson(res, 200, {
+      ok: true,
+      service: 'tuojie-cloud-service',
+      version: APP_VERSION,
+      database: 'neon-postgresql',
+      mediaStorage: R2_ENABLED ? 'cloudflare-r2' : 'postgres-fallback',
+      telegramBotEnabled: TELEGRAM_ENABLED,
+      superAdminReady: Boolean(result.rows[0]?.super_admin_ready),
+      databaseTime: new Date(result.rows[0].now).toISOString(),
+    });
+  }
+
+  await refreshApprovedOrigins();
 
   const origin = req.headers.origin;
   if (origin && !originAllowed(origin)) {
@@ -9717,12 +10753,13 @@ async function router(req, res) {
     return res.end();
   }
 
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const pathname = url.pathname.replace(/\/+$/, '') || '/';
+  const normalizedPath = normalizeApiPath(rawPathname);
+  const apiVersion = normalizedPath.apiVersion;
+  const pathname = normalizedPath.pathname;
   if (
     REQUIRE_CLOUDFLARE &&
-    pathname.startsWith('/api/') &&
-    pathname !== '/api/telegram/webhook' &&
+    rawPathname.startsWith('/api/') &&
+    rawPathname !== '/api/telegram/webhook' &&
     (
       !req.headers['cf-ray'] ||
       !timingSafeTextEqual(
@@ -9734,23 +10771,13 @@ async function router(req, res) {
     return sendError(res, 403, '请求必须通过 Cloudflare。', 'CLOUDFLARE_REQUIRED');
   }
 
-  if (req.method === 'GET' && pathname === '/health') {
-    const dbResult = await pool.query('SELECT NOW() AS now');
-    return sendJson(res, 200, {
-      ok: true,
-      service: 'tuojie-cloud-service',
-      version: APP_VERSION,
-      database: 'neon-postgresql',
-      mediaStorage: R2_ENABLED ? 'cloudflare-r2' : 'postgres-fallback',
-      defaultRetentionHours: RETENTION_HOURS,
-      telegramBotEnabled: TELEGRAM_ENABLED,
-      superAdminReady: Boolean(
-        (await pool.query(`SELECT 1 FROM super_admins WHERE enabled=TRUE LIMIT 1`))
-          .rows[0],
-      ),
-      databaseTime: new Date(dbResult.rows[0].now).toISOString(),
-    });
-  }
+  if (
+    apiVersion === 1 &&
+    pathname.startsWith('/api/') &&
+    pathname !== '/api/telegram/webhook' &&
+    !pathname.startsWith('/api/public/') &&
+    !requireLegacyApi(res, apiVersion)
+  ) return;
 
   if (
     req.method === 'GET' &&
@@ -9778,11 +10805,11 @@ async function router(req, res) {
   }
 
   if (pathname.startsWith('/api/super/')) {
-    return handleSuperRoutes(req, res, url, pathname);
+    return handleSuperRoutes(req, res, url, pathname, apiVersion);
   }
 
   if (pathname.startsWith('/api/distributor/')) {
-    return handleDistributorRoutes(req, res, url, pathname);
+    return handleDistributorRoutes(req, res, url, pathname, apiVersion);
   }
 
   if (req.method === 'POST' && pathname === '/api/telegram/webhook') {
@@ -9979,11 +11006,17 @@ async function router(req, res) {
     } else {
       await touchConversation(conversationId, body, req, tenant.id);
     }
-    const conversation = await getPublicConversation(
-      conversationId,
-      pool,
-      tenant.id,
-    );
+    const conversation = apiVersion >= 2
+      ? await getConversationMessagePage(
+          conversationId,
+          tenant.id,
+          { limit: pageLimit(url) },
+        )
+      : await getPublicConversation(
+          conversationId,
+          pool,
+          tenant.id,
+        );
     if (created) {
       broadcast(
         {
@@ -10157,11 +11190,13 @@ async function router(req, res) {
     const client = {
       res,
       kind: payload.kind,
+      apiVersion,
       tenantId: payload.tenantId,
       conversationId: payload.conversationId || null,
       licenseId: payload.licenseId || null,
       adminId: payload.adminId || null,
       distributorId: payload.distributorId || null,
+      ownerDistributorId: tenant?.owner_distributor_id || null,
       accessExpiresAt:
         ['super_admin', 'distributor'].includes(payload.kind)
           ? Number(payload.exp || 0) * 1000 ||
@@ -10179,7 +11214,12 @@ async function router(req, res) {
     );
     sendSse(
       res,
-      { type: 'connected', at: nowIso(), eventId: nextEventId },
+      {
+        type: 'connected',
+        at: nowIso(),
+        eventId: nextEventId,
+        apiVersion,
+      },
       nextEventId++,
     );
     if (payload.kind === 'tenant_admin') {
@@ -10262,16 +11302,49 @@ async function router(req, res) {
         'FORCE_LOGOUT',
       );
     }
-    const conversation = await getConversationRow(payload.conversationId, pool, false, payload.tenantId);
+    const requiresStoredConversation =
+      apiVersion < 2 ||
+      (req.method === 'POST' && pathname === '/api/user/uploads');
+    const conversation = requiresStoredConversation
+      ? await getConversationRow(
+          payload.conversationId,
+          pool,
+          false,
+          payload.tenantId,
+        )
+      : {
+          id: payload.conversationId,
+          tenant_id: payload.tenantId,
+          visitor_key_hash: hashVisitorKey(payload.visitorKey),
+        };
     if (!conversation || !authorizeConversation(payload, conversation)) return sendError(res,401,'访客会话不存在。','AUTH');
-    await touchConversation(conversation.id,{},req,payload.tenantId);
+    if (apiVersion < 2) {
+      await touchConversation(conversation.id,{},req,payload.tenantId);
+    }
 
     if (req.method === 'GET' && pathname === '/api/user/conversation') {
       const [publicConversation, config, featureFlags] = await Promise.all([
-        getPublicConversation(conversation.id, pool, payload.tenantId),
+        apiVersion >= 2
+          ? getConversationMessagePage(
+              conversation.id,
+              payload.tenantId,
+              {
+                cursor: url.searchParams.get('before'),
+                limit: pageLimit(url),
+              },
+            )
+          : getPublicConversation(conversation.id, pool, payload.tenantId),
         getConfig(payload.tenantId),
         getTenantFeatureStates(payload.tenantId),
       ]);
+      if (!publicConversation) {
+        return sendError(
+          res,
+          401,
+          '访客会话不存在。',
+          'CONVERSATION_DELETED',
+        );
+      }
       return sendJson(res, 200, {
         ok: true,
         conversation: publicConversation,
@@ -10333,15 +11406,18 @@ async function router(req, res) {
         )
       ) return;
       const body = await readJson(req);
-      const result = await createUserMessage(conversation.id, body, payload.tenantId);
-      broadcast(
-        {
-          type: 'conversation-updated',
-          trigger: 'user-message',
-          conversation: result.conversation,
-        },
+      const result = await createUserMessage(
+        conversation.id,
+        body,
+        payload.tenantId,
+        { includeConversation: apiVersion < 2 },
+      );
+      await broadcastMessageResult(
+        result,
+        'user-message',
         conversation.id,
         payload.tenantId,
+        apiVersion,
       );
       return sendJson(res, 201, {
         ok: true,
@@ -10377,8 +11453,12 @@ async function router(req, res) {
 
     if (req.method === 'GET' && pathname === '/api/admin/bootstrap') {
       const tenant = activeTenant;
-      const [conversations, config, templates, notices] = await Promise.all([
-        getAllSummaries(payload.tenantId),
+      const [conversationResult, config, templates, notices] = await Promise.all([
+        apiVersion >= 2
+          ? getAllSummariesPage(payload.tenantId, {
+              limit: pageLimit(url),
+            })
+          : getAllSummaries(payload.tenantId),
         getConfig(payload.tenantId),
         getTemplateCatalog({ tenantId: payload.tenantId }),
         getTenantNotices(payload.tenantId),
@@ -10386,7 +11466,16 @@ async function router(req, res) {
       return sendJson(res, 200, {
         ok: true,
         tenant: publicTenant(tenant),
-        conversations,
+        conversations:
+          apiVersion >= 2 ? conversationResult.items : conversationResult,
+        conversationPage:
+          apiVersion >= 2
+            ? {
+                nextCursor: conversationResult.nextCursor,
+                hasMore: conversationResult.hasMore,
+                totals: conversationResult.totals,
+              }
+            : undefined,
         cannedReplies: config.cannedReplies,
         autoReplies: config.autoReplies,
         settings: config.settings,
@@ -10397,12 +11486,30 @@ async function router(req, res) {
     }
 
     if (req.method === 'GET' && pathname === '/api/admin/conversations') {
-      const conversations = await getAllSummaries(payload.tenantId);
+      const page = apiVersion >= 2
+        ? await getAllSummariesPage(payload.tenantId, {
+            cursor: url.searchParams.get('cursor'),
+            limit: pageLimit(url),
+            search: url.searchParams.get('search') || '',
+          })
+        : null;
+      const conversations = apiVersion >= 2
+        ? page.items
+        : await getAllSummaries(payload.tenantId);
       return sendJson(res, 200, {
         ok: true,
         tenant: publicTenant(activeTenant),
         conversations,
+        page:
+          apiVersion >= 2
+            ? {
+                nextCursor: page.nextCursor,
+                hasMore: page.hasMore,
+                totals: page.totals,
+              }
+            : undefined,
       });
+      invalidateTenantCaches();
     }
 
     if (req.method === 'GET' && pathname === '/api/admin/config') {
@@ -10498,6 +11605,7 @@ async function router(req, res) {
       }).catch((error) =>
         console.error('租户设置审计写入失败：', error.message),
       );
+      invalidateTenantCaches(payload.tenantId);
       const updated = await getConfig(payload.tenantId);
       broadcast(
         { type: 'settings-updated', settings: updated.settings },
@@ -10549,6 +11657,7 @@ async function router(req, res) {
       if (isUuid(oldAssetId)) {
         await deleteAsset(oldAssetId, payload.tenantId);
       }
+      invalidateTenantCaches(payload.tenantId);
       await writeAudit(req, null, 'tenant.avatar.update', {
         targetType: 'tenant',
         targetId: payload.tenantId,
@@ -10587,6 +11696,7 @@ async function router(req, res) {
       if (isUuid(oldAssetId)) {
         await deleteAsset(oldAssetId, payload.tenantId);
       }
+      invalidateTenantCaches(payload.tenantId);
       await writeAudit(req, null, 'tenant.avatar.delete', {
         targetType: 'tenant',
         targetId: payload.tenantId,
@@ -10807,6 +11917,7 @@ async function router(req, res) {
             conversationId,
             messageId,
             payload.tenantId,
+            apiVersion,
           )),
         });
       }
@@ -10820,6 +11931,7 @@ async function router(req, res) {
             conversationId,
             messageId,
             payload.tenantId,
+            apiVersion,
           )),
         });
       }
@@ -10835,45 +11947,61 @@ async function router(req, res) {
       if (!isUuid(conversationId)) {
         return sendError(res, 404, '会话不存在。', 'NOT_FOUND');
       }
-      const conversation = await getConversationRow(conversationId, pool, false, payload.tenantId);
+      const useScopedV2Conversation =
+        apiVersion >= 2 &&
+        (
+          (req.method === 'GET' && !action) ||
+          (req.method === 'POST' && action === 'messages')
+        );
+      const conversation = useScopedV2Conversation
+        ? { id: conversationId, tenant_id: payload.tenantId }
+        : await getConversationRow(
+            conversationId,
+            pool,
+            false,
+            payload.tenantId,
+          );
 
       if (!conversation || !authorizeConversation(payload, conversation)) {
         return sendError(res, 404, '会话不存在。', 'NOT_FOUND');
       }
 
       if (req.method === 'GET' && !action) {
-        await markConversationRead(
+        const readReceipt = await markConversationRead(
           conversationId,
           payload.tenantId,
           'admin',
         );
-        const publicConversation = await getPublicConversation(conversationId, pool, payload.tenantId);
-        broadcast(
-          {
-            type: 'summary-updated',
-            conversation: {
-              ...conversationBase({
-                ...conversation,
-                unread_admin: 0,
-              }),
-              latestMessage: publicConversation.messages.at(-1)
-                ? {
-                    type: publicConversation.messages.at(-1).type,
-                    text:
-                      publicConversation.messages.at(-1).type === 'image'
-                        ? publicConversation.messages.at(-1).text || '[图片]'
-                        : publicConversation.messages.at(-1).type === 'video'
-                          ? publicConversation.messages.at(-1).text || '[视频]'
-                          : publicConversation.messages.at(-1).text,
-                    role: publicConversation.messages.at(-1).role,
-                    createdAt: publicConversation.messages.at(-1).createdAt,
-                  }
-                : null,
-            },
-          },
-          conversationId,
-          payload.tenantId,
-        );
+        const publicConversation = apiVersion >= 2
+          ? await getConversationMessagePage(
+              conversationId,
+              payload.tenantId,
+              {
+                cursor: url.searchParams.get('before'),
+                limit: pageLimit(url),
+              },
+            )
+          : await getPublicConversation(
+              conversationId,
+              pool,
+              payload.tenantId,
+            );
+        if (!publicConversation) {
+          return sendError(res, 404, '会话不存在。', 'NOT_FOUND');
+        }
+        if (readReceipt.messageIds.length) {
+          const summary = await getConversationSummaryById(
+            conversationId,
+            payload.tenantId,
+          );
+          if (summary) {
+            broadcast(
+              { type: 'summary-updated', conversation: summary },
+              conversationId,
+              payload.tenantId,
+            );
+          }
+        }
         return sendJson(res, 200, {
           ok: true,
           conversation: publicConversation,
@@ -10912,12 +12040,48 @@ async function router(req, res) {
           [conversationId, status, visitorName, visitorNote, payload.tenantId],
         );
 
-        const publicConversation = await getPublicConversation(conversationId, pool, payload.tenantId);
-        broadcast(
-          { type: 'conversation-updated', conversation: publicConversation },
+        const summary = await getConversationSummaryById(
           conversationId,
           payload.tenantId,
         );
+        let publicConversation = summary;
+        if (apiVersion >= 2) {
+          if (summary) {
+            broadcastVersion(
+              { type: 'summary-updated', conversation: summary },
+              2,
+              conversationId,
+              payload.tenantId,
+            );
+          }
+          if (hasLegacyConversationClient(conversationId, payload.tenantId)) {
+            const legacyConversation = await getPublicConversation(
+              conversationId,
+              pool,
+              payload.tenantId,
+            );
+            if (legacyConversation) {
+              broadcastVersion(
+                { type: 'conversation-updated', conversation: legacyConversation },
+                1,
+                conversationId,
+                payload.tenantId,
+              );
+            }
+          }
+        } else {
+          publicConversation = await getPublicConversation(
+            conversationId,
+            pool,
+            payload.tenantId,
+          );
+          broadcastVersion(
+            { type: 'conversation-updated', conversation: publicConversation },
+            1,
+            conversationId,
+            payload.tenantId,
+          );
+        }
         return sendJson(res, 200, {
           ok: true,
           conversation: publicConversation,
@@ -10977,15 +12141,18 @@ async function router(req, res) {
           )
         ) return;
         const body = await readJson(req);
-        const result = await createAdminMessage(conversationId, body, payload.tenantId);
-        broadcast(
-          {
-            type: 'conversation-updated',
-            trigger: 'admin-message',
-            conversation: result.conversation,
-          },
+        const result = await createAdminMessage(
+          conversationId,
+          body,
+          payload.tenantId,
+          { includeConversation: apiVersion < 2 },
+        );
+        await broadcastMessageResult(
+          result,
+          'admin-message',
           conversationId,
           payload.tenantId,
+          apiVersion,
         );
         return sendJson(res, 201, {
           ok: true,
@@ -11079,6 +12246,10 @@ async function router(req, res) {
 
 const server = http.createServer((req, res) => {
   const requestStartedAt = performance.now();
+  const requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const requestPath = normalizeApiPath(
+    requestUrl.pathname.replace(/\/+$/, '') || '/',
+  ).pathname;
   minuteCounters.requests += 1;
   res.once('finish', () => {
     const duration = performance.now() - requestStartedAt;
@@ -11087,6 +12258,7 @@ const server = http.createServer((req, res) => {
       requestLatencies.splice(0, requestLatencies.length - 5000);
     }
     if (res.statusCode >= 400) minuteCounters.errors += 1;
+    if (res.statusCode < 500) scheduleActiveDatabaseWork(requestPath);
   });
   router(req, res).catch((error) => {
     console.error('请求处理失败：', error);
@@ -11125,9 +12297,6 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 await initDatabase();
 startBackgroundJobs();
-collectMonitorSnapshot().catch((error) =>
-  console.error('首次监控采集失败：', error.message),
-);
 
 server.listen(PORT, HOST, () => {
   console.log(`拓界云客服 v${APP_VERSION} 已启动：http://${HOST}:${PORT}`);
