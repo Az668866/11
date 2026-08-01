@@ -286,6 +286,7 @@ pool.on('error', (error) => {
 const sseClients = new Set();
 const rateBuckets = new Map();
 const eventHistory = [];
+const distributorPresenceTimers = new Map();
 const requestLatencies = [];
 const minuteCounters = {
   requests: 0,
@@ -595,6 +596,62 @@ async function initDatabase() {
     `);
 
     await client.query(`
+      CREATE TABLE IF NOT EXISTS distributors (
+        id UUID PRIMARY KEY,
+        username TEXT NOT NULL UNIQUE,
+        display_name TEXT NOT NULL DEFAULT '',
+        password_hash TEXT NOT NULL,
+        telegram_username TEXT NOT NULL DEFAULT '',
+        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        can_generate BOOLEAN NOT NULL DEFAULT FALSE,
+        allowed_duration_codes JSONB NOT NULL DEFAULT '[]'::jsonb,
+        session_version INTEGER NOT NULL DEFAULT 1,
+        last_login_at TIMESTAMPTZ,
+        created_by_admin_id UUID REFERENCES super_admins(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      ALTER TABLE license_keys
+      ADD COLUMN IF NOT EXISTS generated_by_distributor_id UUID
+        REFERENCES distributors(id) ON DELETE SET NULL
+    `);
+    await client.query(`
+      ALTER TABLE tenants
+      ADD COLUMN IF NOT EXISTS owner_distributor_id UUID
+        REFERENCES distributors(id) ON DELETE SET NULL
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS distributor_license_quotas (
+        distributor_id UUID NOT NULL REFERENCES distributors(id) ON DELETE CASCADE,
+        duration_code TEXT NOT NULL
+          CHECK (duration_code IN ('1d','7d','30d','180d','365d')),
+        remaining_count INTEGER NOT NULL DEFAULT 0 CHECK (remaining_count >= 0),
+        generated_count BIGINT NOT NULL DEFAULT 0 CHECK (generated_count >= 0),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (distributor_id, duration_code)
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS distributor_quota_logs (
+        id BIGSERIAL PRIMARY KEY,
+        distributor_id UUID NOT NULL REFERENCES distributors(id) ON DELETE CASCADE,
+        duration_code TEXT NOT NULL
+          CHECK (duration_code IN ('1d','7d','30d','180d','365d')),
+        action TEXT NOT NULL,
+        change_amount INTEGER NOT NULL,
+        balance_before INTEGER NOT NULL CHECK (balance_before >= 0),
+        balance_after INTEGER NOT NULL CHECK (balance_after >= 0),
+        actor_admin_id UUID REFERENCES super_admins(id) ON DELETE SET NULL,
+        actor_distributor_id UUID REFERENCES distributors(id) ON DELETE SET NULL,
+        reason TEXT NOT NULL DEFAULT '',
+        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
+    await client.query(`
       CREATE TABLE IF NOT EXISTS audit_logs (
         id BIGSERIAL PRIMARY KEY,
         actor_admin_id UUID REFERENCES super_admins(id) ON DELETE SET NULL,
@@ -608,8 +665,25 @@ async function initDatabase() {
       )
     `);
     await client.query(`
+      ALTER TABLE audit_logs
+      ADD COLUMN IF NOT EXISTS actor_distributor_id UUID
+        REFERENCES distributors(id) ON DELETE SET NULL
+    `);
+    await client.query(`
       CREATE INDEX IF NOT EXISTS audit_logs_created_idx
       ON audit_logs (created_at DESC)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS license_keys_distributor_created_idx
+      ON license_keys (generated_by_distributor_id, created_at DESC)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS tenants_distributor_created_idx
+      ON tenants (owner_distributor_id, created_at DESC)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS distributor_quota_logs_created_idx
+      ON distributor_quota_logs (distributor_id, created_at DESC)
     `);
 
     await client.query(`
@@ -1449,6 +1523,15 @@ const LICENSE_DURATIONS = Object.freeze({
   '180d': { label: '半年卡', days: 180 },
   '365d': { label: '年卡', days: 365 },
 });
+const DISTRIBUTOR_DURATION_CODES = Object.freeze(
+  Object.keys(LICENSE_DURATIONS),
+);
+
+function cleanDurationCodes(value) {
+  return Array.isArray(value)
+    ? [...new Set(value)].filter((code) => LICENSE_DURATIONS[code])
+    : [];
+}
 function generateLicenseKey() {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const bytes = randomBytes(20);
@@ -1511,6 +1594,48 @@ async function authenticateSuper(req) {
   };
 }
 
+async function authenticateDistributor(req) {
+  const payload = verifyToken(getBearer(req));
+  if (
+    payload?.kind !== 'distributor' ||
+    !isUuid(payload.distributorId) ||
+    !Number.isInteger(payload.sessionVersion)
+  ) return null;
+  const result = await pool.query(
+    `
+      SELECT
+        id,username,display_name,telegram_username,enabled,can_generate,
+        allowed_duration_codes,session_version,last_login_at,created_at
+      FROM distributors
+      WHERE id=$1
+    `,
+    [payload.distributorId],
+  );
+  const distributor = result.rows[0];
+  if (
+    !distributor?.enabled ||
+    Number(distributor.session_version) !== payload.sessionVersion
+  ) return null;
+  return {
+    id: distributor.id,
+    username: distributor.username,
+    displayName: distributor.display_name || '',
+    telegramUsername: distributor.telegram_username || '',
+    enabled: Boolean(distributor.enabled),
+    canGenerate: Boolean(distributor.can_generate),
+    allowedDurationCodes: Array.isArray(distributor.allowed_duration_codes)
+      ? distributor.allowed_duration_codes.filter(
+          (code) => LICENSE_DURATIONS[code],
+        )
+      : [],
+    sessionVersion: Number(distributor.session_version),
+    lastLoginAt: distributor.last_login_at
+      ? new Date(distributor.last_login_at).toISOString()
+      : null,
+    createdAt: new Date(distributor.created_at).toISOString(),
+  };
+}
+
 const ROLE_LEVEL = Object.freeze({
   readonly: 0,
   support: 1,
@@ -1548,6 +1673,36 @@ async function writeAudit(
     `,
     [
       admin?.id || null,
+      cleanText(action, 100),
+      cleanText(targetType, 80),
+      cleanText(targetId, 160),
+      cleanText(requestIp(req), 100),
+      cleanText(result, 30) || 'success',
+      JSON.stringify(metadata || {}),
+    ],
+  );
+}
+
+async function writeDistributorAudit(
+  req,
+  distributor,
+  action,
+  {
+    targetType = '',
+    targetId = '',
+    result = 'success',
+    metadata = {},
+  } = {},
+) {
+  await pool.query(
+    `
+      INSERT INTO audit_logs (
+        actor_distributor_id,action,target_type,target_id,
+        ip_address,result,metadata
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)
+    `,
+    [
+      distributor?.id || null,
       cleanText(action, 100),
       cleanText(targetType, 80),
       cleanText(targetId, 160),
@@ -3143,6 +3298,10 @@ function sendSse(res, payload, id = null) {
 
 function clientAcceptsEvent(client, event) {
   if (event.targetKind && client.kind !== event.targetKind) return false;
+  if (
+    event.distributorId &&
+    client.distributorId !== event.distributorId
+  ) return false;
   if (event.tenantId && client.tenantId !== event.tenantId) return false;
   if (
     event.conversationId &&
@@ -3157,6 +3316,7 @@ function publishEvent(
   {
     conversationId = null,
     tenantId = null,
+    distributorId = null,
     targetKind = null,
     keepHistory = true,
   } = {},
@@ -3166,6 +3326,7 @@ function publishEvent(
     payload: { ...payload, eventId: nextEventId - 1 },
     conversationId,
     tenantId,
+    distributorId,
     targetKind,
   };
   if (keepHistory) {
@@ -3190,6 +3351,29 @@ function broadcast(payload, conversationId = null, tenantId = null) {
 
 function broadcastSuper(payload) {
   publishEvent(payload, { targetKind: 'super_admin' });
+}
+
+function broadcastDistributor(payload, distributorId) {
+  if (!isUuid(distributorId)) return;
+  publishEvent(payload, {
+    distributorId,
+    targetKind: 'distributor',
+  });
+}
+
+function scheduleDistributorPresenceUpdate(distributorId) {
+  if (!isUuid(distributorId) || distributorPresenceTimers.has(distributorId)) {
+    return;
+  }
+  const timer = setTimeout(() => {
+    distributorPresenceTimers.delete(distributorId);
+    broadcastDistributor(
+      { type: 'distributor-presence-updated' },
+      distributorId,
+    );
+  }, 300);
+  timer.unref();
+  distributorPresenceTimers.set(distributorId, timer);
 }
 
 function scheduleSuperPresenceUpdate() {
@@ -3264,6 +3448,26 @@ function disconnectTenant(tenantId, payload) {
   }
 }
 
+function disconnectDistributor(distributorId, payload = {}) {
+  if (!isUuid(distributorId)) return;
+  for (const client of sseClients) {
+    if (
+      client.kind !== 'distributor' ||
+      client.distributorId !== distributorId
+    ) continue;
+    try {
+      sendSse(client.res, {
+        type: 'distributor-session-revoked',
+        message: '代理账号状态已更新，请重新登录。',
+        at: nowIso(),
+        ...payload,
+      });
+      client.res.end();
+    } catch {}
+    sseClients.delete(client);
+  }
+}
+
 function updateTenantConnectionsAfterRenewal(
   tenantId,
   accessExpiresAt,
@@ -3304,7 +3508,12 @@ setInterval(() => {
   for (const client of sseClients) {
     try {
       if (client.accessExpiresAt && client.accessExpiresAt <= Date.now()) {
-        sendSse(client.res, { type: 'tenant-expired', at: nowIso() });
+        sendSse(client.res, {
+          type: ['tenant_admin', 'user'].includes(client.kind)
+            ? 'tenant-expired'
+            : 'session-expired',
+          at: nowIso(),
+        });
         client.res.end();
         sseClients.delete(client);
         continue;
@@ -4199,7 +4408,11 @@ async function touchConversation(conversationId, body = {}, req = null, tenantId
   );
 }
 
-async function createLicenseRecord(durationCode, metadata = {}) {
+async function createLicenseRecord(
+  durationCode,
+  metadata = {},
+  queryClient = pool,
+) {
   const duration = LICENSE_DURATIONS[durationCode];
   if (!duration) throw new Error('卡密时长无效。');
   const updateId = Number(metadata.telegramUpdateId);
@@ -4207,7 +4420,7 @@ async function createLicenseRecord(durationCode, metadata = {}) {
 
   async function existingForUpdate() {
     if (telegramUpdateId == null) return null;
-    const result = await pool.query(
+    const result = await queryClient.query(
       `SELECT * FROM license_keys WHERE telegram_update_id = $1`,
       [telegramUpdateId],
     );
@@ -4229,15 +4442,16 @@ async function createLicenseRecord(durationCode, metadata = {}) {
 
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const licenseKey = generateLicenseKey();
-    try {
-      const result = await pool.query(
+    const result = await queryClient.query(
         `
           INSERT INTO license_keys (
             id, key_hash, key_ciphertext, key_prefix, key_suffix,
             duration_code, duration_days,
             telegram_chat_id, telegram_user_id, telegram_username,
-            telegram_display_name, telegram_update_id, generated_by_admin_id
-          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            telegram_display_name, telegram_update_id, generated_by_admin_id,
+            generated_by_distributor_id
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+          ON CONFLICT DO NOTHING
           RETURNING *
         `,
         [randomUUID(), hashLicenseKey(licenseKey), encryptLicenseKey(licenseKey),
@@ -4249,15 +4463,17 @@ async function createLicenseRecord(durationCode, metadata = {}) {
          telegramUpdateId,
          isUuid(metadata.generatedByAdminId)
            ? metadata.generatedByAdminId
+           : null,
+         isUuid(metadata.generatedByDistributorId)
+           ? metadata.generatedByDistributorId
            : null],
-      );
+    );
+    if (result.rows[0]) {
       return { licenseKey, row: result.rows[0], duration };
-    } catch (error) {
-      if (error?.code !== '23505') throw error;
-      const duplicateUpdate = await existingForUpdate();
-      if (duplicateUpdate) return duplicateUpdate;
-      if (attempt === 4) throw error;
     }
+    const duplicateUpdate = await existingForUpdate();
+    if (duplicateUpdate) return duplicateUpdate;
+    if (attempt === 4) throw new Error('生成卡密发生唯一值冲突。');
   }
   throw new Error('生成卡密失败。');
 }
@@ -4278,6 +4494,8 @@ async function handleTenantLogin(req, res) {
   const client = await pool.connect();
   let tenant;
   let license;
+  let newlyActivated = false;
+  let activatedDistributorId = null;
   try {
     await client.query('BEGIN');
     const result = await client.query(`SELECT * FROM license_keys WHERE key_hash = $1 FOR UPDATE`, [hashLicenseKey(key)]);
@@ -4299,10 +4517,24 @@ async function handleTenantLogin(req, res) {
       const tenantId = randomUUID();
       const expiry = new Date(Date.now() + Number(license.duration_days) * 86_400_000);
       const tenantResult = await client.query(
-        `INSERT INTO tenants (id, public_code, access_expires_at) VALUES ($1,$2,$3) RETURNING *`,
-        [tenantId, generateTenantCode(), expiry.toISOString()],
+        `
+          INSERT INTO tenants (
+            id,public_code,access_expires_at,owner_distributor_id
+          ) VALUES ($1,$2,$3,$4)
+          RETURNING *
+        `,
+        [
+          tenantId,
+          generateTenantCode(),
+          expiry.toISOString(),
+          isUuid(license.generated_by_distributor_id)
+            ? license.generated_by_distributor_id
+            : null,
+        ],
       );
       tenant = tenantResult.rows[0];
+      newlyActivated = true;
+      activatedDistributorId = tenant.owner_distributor_id || null;
       await createTenantConfig(tenantId, client);
       await client.query(
         `UPDATE license_keys SET tenant_id=$2,status='active',key_ciphertext=COALESCE(key_ciphertext,$4),activated_at=NOW(),expires_at=$3,last_used_at=NOW(),updated_at=NOW() WHERE id=$1`,
@@ -4349,6 +4581,21 @@ async function handleTenantLogin(req, res) {
     targetType: 'tenant',
     targetId: tenant.id,
   }).catch(() => {});
+  if (newlyActivated) {
+    broadcastSuper({ type: 'licenses-updated' });
+    broadcastSuper({ type: 'tenants-updated' });
+    if (activatedDistributorId) {
+      broadcastSuper({ type: 'distributors-updated' });
+      broadcastDistributor(
+        { type: 'distributor-licenses-updated' },
+        activatedDistributorId,
+      );
+      broadcastDistributor(
+        { type: 'distributor-tenants-updated' },
+        activatedDistributorId,
+      );
+    }
+  }
   return sendJson(res, 200, {
     ok: true,
     token: signTokenUntil({
@@ -4386,6 +4633,16 @@ async function handleTenantRenew(req, res) {
     }
     tenant = await getTenantById(current.tenant_id, client, true);
     if (!tenant) { const error=new Error('租户不存在。'); error.statusCode=409; error.code='LICENSE_STATE'; throw error; }
+    if (
+      isUuid(tenant.owner_distributor_id) &&
+      isUuid(newLicense.generated_by_distributor_id) &&
+      tenant.owner_distributor_id !== newLicense.generated_by_distributor_id
+    ) {
+      const error = new Error('该租户归属其他代理，请向原代理购买续费卡密。');
+      error.statusCode = 403;
+      error.code = 'DISTRIBUTOR_OWNERSHIP';
+      throw error;
+    }
     const base = Math.max(Date.now(), new Date(tenant.access_expires_at).getTime());
     newExpiry = new Date(base + Number(newLicense.duration_days) * 86_400_000);
     const tenantResult = await client.query(
@@ -4393,12 +4650,19 @@ async function handleTenantRenew(req, res) {
         UPDATE tenants
         SET status='active',
             access_expires_at=$2,
+            owner_distributor_id=COALESCE(owner_distributor_id,$3),
             expiry_reminder_sent_at=NULL,
             updated_at=NOW()
         WHERE id=$1
         RETURNING *
       `,
-      [tenant.id, newExpiry.toISOString()],
+      [
+        tenant.id,
+        newExpiry.toISOString(),
+        isUuid(newLicense.generated_by_distributor_id)
+          ? newLicense.generated_by_distributor_id
+          : null,
+      ],
     );
     tenant = tenantResult.rows[0];
     await client.query(
@@ -4414,6 +4678,19 @@ async function handleTenantRenew(req, res) {
   } catch (error) { await client.query('ROLLBACK'); throw error; }
   finally { client.release(); }
   updateTenantConnectionsAfterRenewal(tenant.id, newExpiry, newLicense.id);
+  broadcastSuper({ type: 'licenses-updated' });
+  broadcastSuper({ type: 'tenants-updated' });
+  if (tenant.owner_distributor_id) {
+    broadcastSuper({ type: 'distributors-updated' });
+    broadcastDistributor(
+      { type: 'distributor-licenses-updated' },
+      tenant.owner_distributor_id,
+    );
+    broadcastDistributor(
+      { type: 'distributor-tenants-updated' },
+      tenant.owner_distributor_id,
+    );
+  }
   return sendJson(res, 200, {
     ok:true,
     token: signTokenUntil({
@@ -4559,6 +4836,13 @@ function telegramDisplayName(user = {}) {
   );
 }
 
+function escapeTelegramHtml(value) {
+  return String(value ?? '').replace(
+    /[&<>]/g,
+    (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[char],
+  );
+}
+
 function formatTelegramDate(value) {
   if (!value) return '—';
   const date = new Date(value);
@@ -4683,7 +4967,7 @@ function displayTemplateDomain(value) {
   }
 }
 
-async function sendTelegramReply(message, text) {
+async function sendTelegramReply(message, text, extra = {}) {
   return telegramApi('sendMessage', {
     chat_id: message.chat.id,
     text,
@@ -4692,6 +4976,7 @@ async function sendTelegramReply(message, text) {
       allow_sending_without_reply: true,
     },
     ...telegramThread(message),
+    ...extra,
   });
 }
 
@@ -4811,18 +5096,37 @@ async function createQrIncidentReport(tenant, template) {
     const sent = await telegramApi('sendMessage', {
       chat_id: settings.telegramGroupId,
       text: [
-        '🚨 二维码异常',
+        '<b>🚨 二维码异常 · 待处理</b>',
         '',
-        `租户：${tenant.name || '未命名租户'}（${tenant.public_code}）`,
-        `模板：${template.name}`,
-        `异常域名：${domain}`,
-        `Netlify 自动更换：${netlifyState}`,
-        `异常编号：${incidentId}`,
+        '<b>🏢 租户信息</b>',
+        `名称：${escapeTelegramHtml(tenant.name || '未命名租户')}`,
+        `编号：<code>${escapeTelegramHtml(tenant.public_code)}</code>`,
         '',
-        '处理时请直接回复本条消息，例如：',
-        '更换域名wxmb2.netlify.app',
+        '<b>🧩 模板信息</b>',
+        `模板：${escapeTelegramHtml(template.name)}`,
+        '',
+        '<b>🌐 异常域名</b>',
+        `<code>${escapeTelegramHtml(domain)}</code>`,
+        '',
+        `<b>⚙️ 自动更换状态</b>：${escapeTelegramHtml(netlifyState)}`,
+        `异常编号：<code>${incidentId}</code>`,
+        '',
+        '<b>处理方式</b>',
+        '请直接回复本条消息，例如：',
+        '<code>更换域名wxmb2.netlify.app</code>',
       ].join('\n'),
+      parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: '📋 一键复制异常域名',
+              copy_text: { text: domain },
+            },
+          ],
+        ],
+      },
     });
     await pool.query(
       `
@@ -5020,13 +5324,31 @@ async function handleQrIncidentDomainReply(message, targetDomain) {
     await sendTelegramReply(
       message,
       [
-        '✅ 域名已更换并同步',
-        `租户：${incident.tenant_name || '未命名租户'}（${incident.public_code}）`,
-        `模板：${incident.template_name}`,
-        `旧域名：${currentDomain}`,
-        `新域名：${targetDomain}`,
+        '<b>✅ 域名已更换并同步</b>',
+        '',
+        `<b>租户</b>：${escapeTelegramHtml(incident.tenant_name || '未命名租户')}`,
+        `<b>编号</b>：<code>${escapeTelegramHtml(incident.public_code)}</code>`,
+        `<b>模板</b>：${escapeTelegramHtml(incident.template_name)}`,
+        '',
+        `<b>旧域名</b>：<code>${escapeTelegramHtml(currentDomain)}</code>`,
+        `<b>新域名</b>：<code>${escapeTelegramHtml(targetDomain)}</code>`,
+        '',
         '超级后台和租户后台已通过实时连接同步，无需轮询。',
       ].join('\n'),
+      {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: '📋 复制新域名',
+                copy_text: { text: targetDomain },
+              },
+            ],
+          ],
+        },
+      },
     );
   } catch (error) {
     await pool.query(
@@ -6454,7 +6776,11 @@ function publicLicenseRow(row) {
     storedStatus: row.status,
     generator:
       row.generated_by_username ||
+      (row.generated_by_distributor_username
+        ? `二级代理 · ${row.generated_by_distributor_username}`
+        : '') ||
       telegramLicenseCreator(row),
+    generatedByDistributorId: row.generated_by_distributor_id || null,
     tenantName: row.tenant_name || '',
     activatedAt: row.activated_at
       ? new Date(row.activated_at).toISOString()
@@ -6581,10 +6907,12 @@ async function getSuperDashboard() {
 async function getSuperLicenses() {
   const result = await pool.query(`
     SELECT
-      l.*, t.name AS tenant_name, sa.username AS generated_by_username
+      l.*, t.name AS tenant_name, sa.username AS generated_by_username,
+      d.username AS generated_by_distributor_username
     FROM license_keys l
     LEFT JOIN tenants t ON t.id = l.tenant_id
     LEFT JOIN super_admins sa ON sa.id = l.generated_by_admin_id
+    LEFT JOIN distributors d ON d.id = l.generated_by_distributor_id
     ORDER BY l.created_at DESC
     LIMIT 2000
   `);
@@ -6605,6 +6933,7 @@ async function getSuperTenants() {
       l.telegram_username,
       l.telegram_display_name,
       sa.username AS generated_by_username,
+      d.username AS generated_by_distributor_username,
       tc.retention_hours,
       tc.frontend_template_id,
       ft.name AS frontend_template_name,
@@ -6622,6 +6951,7 @@ async function getSuperTenants() {
       LIMIT 1
     ) l ON TRUE
     LEFT JOIN super_admins sa ON sa.id = l.generated_by_admin_id
+    LEFT JOIN distributors d ON d.id = l.generated_by_distributor_id
     LEFT JOIN tenant_config tc ON tc.tenant_id = t.id
     LEFT JOIN frontend_templates ft ON ft.id = tc.frontend_template_id
     LEFT JOIN LATERAL (
@@ -6663,7 +6993,12 @@ async function getSuperTenants() {
     licenseStatus: row.license_status || '',
     generator:
       row.generated_by_username ||
+      (row.generated_by_distributor_username
+        ? `二级代理 · ${row.generated_by_distributor_username}`
+        : '') ||
       telegramLicenseCreator(row),
+    generatedByDistributorId: row.generated_by_distributor_id || null,
+    ownerDistributorId: row.owner_distributor_id || null,
     retentionHours: Number(row.retention_hours || 24),
     frontendTemplateId: row.frontend_template_id || null,
     frontendTemplateName: row.frontend_template_name || '',
@@ -6684,6 +7019,721 @@ async function getSuperTenants() {
         .filter(Boolean),
     ).size,
   }));
+}
+
+function normalizeDistributorUsername(value) {
+  const username = cleanText(value, 40).trim().toLowerCase();
+  return /^[a-z0-9_]{3,32}$/.test(username) ? username : '';
+}
+
+function normalizeTelegramUsername(value) {
+  const username = cleanText(value, 64).trim().replace(/^@+/, '');
+  return /^[A-Za-z0-9_]{0,32}$/.test(username) ? username : '';
+}
+
+async function ensureDistributorQuotas(distributorId, client = pool) {
+  if (!isUuid(distributorId)) return;
+  await client.query(
+    `
+      INSERT INTO distributor_license_quotas (
+        distributor_id,duration_code
+      )
+      SELECT $1,code
+      FROM unnest($2::text[]) AS code
+      ON CONFLICT (distributor_id,duration_code) DO NOTHING
+    `,
+    [distributorId, DISTRIBUTOR_DURATION_CODES],
+  );
+}
+
+async function getDistributorQuotaMap(distributorId, client = pool) {
+  await ensureDistributorQuotas(distributorId, client);
+  const result = await client.query(
+    `
+      SELECT duration_code,remaining_count,generated_count,updated_at
+      FROM distributor_license_quotas
+      WHERE distributor_id=$1
+      ORDER BY duration_code
+    `,
+    [distributorId],
+  );
+  const quotas = {};
+  for (const code of DISTRIBUTOR_DURATION_CODES) {
+    const row = result.rows.find((item) => item.duration_code === code);
+    quotas[code] = {
+      remaining: Number(row?.remaining_count || 0),
+      generated: Number(row?.generated_count || 0),
+      updatedAt: row?.updated_at
+        ? new Date(row.updated_at).toISOString()
+        : null,
+    };
+  }
+  return quotas;
+}
+
+function distributorAccountPayload(row, quotas = {}) {
+  return {
+    id: row.id,
+    username: row.username,
+    displayName: row.display_name || row.displayName || '',
+    telegramUsername:
+      row.telegram_username || row.telegramUsername || '',
+    enabled: row.enabled !== false,
+    canGenerate: Boolean(row.can_generate ?? row.canGenerate),
+    allowedDurationCodes: cleanDurationCodes(
+      row.allowed_duration_codes || row.allowedDurationCodes || [],
+    ),
+    quotas,
+    lastLoginAt: row.last_login_at
+      ? new Date(row.last_login_at).toISOString()
+      : row.lastLoginAt || null,
+    createdAt: row.created_at
+      ? new Date(row.created_at).toISOString()
+      : row.createdAt || null,
+  };
+}
+
+async function getSuperDistributors() {
+  const result = await pool.query(
+    `
+      SELECT
+        d.*,
+        sa.username AS created_by_username,
+        (SELECT COUNT(*)::int FROM license_keys l
+          WHERE l.generated_by_distributor_id=d.id) AS license_total,
+        (SELECT COUNT(*)::int FROM license_keys l
+          WHERE l.generated_by_distributor_id=d.id
+            AND l.status='unused') AS license_unused,
+        (SELECT COUNT(*)::int FROM tenants t
+          WHERE t.owner_distributor_id=d.id) AS tenant_total
+      FROM distributors d
+      LEFT JOIN super_admins sa ON sa.id=d.created_by_admin_id
+      ORDER BY d.created_at DESC
+    `,
+  );
+  const distributorIds = result.rows.map((row) => row.id);
+  if (!distributorIds.length) return [];
+  await pool.query(
+    `
+      INSERT INTO distributor_license_quotas (
+        distributor_id,duration_code
+      )
+      SELECT d.distributor_id,c.duration_code
+      FROM unnest($1::uuid[]) AS d(distributor_id)
+      CROSS JOIN unnest($2::text[]) AS c(duration_code)
+      ON CONFLICT (distributor_id,duration_code) DO NOTHING
+    `,
+    [distributorIds, DISTRIBUTOR_DURATION_CODES],
+  );
+  const quotaResult = await pool.query(
+    `
+      SELECT distributor_id,duration_code,remaining_count,
+             generated_count,updated_at
+      FROM distributor_license_quotas
+      WHERE distributor_id=ANY($1::uuid[])
+    `,
+    [distributorIds],
+  );
+  const quotaMaps = new Map(
+    distributorIds.map((id) => [
+      id,
+      Object.fromEntries(
+        DISTRIBUTOR_DURATION_CODES.map((code) => [
+          code,
+          { remaining: 0, generated: 0, updatedAt: null },
+        ]),
+      ),
+    ]),
+  );
+  for (const quota of quotaResult.rows) {
+    quotaMaps.get(quota.distributor_id)[quota.duration_code] = {
+      remaining: Number(quota.remaining_count || 0),
+      generated: Number(quota.generated_count || 0),
+      updatedAt: quota.updated_at
+        ? new Date(quota.updated_at).toISOString()
+        : null,
+    };
+  }
+  return result.rows.map((row) => ({
+      ...distributorAccountPayload(row, quotaMaps.get(row.id)),
+      createdBy: row.created_by_username || '',
+      licenseTotal: Number(row.license_total || 0),
+      licenseUnused: Number(row.license_unused || 0),
+      tenantTotal: Number(row.tenant_total || 0),
+    }));
+}
+
+function publicDistributorLicenseRow(row, distributorId) {
+  const fullKey = decryptLicenseKey(row.key_ciphertext) || licenseHint(row);
+  return {
+    id: row.id,
+    tenantId: row.tenant_id || null,
+    tenantName: row.tenant_name || '',
+    fullKey,
+    durationCode: row.duration_code,
+    durationDays: Number(row.duration_days),
+    status: effectiveLicenseStatus(row),
+    activatedAt: row.activated_at
+      ? new Date(row.activated_at).toISOString()
+      : null,
+    expiresAt: row.expires_at
+      ? new Date(row.expires_at).toISOString()
+      : null,
+    revokedAt: row.revoked_at
+      ? new Date(row.revoked_at).toISOString()
+      : null,
+    lastUsedAt: row.last_used_at
+      ? new Date(row.last_used_at).toISOString()
+      : null,
+    createdAt: new Date(row.created_at).toISOString(),
+    canDisable: Boolean(
+      row.tenant_id &&
+      row.owner_distributor_id === distributorId &&
+      row.status === 'active' &&
+      row.expires_at &&
+      new Date(row.expires_at).getTime() > Date.now()
+    ),
+  };
+}
+
+async function getDistributorLicenses(distributorId) {
+  const result = await pool.query(
+    `
+      SELECT l.*,t.name AS tenant_name,t.owner_distributor_id
+      FROM license_keys l
+      LEFT JOIN tenants t ON t.id=l.tenant_id
+      WHERE l.generated_by_distributor_id=$1
+      ORDER BY l.created_at DESC
+      LIMIT 2000
+    `,
+    [distributorId],
+  );
+  return result.rows.map((row) =>
+    publicDistributorLicenseRow(row, distributorId),
+  );
+}
+
+async function getDistributorTenants(distributorId) {
+  const result = await pool.query(
+    `
+      SELECT
+        t.*,
+        l.id AS license_id,l.key_ciphertext,l.key_prefix,l.key_suffix,
+        l.duration_code,l.status AS license_status,l.activated_at,
+        l.expires_at,l.last_used_at,l.revoked_at
+      FROM tenants t
+      LEFT JOIN LATERAL (
+        SELECT *
+        FROM license_keys
+        WHERE tenant_id=t.id
+        ORDER BY
+          CASE WHEN status='active' THEN 0 ELSE 1 END,
+          created_at DESC
+        LIMIT 1
+      ) l ON TRUE
+      WHERE t.owner_distributor_id=$1
+      ORDER BY t.updated_at DESC
+      LIMIT 2000
+    `,
+    [distributorId],
+  );
+  return result.rows.map((row) => {
+    const onlineDevices = [...sseClients].filter(
+      (client) =>
+        client.kind === 'tenant_admin' && client.tenantId === row.id,
+    ).length;
+    const onlineVisitors = new Set(
+      [...sseClients]
+        .filter(
+          (client) =>
+            client.kind === 'user' && client.tenantId === row.id,
+        )
+        .map((client) => client.conversationId)
+        .filter(Boolean),
+    ).size;
+    return {
+      id: row.id,
+      publicCode: row.public_code,
+      name: row.name || '',
+      note: row.note || '',
+      status: row.status,
+      createdAt: new Date(row.created_at).toISOString(),
+      accessExpiresAt: new Date(row.access_expires_at).toISOString(),
+      lastAdminOnlineAt: row.last_admin_online_at
+        ? new Date(row.last_admin_online_at).toISOString()
+        : null,
+      licenseId: row.license_id || null,
+      fullKey: row.license_id
+        ? decryptLicenseKey(row.key_ciphertext) || licenseHint(row)
+        : '',
+      durationCode: row.duration_code || '',
+      licenseStatus: row.license_id ? effectiveLicenseStatus({
+        status: row.license_status,
+        expires_at: row.expires_at,
+      }) : '',
+      activatedAt: row.activated_at
+        ? new Date(row.activated_at).toISOString()
+        : null,
+      expiresAt: row.expires_at
+        ? new Date(row.expires_at).toISOString()
+        : null,
+      lastUsedAt: row.last_used_at
+        ? new Date(row.last_used_at).toISOString()
+        : null,
+      onlineDevices,
+      onlineVisitors,
+      currentlyUsing: onlineDevices > 0,
+      canDisable: Boolean(
+        row.license_id &&
+        row.license_status === 'active' &&
+        row.expires_at &&
+        new Date(row.expires_at).getTime() > Date.now()
+      ),
+    };
+  });
+}
+
+async function getDistributorDashboard(distributorId) {
+  const [result, tenantResult, quotas] = await Promise.all([
+    pool.query(
+      `
+        SELECT
+          COUNT(*)::int AS license_total,
+          COUNT(*) FILTER (WHERE status='unused')::int AS license_unused,
+          COUNT(*) FILTER (
+            WHERE status='active' AND expires_at>NOW()
+          )::int AS license_active,
+          COUNT(*) FILTER (
+            WHERE status='active' AND expires_at<=NOW()
+          )::int AS license_expired,
+          COUNT(*) FILTER (WHERE status='revoked')::int AS license_revoked
+        FROM license_keys
+        WHERE generated_by_distributor_id=$1
+      `,
+      [distributorId],
+    ),
+    pool.query(
+      `SELECT id FROM tenants WHERE owner_distributor_id=$1`,
+      [distributorId],
+    ),
+    getDistributorQuotaMap(distributorId),
+  ]);
+  const row = result.rows[0] || {};
+  const tenantIds = new Set(tenantResult.rows.map((item) => item.id));
+  const onlineTenantIds = new Set(
+    [...sseClients]
+      .filter(
+        (client) =>
+          client.kind === 'tenant_admin' &&
+          tenantIds.has(client.tenantId),
+      )
+      .map((client) => client.tenantId),
+  );
+  const chattingTenantIds = new Set(
+    [...sseClients]
+      .filter(
+        (client) =>
+          client.kind === 'user' && tenantIds.has(client.tenantId),
+      )
+      .map((client) => client.tenantId),
+  );
+  return {
+    licenseTotal: Number(row.license_total || 0),
+    licenseUnused: Number(row.license_unused || 0),
+    licenseActive: Number(row.license_active || 0),
+    licenseExpired: Number(row.license_expired || 0),
+    licenseRevoked: Number(row.license_revoked || 0),
+    tenantTotal: tenantIds.size,
+    onlineTenants: onlineTenantIds.size,
+    chattingTenants: chattingTenantIds.size,
+    quotas,
+  };
+}
+
+async function handleDistributorLogin(req, res) {
+  if (!rateLimit(req, res, 'distributor-login', 12, 15 * 60_000)) return;
+  const body = await readJson(req, 32 * 1024);
+  const username = normalizeDistributorUsername(body.username);
+  const result = username
+    ? await pool.query(
+        `SELECT * FROM distributors WHERE username=$1`,
+        [username],
+      )
+    : { rows: [] };
+  const row = result.rows[0];
+  const passwordOk = row
+    ? verifyPassword(body.password, row.password_hash)
+    : verifyPassword(body.password, hashPassword('invalid-password'));
+  if (!row?.enabled || !passwordOk) {
+    await writeDistributorAudit(
+      req,
+      row ? { id: row.id } : null,
+      'distributor.login',
+      {
+        targetType: 'distributor',
+        targetId: username,
+        result: 'failed',
+      },
+    ).catch(() => {});
+    return sendError(
+      res,
+      401,
+      row && !row.enabled ? '代理账号已停用。' : '账号或密码不正确。',
+      'DISTRIBUTOR_LOGIN',
+    );
+  }
+  await ensureDistributorQuotas(row.id);
+  await pool.query(
+    `UPDATE distributors SET last_login_at=NOW(),updated_at=NOW() WHERE id=$1`,
+    [row.id],
+  );
+  const token = signToken(
+    {
+      kind: 'distributor',
+      distributorId: row.id,
+      sessionVersion: Number(row.session_version),
+    },
+    8 * 60 * 60,
+  );
+  await writeDistributorAudit(
+    req,
+    { id: row.id },
+    'distributor.login',
+    { targetType: 'distributor', targetId: row.id },
+  ).catch(() => {});
+  return sendJson(res, 200, {
+    ok: true,
+    token,
+    distributor: distributorAccountPayload(
+      row,
+      await getDistributorQuotaMap(row.id),
+    ),
+  });
+}
+
+async function handleDistributorRoutes(req, res, url, pathname) {
+  if (req.method === 'POST' && pathname === '/api/distributor/login') {
+    return handleDistributorLogin(req, res);
+  }
+  const distributor = await authenticateDistributor(req);
+  if (!distributor) {
+    return sendError(res, 401, '二级代理登录已失效。', 'DISTRIBUTOR_AUTH');
+  }
+
+  if (req.method === 'POST' && pathname === '/api/distributor/logout') {
+    await writeDistributorAudit(req, distributor, 'distributor.logout', {
+      targetType: 'distributor',
+      targetId: distributor.id,
+    }).catch(() => {});
+    return sendJson(res, 200, { ok: true });
+  }
+
+  if (req.method === 'GET' && pathname === '/api/distributor/bootstrap') {
+    const [quotas, dashboard] = await Promise.all([
+      getDistributorQuotaMap(distributor.id),
+      getDistributorDashboard(distributor.id),
+    ]);
+    return sendJson(res, 200, {
+      ok: true,
+      distributor: distributorAccountPayload(distributor, quotas),
+      dashboard,
+    });
+  }
+
+  if (req.method === 'GET' && pathname === '/api/distributor/licenses') {
+    return sendJson(res, 200, {
+      ok: true,
+      licenses: await getDistributorLicenses(distributor.id),
+    });
+  }
+
+  if (req.method === 'POST' && pathname === '/api/distributor/licenses') {
+    if (
+      !rateLimit(
+        req,
+        res,
+        'distributor-license-create',
+        20,
+        60_000,
+        distributor.id,
+      )
+    ) return;
+    const body = await readJson(req, 32 * 1024);
+    const durationCode = cleanText(body.durationCode, 12);
+    const count = Math.min(
+      50,
+      Math.max(1, Math.trunc(Number(body.count || 1))),
+    );
+    if (!LICENSE_DURATIONS[durationCode]) {
+      return sendError(res, 400, '卡密期限无效。', 'LICENSE_DURATION');
+    }
+    const client = await pool.connect();
+    const created = [];
+    let before = 0;
+    let after = 0;
+    try {
+      await client.query('BEGIN');
+      const accountResult = await client.query(
+        `SELECT * FROM distributors WHERE id=$1 FOR UPDATE`,
+        [distributor.id],
+      );
+      const account = accountResult.rows[0];
+      if (
+        !account?.enabled ||
+        Number(account.session_version) !== distributor.sessionVersion
+      ) {
+        throw requestError(
+          '代理登录状态已变化，请重新登录。',
+          401,
+          'DISTRIBUTOR_AUTH',
+        );
+      }
+      if (!account.can_generate) {
+        throw requestError(
+          '超级管理员尚未开放卡密生成权限。',
+          403,
+          'DISTRIBUTOR_GENERATE_DISABLED',
+        );
+      }
+      if (!cleanDurationCodes(account.allowed_duration_codes).includes(durationCode)) {
+        throw requestError(
+          '超级管理员尚未开放此期限的卡密。',
+          403,
+          'DISTRIBUTOR_DURATION_DISABLED',
+        );
+      }
+      await ensureDistributorQuotas(distributor.id, client);
+      const quotaResult = await client.query(
+        `
+          SELECT *
+          FROM distributor_license_quotas
+          WHERE distributor_id=$1 AND duration_code=$2
+          FOR UPDATE
+        `,
+        [distributor.id, durationCode],
+      );
+      const quota = quotaResult.rows[0];
+      before = Number(quota?.remaining_count || 0);
+      if (before < count) {
+        throw requestError(
+          `此期限只剩 ${before} 个额度。`,
+          409,
+          'DISTRIBUTOR_QUOTA',
+        );
+      }
+      for (let index = 0; index < count; index += 1) {
+        created.push(
+          await createLicenseRecord(
+            durationCode,
+            { generatedByDistributorId: distributor.id },
+            client,
+          ),
+        );
+      }
+      after = before - count;
+      await client.query(
+        `
+          UPDATE distributor_license_quotas
+          SET remaining_count=$3,
+              generated_count=generated_count+$4,
+              updated_at=NOW()
+          WHERE distributor_id=$1 AND duration_code=$2
+        `,
+        [distributor.id, durationCode, after, count],
+      );
+      await client.query(
+        `
+          INSERT INTO distributor_quota_logs (
+            distributor_id,duration_code,action,change_amount,
+            balance_before,balance_after,actor_distributor_id,
+            reason,metadata
+          ) VALUES ($1,$2,'consume',$3,$4,$5,$1,$6,$7::jsonb)
+        `,
+        [
+          distributor.id,
+          durationCode,
+          -count,
+          before,
+          after,
+          '生成卡密',
+          JSON.stringify({
+            count,
+            licenseIds: created.map((item) => item.row.id),
+          }),
+        ],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      await writeDistributorAudit(
+        req,
+        distributor,
+        'distributor.license.create',
+        {
+          targetType: 'license_batch',
+          targetId: durationCode,
+          result: 'failed',
+          metadata: { count, code: cleanText(error.code, 80) },
+        },
+      ).catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+    await writeDistributorAudit(
+      req,
+      distributor,
+      'distributor.license.create',
+      {
+        targetType: 'license_batch',
+        targetId: durationCode,
+        metadata: { count, quotaBefore: before, quotaAfter: after },
+      },
+    );
+    broadcastDistributor(
+      { type: 'distributor-licenses-updated' },
+      distributor.id,
+    );
+    broadcastDistributor(
+      { type: 'distributor-account-updated' },
+      distributor.id,
+    );
+    broadcastSuper({ type: 'licenses-updated' });
+    broadcastSuper({ type: 'distributors-updated' });
+    return sendJson(res, 201, {
+      ok: true,
+      licenses: created.map((item) => ({
+        ...publicDistributorLicenseRow(item.row, distributor.id),
+        fullKey: item.licenseKey,
+      })),
+      quota: { durationCode, remaining: after },
+    });
+  }
+
+  if (req.method === 'GET' && pathname === '/api/distributor/tenants') {
+    return sendJson(res, 200, {
+      ok: true,
+      tenants: await getDistributorTenants(distributor.id),
+    });
+  }
+
+  if (req.method === 'GET' && pathname === '/api/distributor/quota-logs') {
+    const result = await pool.query(
+      `
+        SELECT duration_code,action,change_amount,balance_before,
+               balance_after,reason,created_at
+        FROM distributor_quota_logs
+        WHERE distributor_id=$1
+        ORDER BY created_at DESC
+        LIMIT 500
+      `,
+      [distributor.id],
+    );
+    return sendJson(res, 200, { ok: true, logs: result.rows });
+  }
+
+  const licenseMatch = pathname.match(
+    /^\/api\/distributor\/licenses\/([0-9a-f-]+)$/i,
+  );
+  if (
+    licenseMatch &&
+    isUuid(licenseMatch[1]) &&
+    req.method === 'PATCH'
+  ) {
+    const body = await readJson(req, 16 * 1024);
+    if (body.action !== 'disable') {
+      return sendError(
+        res,
+        400,
+        '二级代理只允许禁用自己租户当前使用的卡密。',
+        'DISTRIBUTOR_LICENSE_ACTION',
+      );
+    }
+    const licenseId = licenseMatch[1];
+    const client = await pool.connect();
+    let row;
+    try {
+      await client.query('BEGIN');
+      const result = await client.query(
+        `
+          SELECT l.*,t.owner_distributor_id,t.status AS tenant_status
+          FROM license_keys l
+          JOIN tenants t ON t.id=l.tenant_id
+          WHERE l.id=$1
+            AND t.owner_distributor_id=$2
+          FOR UPDATE OF l,t
+        `,
+        [licenseId, distributor.id],
+      );
+      row = result.rows[0];
+      if (!row) {
+        throw requestError(
+          '卡密不存在或不属于你的租户。',
+          404,
+          'NOT_FOUND',
+        );
+      }
+      if (
+        row.status !== 'active' ||
+        !row.expires_at ||
+        new Date(row.expires_at).getTime() <= Date.now()
+      ) {
+        throw requestError(
+          '只有正在有效使用的卡密可以禁用。',
+          409,
+          'LICENSE_STATE',
+        );
+      }
+      await client.query(
+        `
+          UPDATE license_keys
+          SET status='revoked',revoked_at=NOW(),updated_at=NOW()
+          WHERE id=$1
+        `,
+        [licenseId],
+      );
+      await client.query(
+        `
+          UPDATE tenants
+          SET status='suspended',session_version=session_version+1,
+              updated_at=NOW()
+          WHERE id=$1
+        `,
+        [row.tenant_id],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    disconnectTenant(row.tenant_id, {
+      type: 'license-revoked',
+      message: `你的卡密已被禁用，如有疑问请联系 Telegram ${CUSTOMER_SERVICE_TELEGRAM}。`,
+      supportTelegram: CUSTOMER_SERVICE_TELEGRAM,
+      at: nowIso(),
+    });
+    await writeDistributorAudit(
+      req,
+      distributor,
+      'distributor.license.disable',
+      { targetType: 'license', targetId: licenseId },
+    );
+    broadcastDistributor(
+      { type: 'distributor-licenses-updated' },
+      distributor.id,
+    );
+    broadcastDistributor(
+      { type: 'distributor-tenants-updated' },
+      distributor.id,
+    );
+    broadcastSuper({ type: 'licenses-updated' });
+    broadcastSuper({ type: 'tenants-updated' });
+    return sendJson(res, 200, { ok: true });
+  }
+
+  return sendError(res, 404, '二级代理接口不存在。', 'NOT_FOUND');
 }
 
 async function handleSuperLogin(req, res) {
@@ -6876,6 +7926,330 @@ async function handleSuperRoutes(req, res, url, pathname) {
     });
   }
 
+  if (req.method === 'GET' && pathname === '/api/super/distributors') {
+    return sendJson(res, 200, {
+      ok: true,
+      distributors: await getSuperDistributors(),
+    });
+  }
+
+  if (req.method === 'POST' && pathname === '/api/super/distributors') {
+    requireRole(admin, 'manager');
+    const body = await readJson(req, 32 * 1024);
+    const username = normalizeDistributorUsername(body.username);
+    const password = String(body.password || '');
+    if (!username) {
+      return sendError(
+        res,
+        400,
+        '代理账号必须为3-32位小写字母、数字或下划线。',
+        'DISTRIBUTOR_USERNAME',
+      );
+    }
+    if (password.length < 8 || password.length > 128) {
+      return sendError(
+        res,
+        400,
+        '代理密码必须为8-128位。',
+        'DISTRIBUTOR_PASSWORD',
+      );
+    }
+    const telegramUsername = normalizeTelegramUsername(
+      body.telegramUsername,
+    );
+    if (body.telegramUsername && !telegramUsername) {
+      return sendError(
+        res,
+        400,
+        'Telegram 用户名格式不正确。',
+        'DISTRIBUTOR_TELEGRAM',
+      );
+    }
+    const distributorId = randomUUID();
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `
+          INSERT INTO distributors (
+            id,username,display_name,password_hash,telegram_username,
+            enabled,can_generate,allowed_duration_codes,created_by_admin_id
+          ) VALUES ($1,$2,$3,$4,$5,TRUE,FALSE,'[]'::jsonb,$6)
+        `,
+        [
+          distributorId,
+          username,
+          cleanText(body.displayName, 80),
+          hashPassword(password),
+          telegramUsername,
+          admin.id,
+        ],
+      );
+      await ensureDistributorQuotas(distributorId, client);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      if (error?.code === '23505') {
+        return sendError(
+          res,
+          409,
+          '这个代理账号已经存在。',
+          'DISTRIBUTOR_EXISTS',
+        );
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+    await writeAudit(req, admin, 'distributor.create', {
+      targetType: 'distributor',
+      targetId: distributorId,
+      metadata: { username },
+    });
+    broadcastSuper({ type: 'distributors-updated' });
+    return sendJson(res, 201, {
+      ok: true,
+      distributor: (await getSuperDistributors()).find(
+        (item) => item.id === distributorId,
+      ),
+    });
+  }
+
+  const distributorMatch = pathname.match(
+    /^\/api\/super\/distributors\/([0-9a-f-]+)(?:\/(quotas|quota-logs))?$/i,
+  );
+  if (distributorMatch && isUuid(distributorMatch[1])) {
+    const distributorId = distributorMatch[1];
+    const subresource = distributorMatch[2] || '';
+    if (
+      req.method === 'GET' &&
+      subresource === 'quota-logs'
+    ) {
+      const result = await pool.query(
+        `
+          SELECT ql.*,sa.username AS actor_admin_username,
+                 d.username AS actor_distributor_username
+          FROM distributor_quota_logs ql
+          LEFT JOIN super_admins sa ON sa.id=ql.actor_admin_id
+          LEFT JOIN distributors d ON d.id=ql.actor_distributor_id
+          WHERE ql.distributor_id=$1
+          ORDER BY ql.created_at DESC
+          LIMIT 1000
+        `,
+        [distributorId],
+      );
+      return sendJson(res, 200, { ok: true, logs: result.rows });
+    }
+
+    if (req.method === 'PUT' && subresource === 'quotas') {
+      requireRole(admin, 'manager');
+      const body = await readJson(req, 32 * 1024);
+      const requested = body.quotas && typeof body.quotas === 'object'
+        ? body.quotas
+        : {};
+      const reason = cleanText(body.reason, 200) || '超级管理员调整额度';
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const account = await client.query(
+          `SELECT id FROM distributors WHERE id=$1 FOR UPDATE`,
+          [distributorId],
+        );
+        if (!account.rows[0]) {
+          throw requestError('二级代理不存在。', 404, 'NOT_FOUND');
+        }
+        await ensureDistributorQuotas(distributorId, client);
+        const rows = await client.query(
+          `
+            SELECT * FROM distributor_license_quotas
+            WHERE distributor_id=$1
+            FOR UPDATE
+          `,
+          [distributorId],
+        );
+        for (const code of DISTRIBUTOR_DURATION_CODES) {
+          if (requested[code] === undefined) continue;
+          const next = Math.trunc(Number(requested[code]));
+          if (!Number.isSafeInteger(next) || next < 0 || next > 1_000_000) {
+            throw requestError(
+              `${LICENSE_DURATIONS[code].label}额度必须是0-1000000的整数。`,
+              400,
+              'DISTRIBUTOR_QUOTA',
+            );
+          }
+          const current = rows.rows.find(
+            (item) => item.duration_code === code,
+          );
+          const before = Number(current?.remaining_count || 0);
+          if (before === next) continue;
+          await client.query(
+            `
+              UPDATE distributor_license_quotas
+              SET remaining_count=$3,updated_at=NOW()
+              WHERE distributor_id=$1 AND duration_code=$2
+            `,
+            [distributorId, code, next],
+          );
+          await client.query(
+            `
+              INSERT INTO distributor_quota_logs (
+                distributor_id,duration_code,action,change_amount,
+                balance_before,balance_after,actor_admin_id,reason
+              ) VALUES ($1,$2,'set',$3,$4,$5,$6,$7)
+            `,
+            [
+              distributorId,
+              code,
+              next - before,
+              before,
+              next,
+              admin.id,
+              reason,
+            ],
+          );
+        }
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+      await writeAudit(req, admin, 'distributor.quota.update', {
+        targetType: 'distributor',
+        targetId: distributorId,
+        metadata: { reason },
+      });
+      broadcastDistributor(
+        { type: 'distributor-account-updated' },
+        distributorId,
+      );
+      broadcastSuper({ type: 'distributors-updated' });
+      return sendJson(res, 200, {
+        ok: true,
+        quotas: await getDistributorQuotaMap(distributorId),
+      });
+    }
+
+    if (req.method === 'PATCH' && !subresource) {
+      requireRole(admin, 'manager');
+      const body = await readJson(req, 32 * 1024);
+      const currentResult = await pool.query(
+        `SELECT * FROM distributors WHERE id=$1`,
+        [distributorId],
+      );
+      const current = currentResult.rows[0];
+      if (!current) {
+        return sendError(res, 404, '二级代理不存在。', 'NOT_FOUND');
+      }
+      const username = body.username === undefined
+        ? current.username
+        : normalizeDistributorUsername(body.username);
+      if (!username) {
+        return sendError(
+          res,
+          400,
+          '代理账号格式不正确。',
+          'DISTRIBUTOR_USERNAME',
+        );
+      }
+      const telegramUsername = body.telegramUsername === undefined
+        ? current.telegram_username
+        : normalizeTelegramUsername(body.telegramUsername);
+      if (body.telegramUsername && !telegramUsername) {
+        return sendError(
+          res,
+          400,
+          'Telegram 用户名格式不正确。',
+          'DISTRIBUTOR_TELEGRAM',
+        );
+      }
+      const password = body.password === undefined
+        ? ''
+        : String(body.password || '');
+      if (password && (password.length < 8 || password.length > 128)) {
+        return sendError(
+          res,
+          400,
+          '新密码必须为8-128位。',
+          'DISTRIBUTOR_PASSWORD',
+        );
+      }
+      const enabled = body.enabled === undefined
+        ? Boolean(current.enabled)
+        : Boolean(body.enabled);
+      const canGenerate = body.canGenerate === undefined
+        ? Boolean(current.can_generate)
+        : Boolean(body.canGenerate);
+      const allowedDurationCodes = body.allowedDurationCodes === undefined
+        ? cleanDurationCodes(current.allowed_duration_codes)
+        : cleanDurationCodes(body.allowedDurationCodes);
+      const invalidateSession = Boolean(
+        password || (current.enabled && !enabled),
+      );
+      try {
+        await pool.query(
+          `
+            UPDATE distributors
+            SET username=$2,display_name=$3,telegram_username=$4,
+                enabled=$5,can_generate=$6,allowed_duration_codes=$7::jsonb,
+                password_hash=$8,
+                session_version=session_version+$9,
+                updated_at=NOW()
+            WHERE id=$1
+          `,
+          [
+            distributorId,
+            username,
+            body.displayName === undefined
+              ? current.display_name
+              : cleanText(body.displayName, 80),
+            telegramUsername,
+            enabled,
+            canGenerate,
+            JSON.stringify(allowedDurationCodes),
+            password ? hashPassword(password) : current.password_hash,
+            invalidateSession ? 1 : 0,
+          ],
+        );
+      } catch (error) {
+        if (error?.code === '23505') {
+          return sendError(
+            res,
+            409,
+            '这个代理账号已经存在。',
+            'DISTRIBUTOR_EXISTS',
+          );
+        }
+        throw error;
+      }
+      await writeAudit(req, admin, 'distributor.update', {
+        targetType: 'distributor',
+        targetId: distributorId,
+        metadata: {
+          enabled,
+          canGenerate,
+          allowedDurationCodes,
+          passwordReset: Boolean(password),
+        },
+      });
+      if (invalidateSession) disconnectDistributor(distributorId);
+      else {
+        broadcastDistributor(
+          { type: 'distributor-account-updated' },
+          distributorId,
+        );
+      }
+      broadcastSuper({ type: 'distributors-updated' });
+      return sendJson(res, 200, {
+        ok: true,
+        distributor: (await getSuperDistributors()).find(
+          (item) => item.id === distributorId,
+        ),
+      });
+    }
+  }
+
   if (req.method === 'GET' && pathname === '/api/super/dashboard') {
     return sendJson(res, 200, {
       ok: true,
@@ -6958,7 +8332,13 @@ async function handleSuperRoutes(req, res, url, pathname) {
       try {
         await databaseClient.query('BEGIN');
         const result = await databaseClient.query(
-          `SELECT * FROM license_keys WHERE id=$1 FOR UPDATE`,
+          `
+            SELECT l.*,t.owner_distributor_id
+            FROM license_keys l
+            LEFT JOIN tenants t ON t.id=l.tenant_id
+            WHERE l.id=$1
+            FOR UPDATE OF l
+          `,
           [licenseId],
         );
         row = result.rows[0];
@@ -7054,6 +8434,24 @@ async function handleSuperRoutes(req, res, url, pathname) {
         targetId: licenseId,
       });
       broadcastSuper({ type: 'licenses-updated' });
+      if (row.tenant_id) broadcastSuper({ type: 'tenants-updated' });
+      if (row.generated_by_distributor_id) {
+        broadcastSuper({ type: 'distributors-updated' });
+      }
+      const ownerDistributorId = row.owner_distributor_id ||
+        row.generated_by_distributor_id;
+      if (ownerDistributorId) {
+        broadcastDistributor(
+          { type: 'distributor-licenses-updated' },
+          ownerDistributorId,
+        );
+        if (row.tenant_id) {
+          broadcastDistributor(
+            { type: 'distributor-tenants-updated' },
+            ownerDistributorId,
+          );
+        }
+      }
       return sendJson(res, 200, { ok: true });
     }
     if (req.method === 'DELETE' && !action) {
@@ -7062,7 +8460,7 @@ async function handleSuperRoutes(req, res, url, pathname) {
         `
           DELETE FROM license_keys
           WHERE id=$1 AND status='unused' AND tenant_id IS NULL
-          RETURNING id
+          RETURNING id,generated_by_distributor_id
         `,
         [licenseId],
       );
@@ -7079,6 +8477,13 @@ async function handleSuperRoutes(req, res, url, pathname) {
         targetId: licenseId,
       });
       broadcastSuper({ type: 'licenses-updated' });
+      if (deleted.rows[0].generated_by_distributor_id) {
+        broadcastDistributor(
+          { type: 'distributor-licenses-updated' },
+          deleted.rows[0].generated_by_distributor_id,
+        );
+        broadcastSuper({ type: 'distributors-updated' });
+      }
       return sendJson(res, 200, { ok: true });
     }
   }
@@ -7096,6 +8501,15 @@ async function handleSuperRoutes(req, res, url, pathname) {
     requireRole(admin, 'operations');
     const tenantId = tenantMatch[1];
     const body = await readJson(req, 64 * 1024);
+    const tenantOwnerResult = await pool.query(
+      `SELECT owner_distributor_id FROM tenants WHERE id=$1`,
+      [tenantId],
+    );
+    if (!tenantOwnerResult.rows[0]) {
+      return sendError(res, 404, '租户不存在。', 'NOT_FOUND');
+    }
+    const ownerDistributorId =
+      tenantOwnerResult.rows[0].owner_distributor_id;
     if (body.action === 'forceLogout') {
       await pool.query(
         `UPDATE tenants SET session_version=session_version+1,updated_at=NOW() WHERE id=$1`,
@@ -7221,6 +8635,12 @@ async function handleSuperRoutes(req, res, url, pathname) {
       metadata: { action: body.action || 'settings' },
     });
     broadcastSuper({ type: 'tenants-updated' });
+    if (ownerDistributorId) {
+      broadcastDistributor(
+        { type: 'distributor-tenants-updated' },
+        ownerDistributorId,
+      );
+    }
     return sendJson(res, 200, { ok: true });
   }
 
@@ -8074,9 +9494,18 @@ async function handleSuperRoutes(req, res, url, pathname) {
 
   if (req.method === 'GET' && pathname === '/api/super/audit') {
     const result = await pool.query(`
-      SELECT al.*, sa.username
+      SELECT
+        al.*,
+        COALESCE(
+          sa.username,
+          CASE WHEN d.username IS NOT NULL
+            THEN '二级代理 · ' || d.username
+            ELSE NULL
+          END
+        ) AS username
       FROM audit_logs al
       LEFT JOIN super_admins sa ON sa.id=al.actor_admin_id
+      LEFT JOIN distributors d ON d.id=al.actor_distributor_id
       ORDER BY al.created_at DESC
       LIMIT 1000
     `);
@@ -8253,6 +9682,10 @@ async function router(req, res) {
 
   if (pathname.startsWith('/api/super/')) {
     return handleSuperRoutes(req, res, url, pathname);
+  }
+
+  if (pathname.startsWith('/api/distributor/')) {
+    return handleDistributorRoutes(req, res, url, pathname);
   }
 
   if (req.method === 'POST' && pathname === '/api/telegram/webhook') {
@@ -8492,24 +9925,43 @@ async function router(req, res) {
   }
 
   if (req.method === 'GET' && pathname === '/api/events') {
-    const superAdmin = parseCookies(req)[SESSION_COOKIE]
+    const rawPayload = authenticate(req);
+    const hasSuperCredential = Boolean(
+      parseCookies(req)[SESSION_COOKIE] ||
+      rawPayload?.kind === 'super_admin',
+    );
+    const superAdmin = hasSuperCredential
       ? await authenticateSuper(req)
+      : null;
+    const distributorAccount = rawPayload?.kind === 'distributor'
+      ? await authenticateDistributor(req)
       : null;
     const payload = superAdmin
       ? {
           kind: 'super_admin',
           adminId: superAdmin.id,
         }
-      : authenticate(req);
+      : distributorAccount
+        ? {
+            ...rawPayload,
+            kind: 'distributor',
+            distributorId: distributorAccount.id,
+          }
+        : rawPayload?.kind === 'super_admin' ||
+            rawPayload?.kind === 'distributor'
+          ? null
+          : rawPayload;
     if (
       !payload ||
-      !['user', 'tenant_admin', 'super_admin'].includes(payload.kind)
+      !['user', 'tenant_admin', 'super_admin', 'distributor'].includes(
+        payload.kind,
+      )
     ) {
       return sendError(res, 401, '登录已失效。', 'AUTH');
     }
 
     let tenant = null;
-    if (payload.kind !== 'super_admin') {
+    if (!['super_admin', 'distributor'].includes(payload.kind)) {
       tenant =
         payload.kind === 'tenant_admin'
           ? await getTenantForAdminToken(payload)
@@ -8554,6 +10006,8 @@ async function router(req, res) {
     const connectionIdentity =
       payload.kind === 'super_admin'
         ? payload.adminId
+        : payload.kind === 'distributor'
+          ? payload.distributorId
         : payload.kind === 'tenant_admin'
           ? `${payload.tenantId}:${payload.licenseId}`
           : `${payload.tenantId}:${payload.conversationId}`;
@@ -8572,6 +10026,8 @@ async function router(req, res) {
         client.kind === payload.kind &&
         (payload.kind === 'super_admin'
           ? client.adminId === payload.adminId
+          : payload.kind === 'distributor'
+            ? client.distributorId === payload.distributorId
           : client.tenantId === payload.tenantId) &&
         (payload.kind === 'tenant_admin'
           ? client.licenseId === payload.licenseId
@@ -8582,6 +10038,8 @@ async function router(req, res) {
     const perSessionLimit =
       payload.kind === 'super_admin'
         ? 3
+        : payload.kind === 'distributor'
+          ? 3
         : payload.kind === 'tenant_admin'
           ? 6
           : 4;
@@ -8606,14 +10064,17 @@ async function router(req, res) {
       conversationId: payload.conversationId || null,
       licenseId: payload.licenseId || null,
       adminId: payload.adminId || null,
+      distributorId: payload.distributorId || null,
       accessExpiresAt:
-        payload.kind === 'super_admin'
-          ? Date.now() + 8 * 60 * 60_000
+        ['super_admin', 'distributor'].includes(payload.kind)
+          ? Number(payload.exp || 0) * 1000 ||
+            Date.now() + 8 * 60 * 60_000
           : new Date(tenant.access_expires_at).getTime(),
     };
     sseClients.add(client);
     if (['tenant_admin', 'user'].includes(payload.kind)) {
       scheduleSuperPresenceUpdate();
+      scheduleDistributorPresenceUpdate(tenant?.owner_distributor_id);
     }
     replayEvents(
       client,
@@ -8650,7 +10111,10 @@ async function router(req, res) {
       if (
         removed &&
         ['tenant_admin', 'user'].includes(payload.kind)
-      ) scheduleSuperPresenceUpdate();
+      ) {
+        scheduleSuperPresenceUpdate();
+        scheduleDistributorPresenceUpdate(tenant?.owner_distributor_id);
+      }
       if (payload.kind !== 'user') return;
       setTimeout(() => {
         if (
