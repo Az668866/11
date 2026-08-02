@@ -609,6 +609,7 @@ async function initDatabase() {
 
     await client.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT ''`);
     await client.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT ''`);
+    await client.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS distributor_note TEXT NOT NULL DEFAULT ''`);
     await client.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS session_version INTEGER NOT NULL DEFAULT 1`);
     await client.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS last_admin_online_at TIMESTAMPTZ`);
     await client.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS expiry_reminder_sent_at TIMESTAMPTZ`);
@@ -8447,6 +8448,7 @@ async function getDistributorTenants(distributorId, options = {}) {
       publicCode: row.public_code,
       name: row.name || '',
       note: row.note || '',
+      remark: row.distributor_note || '',
       status: row.status,
       createdAt: new Date(row.created_at).toISOString(),
       updatedAt: new Date(row.updated_at).toISOString(),
@@ -8820,22 +8822,115 @@ async function handleDistributorRoutes(req, res, url, pathname, apiVersion = 1) 
     });
   }
 
-  if (req.method === 'GET' && pathname === '/api/distributor/tenants') {
-    const page = await getDistributorTenants(distributor.id, {
-      cursor: apiVersion >= 2 ? url.searchParams.get('cursor') : null,
-      limit: apiVersion >= 2 ? pageLimit(url) : 2000,
-      legacy: apiVersion < 2,
-    });
-    return sendJson(res, 200, {
-      ok: true,
-      tenants: page.items,
-      page: apiVersion >= 2
-        ? { nextCursor: page.nextCursor, hasMore: page.hasMore }
-        : undefined,
-    });
+ if (req.method === 'GET' && pathname === '/api/distributor/tenants') {
+  const page = await getDistributorTenants(distributor.id, {
+    cursor: apiVersion >= 2 ? url.searchParams.get('cursor') : null,
+    limit: apiVersion >= 2 ? pageLimit(url) : 2000,
+    legacy: apiVersion < 2,
+  });
+  return sendJson(res, 200, {
+    ok: true,
+    tenants: page.items,
+    page: apiVersion >= 2
+      ? { nextCursor: page.nextCursor, hasMore: page.hasMore }
+      : undefined,
+  });
+}
+
+const tenantRemarkMatch = pathname.match(
+  /^\/api\/distributor\/tenants\/([0-9a-f-]+)\/remark$/i,
+);
+
+if (
+  tenantRemarkMatch &&
+  isUuid(tenantRemarkMatch[1]) &&
+  req.method === 'PATCH'
+) {
+  if (
+    !rateLimit(
+      req,
+      res,
+      'distributor-tenant-remark',
+      60,
+      60_000,
+      distributor.id,
+    )
+  ) {
+    return;
   }
 
-  if (req.method === 'GET' && pathname === '/api/distributor/quota-logs') {
+  const tenantId = tenantRemarkMatch[1];
+  const body = await readJson(req, 16 * 1024);
+
+  if (typeof body.remark !== 'string') {
+    return sendError(
+      res,
+      400,
+      '备注内容格式不正确。',
+      'DISTRIBUTOR_TENANT_REMARK_INPUT',
+    );
+  }
+
+  const remark = cleanText(body.remark, 300);
+
+  const result = await pool.query(
+    `
+      UPDATE tenants
+      SET distributor_note = $3,
+          updated_at = NOW()
+      WHERE id = $1
+        AND owner_distributor_id = $2
+      RETURNING id, distributor_note, updated_at
+    `,
+    [tenantId, distributor.id, remark],
+  );
+
+  const row = result.rows[0];
+
+  if (!row) {
+    return sendError(
+      res,
+      404,
+      '租户不存在或不属于当前代理。',
+      'DISTRIBUTOR_TENANT_NOT_FOUND',
+    );
+  }
+
+  await writeDistributorAudit(
+    req,
+    distributor,
+    'distributor.tenant.remark.update',
+    {
+      targetType: 'tenant',
+      targetId: tenantId,
+      metadata: {
+        remarkLength: remark.length,
+      },
+    },
+  );
+
+  broadcastDistributor(
+    {
+      type: 'distributor-tenants-updated',
+    },
+    distributor.id,
+  );
+
+  broadcastSuper({
+    type: 'tenants-updated',
+  });
+
+  return sendJson(res, 200, {
+    ok: true,
+    tenant: {
+      id: row.id,
+      remark: row.distributor_note || '',
+      updatedAt: new Date(row.updated_at).toISOString(),
+    },
+  });
+}
+
+if (req.method === 'GET' && pathname === '/api/distributor/quota-logs') {
     const logLimit = apiVersion >= 2 ? pageLimit(url, 100) : 500;
     const rawCursor = Number(url.searchParams.get('cursor'));
     const logCursor = apiVersion >= 2 && Number.isSafeInteger(rawCursor) && rawCursor > 0
