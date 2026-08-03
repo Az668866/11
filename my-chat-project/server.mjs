@@ -1333,7 +1333,7 @@ async function initDatabase() {
               OR
               (
                 recalled_at IS NULL
-                AND type IN ('image','video')
+                AND type IN ('image','video','audio')
                 AND attachment_id IS NOT NULL
               )
             );
@@ -2432,6 +2432,18 @@ function cleanText(value, max = 4000) {
     .slice(0, max);
 }
 
+function cleanSdpText(value, max = 200_000) {
+  let sdp = String(value ?? '').replace(/\u0000/g, '');
+  if (sdp.length > max) {
+    throw requestError('通话描述过大。', 413, 'CALL_SDP_SIZE');
+  }
+  // SDP uses CRLF line endings. Do not call trim() here: Safari/WebKit can
+  // reject an SDP whose final line terminator was removed in transit.
+  sdp = sdp.replace(/\r\n|\r|\n/g, '\r\n');
+  sdp = sdp.replace(/^(?:\r\n)+/, '').replace(/(?:\r\n)+$/, '');
+  return sdp ? `${sdp}\r\n` : '';
+}
+
 function safeDecodeURIComponent(value) {
   try {
     return decodeURIComponent(String(value || ''));
@@ -3001,8 +3013,10 @@ function parseCallSignal(body = {}) {
     if (!sdp || typeof sdp !== 'object' || !['offer','answer'].includes(sdp.type)) {
       throw requestError('通话描述无效。', 400, 'CALL_SDP');
     }
-    const value = cleanText(sdp.sdp, 200_000);
-    if (!value) throw requestError('通话描述为空。', 400, 'CALL_SDP');
+    const value = cleanSdpText(sdp.sdp, 200_000);
+    if (!value || !/^v=0\r\n/.test(value)) {
+      throw requestError('通话描述为空或格式无效。', 400, 'CALL_SDP');
+    }
     signal.sdp = { type: sdp.type, sdp: value };
   }
   if (action === 'ice') {
