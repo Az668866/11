@@ -168,7 +168,10 @@ const MAX_VIDEO_BYTES =
 const MAX_AUDIO_BYTES =
   envNumber('MAX_AUDIO_MB', 12, 1, 30) * 1024 * 1024;
 const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
+const MAX_QR_LOGO_BYTES = 3 * 1024 * 1024;
 const MAX_COVER_BYTES = 5 * 1024 * 1024;
+const DEFAULT_QR_BOTTOM_TEXT =
+  '支持微信，支付宝，QQ，浏览器进入\n如遇联系不上客服请在域名是数字加一位数\n比如1改成2以此类推';
 const MAX_ALBUM_IMAGES = 9;
 const MAX_CONCURRENT_UPLOADS = Math.trunc(
   envNumber('MAX_CONCURRENT_UPLOADS', 4, 1, 8),
@@ -585,6 +588,9 @@ function defaultConfig() {
       settings: {
       siteName: '在线客服',
       avatarAssetId: '',
+      qrTopText: '',
+      qrBottomText: DEFAULT_QR_BOTTOM_TEXT,
+      qrLogoAssetId: '',
       welcomeText: '您好，欢迎咨询。您可以发送文字、图片或视频，我们会尽快回复。',
       onlineStatusText: '客服在线',
       pageTitle: '在线客服',
@@ -675,7 +681,7 @@ async function initDatabase() {
       CREATE TABLE IF NOT EXISTS assets (
         id UUID PRIMARY KEY,
         tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
-        kind TEXT NOT NULL CHECK (kind IN ('brand_avatar','template_cover')),
+        kind TEXT NOT NULL CHECK (kind IN ('brand_avatar','template_cover','qr_logo')),
         filename TEXT NOT NULL,
         mime TEXT NOT NULL,
         size INTEGER NOT NULL CHECK (size > 0),
@@ -688,6 +694,14 @@ async function initDatabase() {
           OR (storage = 'database' AND data IS NOT NULL)
         )
       )
+    `);
+    await client.query(`
+      ALTER TABLE assets DROP CONSTRAINT IF EXISTS assets_kind_check
+    `);
+    await client.query(`
+      ALTER TABLE assets
+      ADD CONSTRAINT assets_kind_check
+      CHECK (kind IN ('brand_avatar','template_cover','qr_logo'))
     `);
 
     await client.query(`
@@ -2912,6 +2926,202 @@ async function prepareImageUpload(req, { maxBytes, width, height }) {
   }
 }
 
+
+async function prepareQrLogoUpload(req) {
+  const mime = String(req.headers['content-type'] || '')
+    .split(';')[0]
+    .trim()
+    .toLowerCase();
+  if (!['image/jpeg', 'image/png', 'image/webp'].includes(mime)) {
+    throw requestError(
+      '二维码图片仅支持 JPG、PNG、WebP。',
+      415,
+      'QR_LOGO_TYPE',
+    );
+  }
+  const input = await readBody(req, MAX_QR_LOGO_BYTES);
+  if (!input.length || !mediaContentMatchesMime(input, mime)) {
+    throw requestError('二维码图片内容无效。', 415, 'QR_LOGO_SIGNATURE');
+  }
+  try {
+    return await sharp(input, {
+      limitInputPixels: 24_000_000,
+      failOn: 'warning',
+    })
+      .rotate()
+      .resize(512, 512, {
+        fit: 'contain',
+        background: { r: 255, g: 255, b: 255, alpha: 0 },
+      })
+      .webp({ quality: 88, effort: 4, alphaQuality: 100 })
+      .toBuffer();
+  } catch {
+    throw requestError('二维码图片无法解析或尺寸异常。', 415, 'QR_LOGO_INVALID');
+  }
+}
+
+function escapeQrSvgText(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function qrCharacterUnits(character) {
+  return /^[\u0000-\u00ff]$/.test(character) ? 0.58 : 1;
+}
+
+function wrapQrText(value, maxUnits, maxLines) {
+  const normalized = String(value || '')
+    .replace(/\r\n?/g, '\n')
+    .trim();
+  if (!normalized) return [];
+  const lines = [];
+  for (const paragraph of normalized.split('\n')) {
+    if (!paragraph) {
+      lines.push('');
+      if (lines.length >= maxLines) break;
+      continue;
+    }
+    let current = '';
+    let units = 0;
+    for (const character of paragraph) {
+      const nextUnits = qrCharacterUnits(character);
+      if (current && units + nextUnits > maxUnits) {
+        lines.push(current);
+        if (lines.length >= maxLines) return lines;
+        current = character;
+        units = nextUnits;
+      } else {
+        current += character;
+        units += nextUnits;
+      }
+    }
+    if (current || !paragraph) lines.push(current);
+    if (lines.length >= maxLines) break;
+  }
+  return lines.slice(0, maxLines);
+}
+
+async function readTenantQrLogo(tenantId, assetId) {
+  if (!isUuid(assetId)) return null;
+  const result = await pool.query(
+    `
+      SELECT *
+      FROM assets
+      WHERE id=$1 AND tenant_id=$2 AND kind='qr_logo'
+    `,
+    [assetId, tenantId],
+  );
+  return readStoredRow(result.rows[0]);
+}
+
+async function buildTenantQrImage(entryUrl, {
+  topText = '',
+  bottomText = DEFAULT_QR_BOTTOM_TEXT,
+  logoData = null,
+} = {}) {
+  const canvasWidth = 840;
+  const qrSize = 720;
+  const topFontSize = 32;
+  const topLineHeight = 43;
+  const bottomFontSize = 24;
+  const bottomLineHeight = 34;
+  const outerPadding = 34;
+  const topLines = wrapQrText(topText, 24, 3);
+  const bottomLines = wrapQrText(bottomText, 31, 7);
+  const topHeight = topLines.length * topLineHeight;
+  const bottomHeight = bottomLines.length * bottomLineHeight;
+  const topGap = topLines.length ? 18 : 0;
+  const bottomGap = bottomLines.length ? 24 : 0;
+  const qrTop = outerPadding + topHeight + topGap;
+  const canvasHeight =
+    qrTop + qrSize + bottomGap + bottomHeight + outerPadding;
+
+  let qrBuffer = await QRCode.toBuffer(entryUrl, {
+    type: 'png',
+    width: qrSize,
+    margin: 3,
+    errorCorrectionLevel: logoData ? 'H' : 'M',
+    color: { dark: '#121827', light: '#ffffff' },
+  });
+
+  if (logoData) {
+    const logoBoxSize = 164;
+    const logoSize = 128;
+    const logo = await sharp(logoData)
+      .resize(logoSize, logoSize, {
+        fit: 'contain',
+        background: { r: 255, g: 255, b: 255, alpha: 0 },
+      })
+      .png()
+      .toBuffer();
+    const badgeSvg = Buffer.from(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${logoBoxSize}" height="${logoBoxSize}"><rect x="0" y="0" width="${logoBoxSize}" height="${logoBoxSize}" rx="25" fill="#ffffff"/></svg>`,
+      'utf8',
+    );
+    const badge = await sharp(badgeSvg)
+      .composite([
+        {
+          input: logo,
+          left: Math.round((logoBoxSize - logoSize) / 2),
+          top: Math.round((logoBoxSize - logoSize) / 2),
+        },
+      ])
+      .png()
+      .toBuffer();
+    qrBuffer = await sharp(qrBuffer)
+      .composite([
+        {
+          input: badge,
+          left: Math.round((qrSize - logoBoxSize) / 2),
+          top: Math.round((qrSize - logoBoxSize) / 2),
+        },
+      ])
+      .png()
+      .toBuffer();
+  }
+
+  const topTextSvg = topLines
+    .map((line, index) => {
+      const y = outerPadding + topFontSize + index * topLineHeight;
+      return `<text x="${canvasWidth / 2}" y="${y}" text-anchor="middle" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="${topFontSize}" font-weight="700" fill="#39425d">${escapeQrSvgText(line)}</text>`;
+    })
+    .join('');
+  const bottomStartY = qrTop + qrSize + bottomGap + bottomFontSize;
+  const bottomTextSvg = bottomLines
+    .map((line, index) => {
+      const y = bottomStartY + index * bottomLineHeight;
+      return `<text x="${canvasWidth / 2}" y="${y}" text-anchor="middle" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="${bottomFontSize}" font-weight="500" fill="#4e5872">${escapeQrSvgText(line)}</text>`;
+    })
+    .join('');
+  const textLayer = Buffer.from(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${canvasWidth}" height="${canvasHeight}">${topTextSvg}${bottomTextSvg}</svg>`,
+    'utf8',
+  );
+
+  return sharp({
+    create: {
+      width: canvasWidth,
+      height: canvasHeight,
+      channels: 4,
+      background: { r: 255, g: 255, b: 255, alpha: 1 },
+    },
+  })
+    .composite([
+      {
+        input: qrBuffer,
+        left: Math.round((canvasWidth - qrSize) / 2),
+        top: qrTop,
+      },
+      { input: textLayer, left: 0, top: 0 },
+    ])
+    .png({ compressionLevel: 9 })
+    .toBuffer();
+}
+
 async function readStoredRow(row) {
   if (!row) return null;
   let data;
@@ -3274,6 +3484,7 @@ async function getConfig(tenantId, client = pool) {
     cannedReplies: result.rows[0].canned_replies || [],
     autoReplies: result.rows[0].auto_replies || [],
     settings: {
+      ...defaultConfig().settings,
       ...(result.rows[0].settings || {}),
       retentionHours: Number(result.rows[0].retention_hours || 24),
       frontendTemplateId:
@@ -4117,6 +4328,17 @@ async function validateAdminSettings(body, current, tenantId) {
         ? cleanText(input.siteName, 80) || '在线客服'
         : current.settings.siteName,
     avatarAssetId: cleanText(current.settings.avatarAssetId, 80),
+    qrTopText:
+      input.qrTopText !== undefined
+        ? cleanText(input.qrTopText, 120)
+        : cleanText(current.settings.qrTopText, 120),
+    qrBottomText:
+      input.qrBottomText !== undefined
+        ? cleanText(input.qrBottomText, 360)
+        : current.settings.qrBottomText !== undefined
+          ? cleanText(current.settings.qrBottomText, 360)
+          : DEFAULT_QR_BOTTOM_TEXT,
+    qrLogoAssetId: cleanText(current.settings.qrLogoAssetId, 80),
     welcomeText:
       input.welcomeText !== undefined
         ? cleanText(input.welcomeText, 2000)
@@ -13033,6 +13255,81 @@ async function router(req, res) {
       return sendJson(res, 200, { ok: true });
     }
 
+    if (req.method === 'POST' && pathname === '/api/admin/qr/logo') {
+      const data = await prepareQrLogoUpload(req);
+      const current = await getConfig(payload.tenantId);
+      const oldAssetId = cleanText(current.settings.qrLogoAssetId, 80);
+      const asset = await saveAsset({
+        tenantId: payload.tenantId,
+        kind: 'qr_logo',
+        filename: 'qr-logo.webp',
+        mime: 'image/webp',
+        data,
+      });
+      await pool.query(
+        `
+          UPDATE tenant_config
+          SET settings=jsonb_set(
+                COALESCE(settings,'{}'::jsonb),
+                '{qrLogoAssetId}',
+                to_jsonb($2::text),
+                true
+              ),
+              updated_at=NOW()
+          WHERE tenant_id=$1
+        `,
+        [payload.tenantId, asset.id],
+      );
+      if (isUuid(oldAssetId)) {
+        await deleteAsset(oldAssetId, payload.tenantId);
+      }
+      invalidateTenantCaches(payload.tenantId);
+      const settings = (await getConfig(payload.tenantId)).settings;
+      broadcast(
+        { type: 'settings-updated', settings },
+        null,
+        payload.tenantId,
+      );
+      await writeAudit(req, null, 'tenant.qr_logo.update', {
+        targetType: 'tenant',
+        targetId: payload.tenantId,
+      }).catch(() => {});
+      return sendJson(res, 201, {
+        ok: true,
+        qrLogoAssetId: asset.id,
+        qrLogoUrl: `${PUBLIC_API_BASE}/api/public/assets/${asset.id}`,
+        settings,
+      });
+    }
+
+    if (req.method === 'DELETE' && pathname === '/api/admin/qr/logo') {
+      const current = await getConfig(payload.tenantId);
+      const oldAssetId = cleanText(current.settings.qrLogoAssetId, 80);
+      await pool.query(
+        `
+          UPDATE tenant_config
+          SET settings=settings - 'qrLogoAssetId',updated_at=NOW()
+          WHERE tenant_id=$1
+        `,
+        [payload.tenantId],
+      );
+      if (isUuid(oldAssetId)) {
+        await deleteAsset(oldAssetId, payload.tenantId);
+      }
+      invalidateTenantCaches(payload.tenantId);
+      const settings = (await getConfig(payload.tenantId)).settings;
+      broadcast(
+        { type: 'settings-updated', settings },
+        null,
+        payload.tenantId,
+      );
+      await writeAudit(req, null, 'tenant.qr_logo.delete', {
+        targetType: 'tenant',
+        targetId: payload.tenantId,
+      }).catch(() => {});
+      return sendJson(res, 200, { ok: true, settings });
+    }
+
     if (req.method === 'POST' && pathname === '/api/admin/qr-incident') {
       if (
         !rateLimit(
@@ -13156,12 +13453,17 @@ async function router(req, res) {
         };
       }
       const entryUrl = tenantEntryUrl(entrySettings, activeTenant.public_code);
-      const image = await QRCode.toBuffer(entryUrl, {
-        type: 'png',
-        width: 720,
-        margin: 3,
-        errorCorrectionLevel: 'M',
-        color: { dark: '#121827', light: '#ffffff' },
+      const logoData = await readTenantQrLogo(
+        payload.tenantId,
+        config.settings.qrLogoAssetId,
+      ).catch(() => null);
+      const image = await buildTenantQrImage(entryUrl, {
+        topText: config.settings.qrTopText || '',
+        bottomText:
+          config.settings.qrBottomText !== undefined
+            ? config.settings.qrBottomText
+            : DEFAULT_QR_BOTTOM_TEXT,
+        logoData,
       });
       res.statusCode = 200;
       res.setHeader('Content-Type', 'image/png');
