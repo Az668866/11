@@ -3025,13 +3025,13 @@ async function buildTenantQrImage(entryUrl, {
 } = {}) {
   const canvasWidth = 840;
   const qrSize = 720;
-  const topFontSize = 32;
-  const topLineHeight = 43;
-  const bottomFontSize = 24;
-  const bottomLineHeight = 34;
+  const topFontSize = 46;
+  const topLineHeight = 62;
+  const bottomFontSize = 36;
+  const bottomLineHeight = 50;
   const outerPadding = 34;
-  const topLines = wrapQrText(topText, 24, 3);
-  const bottomLines = wrapQrText(bottomText, 31, 7);
+  const topLines = wrapQrText(topText, 18, 3);
+  const bottomLines = wrapQrText(bottomText, 22, 7);
   const topHeight = topLines.length * topLineHeight;
   const bottomHeight = bottomLines.length * bottomLineHeight;
   const topGap = topLines.length ? 18 : 0;
@@ -3087,14 +3087,14 @@ async function buildTenantQrImage(entryUrl, {
   const topTextSvg = topLines
     .map((line, index) => {
       const y = outerPadding + topFontSize + index * topLineHeight;
-      return `<text x="${canvasWidth / 2}" y="${y}" text-anchor="middle" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="${topFontSize}" font-weight="700" fill="#39425d">${escapeQrSvgText(line)}</text>`;
+      return `<text x="${canvasWidth / 2}" y="${y}" text-anchor="middle" font-family="Noto Sans CJK SC, Source Han Sans SC, Microsoft YaHei, PingFang SC, sans-serif" font-size="${topFontSize}" font-weight="700" fill="#39425d">${escapeQrSvgText(line)}</text>`;
     })
     .join('');
   const bottomStartY = qrTop + qrSize + bottomGap + bottomFontSize;
   const bottomTextSvg = bottomLines
     .map((line, index) => {
       const y = bottomStartY + index * bottomLineHeight;
-      return `<text x="${canvasWidth / 2}" y="${y}" text-anchor="middle" font-family="Arial, PingFang SC, Microsoft YaHei, sans-serif" font-size="${bottomFontSize}" font-weight="500" fill="#4e5872">${escapeQrSvgText(line)}</text>`;
+      return `<text x="${canvasWidth / 2}" y="${y}" text-anchor="middle" font-family="Noto Sans CJK SC, Source Han Sans SC, Microsoft YaHei, PingFang SC, sans-serif" font-size="${bottomFontSize}" font-weight="500" fill="#4e5872">${escapeQrSvgText(line)}</text>`;
     })
     .join('');
   const textLayer = Buffer.from(
@@ -13457,10 +13457,14 @@ async function router(req, res) {
         payload.tenantId,
         config.settings.qrLogoAssetId,
       ).catch(() => null);
+      // plain=1 只返回二维码主体（仍保留租户上传的中心图片）。
+      // 新版租户后台会在浏览器 Canvas 中绘制中文文字，避免服务器缺少中文字体时出现方框乱码。
+      const plainQr = url.searchParams.get('plain') === '1';
       const image = await buildTenantQrImage(entryUrl, {
-        topText: config.settings.qrTopText || '',
-        bottomText:
-          config.settings.qrBottomText !== undefined
+        topText: plainQr ? '' : config.settings.qrTopText || '',
+        bottomText: plainQr
+          ? ''
+          : config.settings.qrBottomText !== undefined
             ? config.settings.qrBottomText
             : DEFAULT_QR_BOTTOM_TEXT,
         logoData,
