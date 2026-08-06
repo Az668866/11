@@ -6987,6 +6987,19 @@ function normalizeNetlifySiteId(value) {
   return /^[a-z0-9][a-z0-9-]{0,119}$/i.test(siteId) ? siteId : '';
 }
 
+function clientTemplateIdentifierMatches(value, template) {
+  const identifier = cleanText(value, 120).toLowerCase();
+  if (!isUuid(identifier)) return false;
+  const internalTemplateId = String(template?.id || '').trim().toLowerCase();
+  const netlifySiteId = normalizeNetlifySiteId(
+    template?.netlify_site_id,
+  ).toLowerCase();
+  return (
+    timingSafeTextEqual(identifier, internalTemplateId) ||
+    Boolean(netlifySiteId) && timingSafeTextEqual(identifier, netlifySiteId)
+  );
+}
+
 function normalizeNetlifyDomain(value) {
   let domain = cleanText(value, 300).trim().toLowerCase();
   domain = domain
@@ -13505,11 +13518,7 @@ async function router(req, res, parsedRequestUrl = null) {
       );
     }
     const selectedTemplateId = config.settings.frontendTemplateId;
-    if (
-      !isUuid(selectedTemplateId) ||
-      (body.clientTemplateId &&
-        body.clientTemplateId !== selectedTemplateId)
-    ) {
+    if (!isUuid(selectedTemplateId)) {
       return sendError(
         res,
         403,
@@ -13544,7 +13553,7 @@ async function router(req, res, parsedRequestUrl = null) {
     }
     const template = await pool.query(
       `
-        SELECT id
+        SELECT id,netlify_site_id
         FROM frontend_templates
         WHERE id=$1
           AND ($2::text = '' OR origin=$2)
@@ -13567,6 +13576,17 @@ async function router(req, res, parsedRequestUrl = null) {
         res,
         403,
         '当前用户端未通过平台批准，或租户已切换其他模板。',
+        'CLIENT_TEMPLATE',
+      );
+    }
+    if (
+      body.clientTemplateId &&
+      !clientTemplateIdentifierMatches(body.clientTemplateId, template.rows[0])
+    ) {
+      return sendError(
+        res,
+        403,
+        '此链接不是该租户当前选择的用户端。',
         'CLIENT_TEMPLATE',
       );
     }
