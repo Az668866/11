@@ -1,7 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { lookup as dnsLookup } from 'node:dns';
-import { isIP } from 'node:net';
+import { BlockList, isIP } from 'node:net';
 import {
   createCipheriv,
   createDecipheriv,
@@ -21,7 +21,6 @@ import {
 import pg from 'pg';
 import QRCode from 'qrcode';
 import sharp from 'sharp';
-import webpush from 'web-push';
 
 const { Pool } = pg;
 
@@ -32,7 +31,11 @@ const TOKEN_SECRET_TEXT = process.env.TOKEN_SECRET || '';
 const PUBLIC_API_BASE = String(
   process.env.PUBLIC_API_BASE || 'https://api.ykf000.com',
 ).replace(/\/+$/, '');
-const APP_VERSION = String(process.env.APP_VERSION || '2.1.0').trim();
+// 二维码只保存这个长期稳定的入口域名。模板站点域名以后可以任意更换。
+const QR_ENTRY_BASE = String(
+  process.env.QR_ENTRY_BASE || PUBLIC_API_BASE,
+).replace(/\/+$/, '');
+const APP_VERSION = String(process.env.APP_VERSION || '2.3.1').trim();
 const SUPPORT_TELEGRAM = String(
   process.env.SUPPORT_TELEGRAM || '@YingYingUu',
 ).trim();
@@ -76,6 +79,12 @@ const ENV_SUPER_ADMINS = [
 const COOKIE_DOMAIN = String(process.env.COOKIE_DOMAIN || '').trim();
 const COOKIE_SECURE = process.env.COOKIE_SECURE !== 'false';
 const REQUIRE_CLOUDFLARE = process.env.REQUIRE_CLOUDFLARE === 'true';
+const REQUIRE_SUPER_ADMIN_TOTP =
+  process.env.REQUIRE_SUPER_ADMIN_TOTP === 'true';
+const STRICT_CLIENT_ORIGIN =
+  process.env.STRICT_CLIENT_ORIGIN !== 'false';
+const REQUIRE_CLIENT_TEMPLATE_ID =
+  process.env.REQUIRE_CLIENT_TEMPLATE_ID === 'true';
 const CLOUDFLARE_ORIGIN_SECRET = String(
   process.env.CLOUDFLARE_ORIGIN_SECRET || '',
 );
@@ -161,6 +170,46 @@ const READINESS_CACHE_MS = envNumber(
   5,
   60,
 ) * 1000;
+const BLOCKLIST_CACHE_MS = envNumber(
+  'BLOCKLIST_CACHE_SECONDS',
+  300,
+  30,
+  3600,
+) * 1000;
+const SECURITY_IP_BLOCK_HOURS = envNumber(
+  'SECURITY_IP_BLOCK_HOURS',
+  24,
+  1,
+  24 * 365,
+);
+const SECURITY_ALERT_COOLDOWN_MS = envNumber(
+  'SECURITY_ALERT_COOLDOWN_MINUTES',
+  10,
+  1,
+  1440,
+) * 60_000;
+const AUDIT_RETENTION_DAYS = Math.trunc(
+  envNumber('AUDIT_RETENTION_DAYS', 90, 7, 3650),
+);
+const ANOMALY_WINDOW_MS = 10 * 60_000;
+const ANOMALY_VISITOR_IP_LIMIT = Math.trunc(
+  envNumber('ANOMALY_VISITOR_IP_10M', 12, 3, 10_000),
+);
+const ANOMALY_VISITOR_TENANT_LIMIT = Math.trunc(
+  envNumber('ANOMALY_VISITOR_TENANT_10M', 120, 10, 100_000),
+);
+const ANOMALY_MESSAGE_CONVERSATION_LIMIT = Math.trunc(
+  envNumber('ANOMALY_MESSAGES_CONVERSATION_10M', 80, 10, 100_000),
+);
+const ANOMALY_MESSAGE_TENANT_LIMIT = Math.trunc(
+  envNumber('ANOMALY_MESSAGES_TENANT_10M', 600, 50, 1_000_000),
+);
+const QR_INCIDENT_WINDOW_MINUTES = Math.trunc(
+  envNumber('QR_INCIDENT_WINDOW_MINUTES', 10, 1, 1440),
+);
+const QR_INCIDENT_REVIEW_THRESHOLD = Math.trunc(
+  envNumber('QR_INCIDENT_REVIEW_THRESHOLD', 3, 2, 1000),
+);
 const MAX_IMAGE_BYTES =
   envNumber('MAX_IMAGE_MB', 8, 1, 16) * 1024 * 1024;
 const MAX_VIDEO_BYTES =
@@ -171,7 +220,7 @@ const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
 const MAX_QR_LOGO_BYTES = 3 * 1024 * 1024;
 const MAX_COVER_BYTES = 5 * 1024 * 1024;
 const DEFAULT_QR_BOTTOM_TEXT =
-  '支持微信，支付宝，QQ，浏览器进入\n如遇联系不上客服请在域名是数字加一位数\n比如1改成2以此类推';
+  '支持微信、支付宝、QQ和浏览器进入\n此二维码为活码，模板域名更换后仍可继续使用';
 const MAX_ALBUM_IMAGES = 9;
 const MAX_CONCURRENT_UPLOADS = Math.trunc(
   envNumber('MAX_CONCURRENT_UPLOADS', 4, 1, 8),
@@ -193,10 +242,8 @@ const TOKEN_TTL_SECONDS = Math.min(
 const DB_POOL_MAX = Math.trunc(
   envNumber('DB_POOL_MAX', 5, 1, 20),
 );
-const VAPID_PUBLIC_KEY = String(process.env.VAPID_PUBLIC_KEY || '').trim();
-const VAPID_PRIVATE_KEY = String(process.env.VAPID_PRIVATE_KEY || '').trim();
-const VAPID_SUBJECT = String(process.env.VAPID_SUBJECT || '').trim();
-const WEB_PUSH_ENABLED = Boolean(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);
+// 用户端已取消安装与离线通知；保留旧 API 契约，但不再发送 Web Push。
+const WEB_PUSH_ENABLED = false;
 const WEBRTC_STUN_URLS = String(
   process.env.WEBRTC_STUN_URLS || 'stun:stun.l.google.com:19302',
 )
@@ -235,6 +282,23 @@ if (!DATABASE_URL || !/^postgres(?:ql)?:\/\//i.test(DATABASE_URL)) {
   throw new Error('DATABASE_URL 必须设置为 Neon PostgreSQL 连接串。');
 }
 
+for (const [name, value] of [
+  ['PUBLIC_API_BASE', PUBLIC_API_BASE],
+  ['QR_ENTRY_BASE', QR_ENTRY_BASE],
+]) {
+  try {
+    const parsed = new URL(value);
+    if (
+      parsed.protocol !== 'https:' ||
+      parsed.username ||
+      parsed.password ||
+      parsed.search ||
+      parsed.hash
+    ) throw new Error();
+  } catch {
+    throw new Error(`${name} 必须是标准 HTTPS 地址。`);
+  }
+}
 
 if (!STATIC_ALLOWED_ORIGINS.length) {
   throw new Error(
@@ -279,6 +343,14 @@ if (
 ) {
   throw new Error('SUPER_ADMIN_TOTP_SECRET_2 必须是有效的 Base32 密钥。');
 }
+if (
+  REQUIRE_SUPER_ADMIN_TOTP &&
+  ENV_SUPER_ADMINS.some((admin) => !admin.totpSecret)
+) {
+  throw new Error(
+    'REQUIRE_SUPER_ADMIN_TOTP=true 时，每个超级管理员都必须配置 TOTP 密钥。',
+  );
+}
 if (REQUIRE_CLOUDFLARE && CLOUDFLARE_ORIGIN_SECRET.length < 24) {
   throw new Error(
     'REQUIRE_CLOUDFLARE=true 时，CLOUDFLARE_ORIGIN_SECRET 必须至少24位。',
@@ -292,27 +364,6 @@ if (TELEGRAM_ENABLED) {
     throw new Error(
       '启用 Telegram 时必须设置 TELEGRAM_ALLOWED_USER_IDS 操作员白名单（旧变量 TELEGRAM_ALLOWED_PRIVATE_USER_IDS 仍兼容）。',
     );
-  }
-}
-
-if (Boolean(VAPID_PUBLIC_KEY) !== Boolean(VAPID_PRIVATE_KEY)) {
-  throw new Error('VAPID_PUBLIC_KEY 和 VAPID_PRIVATE_KEY 必须同时设置。');
-}
-if (
-  WEB_PUSH_ENABLED &&
-  !(/^mailto:[^@\s]+@[^@\s]+$/i.test(VAPID_SUBJECT) || /^https:\/\//i.test(VAPID_SUBJECT))
-) {
-  throw new Error('启用 Web Push 时必须设置有效的 VAPID_SUBJECT（mailto:邮箱或 HTTPS 地址）。');
-}
-if (WEB_PUSH_ENABLED) {
-  try {
-    webpush.setVapidDetails(
-      VAPID_SUBJECT,
-      VAPID_PUBLIC_KEY,
-      VAPID_PRIVATE_KEY,
-    );
-  } catch (error) {
-    throw new Error(`VAPID 配置无效：${error.message}`);
   }
 }
 
@@ -380,6 +431,16 @@ pool.on('error', (error) => {
 const sseClients = new Set();
 const rateBuckets = new Map();
 let nextRateBucketCleanupAt = 0;
+const behaviorBuckets = new Map();
+const securityAlertClaims = new Map();
+const MAX_RATE_BUCKETS = 20_000;
+const MAX_BEHAVIOR_BUCKETS = 5_000;
+const MAX_SECURITY_ALERT_CLAIMS = 2_000;
+const blockedIpCache = new Map();
+const telegramGroupAdminCache = new Map();
+const telegramBlockedUserCache = new Map();
+let blockedIpCacheExpiresAt = 0;
+let blockedIpCachePromise = null;
 const eventHistory = [];
 const distributorPresenceTimers = new Map();
 const requestLatencies = [];
@@ -415,6 +476,7 @@ let cleanupPromise = null;
 let cleanupFailureCount = 0;
 let nextCleanupRetryAt = 0;
 let activeUploads = 0;
+let activeImageTransforms = 0;
 let reportTimer = null;
 let expiryReminderTimer = null;
 let expiryReminderRescheduleTimer = null;
@@ -517,6 +579,27 @@ function cacheGet(cache, key) {
 function cacheSet(cache, key, value, ttl = CONFIG_CACHE_MS) {
   cache.set(key, { value, expiresAt: Date.now() + ttl });
   return value;
+}
+
+function parseRequestUrl(value) {
+  try {
+    const parsed = new URL(String(value || '/'), 'http://localhost');
+    return ['http:', 'https:'].includes(parsed.protocol) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function makeRoomInExpiringMap(cache, maxEntries, now, expiresAtOf) {
+  if (cache.size < maxEntries) return;
+  for (const [key, value] of cache) {
+    if (expiresAtOf(value) <= now) cache.delete(key);
+  }
+  while (cache.size >= maxEntries) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey === undefined) break;
+    cache.delete(oldestKey);
+  }
 }
 
 function invalidateTenantCaches(tenantId = '') {
@@ -907,6 +990,16 @@ async function initDatabase() {
         REFERENCES distributors(id) ON DELETE SET NULL
     `);
     await client.query(`
+      ALTER TABLE audit_logs
+      ADD COLUMN IF NOT EXISTS actor_tenant_id UUID
+        REFERENCES tenants(id) ON DELETE SET NULL
+    `);
+    await client.query(`
+      ALTER TABLE audit_logs
+      ADD COLUMN IF NOT EXISTS actor_license_id UUID
+        REFERENCES license_keys(id) ON DELETE SET NULL
+    `);
+    await client.query(`
       CREATE INDEX IF NOT EXISTS audit_logs_created_idx
       ON audit_logs (created_at DESC)
     `);
@@ -1105,6 +1198,7 @@ async function initDatabase() {
     `);
     await client.query(`ALTER TABLE qr_incidents ADD COLUMN IF NOT EXISTS reporter_license_id UUID REFERENCES license_keys(id) ON DELETE SET NULL`);
     await client.query(`ALTER TABLE qr_incidents ADD COLUMN IF NOT EXISTS click_count_30m INTEGER NOT NULL DEFAULT 1`);
+    await client.query(`ALTER TABLE qr_incidents ADD COLUMN IF NOT EXISTS click_count_10m INTEGER NOT NULL DEFAULT 1`);
     await client.query(`ALTER TABLE qr_incidents ADD COLUMN IF NOT EXISTS requires_admin_review BOOLEAN NOT NULL DEFAULT FALSE`);
     await client.query(`
       CREATE TABLE IF NOT EXISTS qr_incident_reports (
@@ -1464,6 +1558,69 @@ async function initDatabase() {
       WHERE status IN ('resolved','failed')
     `);
 
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS security_events (
+        id UUID PRIMARY KEY,
+        kind TEXT NOT NULL,
+        severity TEXT NOT NULL DEFAULT 'warning'
+          CHECK (severity IN ('info','warning','critical')),
+        fingerprint TEXT NOT NULL,
+        tenant_id UUID REFERENCES tenants(id) ON DELETE SET NULL,
+        license_id UUID REFERENCES license_keys(id) ON DELETE SET NULL,
+        conversation_id UUID REFERENCES conversations(id) ON DELETE SET NULL,
+        ip_address TEXT NOT NULL DEFAULT '',
+        user_agent TEXT NOT NULL DEFAULT '',
+        details JSONB NOT NULL DEFAULT '{}'::jsonb,
+        occurrences INTEGER NOT NULL DEFAULT 1 CHECK (occurrences > 0),
+        status TEXT NOT NULL DEFAULT 'open'
+          CHECK (status IN ('open','blocked','dismissed','resolved')),
+        telegram_chat_id TEXT,
+        telegram_message_id BIGINT,
+        handled_by_telegram_user_id TEXT,
+        first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        handled_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS security_events_open_fingerprint_idx
+      ON security_events (fingerprint)
+      WHERE status='open'
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS security_events_created_idx
+      ON security_events (created_at DESC)
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS blocked_ips (
+        ip_address TEXT PRIMARY KEY,
+        reason TEXT NOT NULL DEFAULT '',
+        security_event_id UUID REFERENCES security_events(id) ON DELETE SET NULL,
+        blocked_by_telegram_user_id TEXT NOT NULL DEFAULT '',
+        expires_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS blocked_ips_expiry_idx
+      ON blocked_ips (expires_at)
+      WHERE expires_at IS NOT NULL
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS telegram_blocked_users (
+        user_id TEXT PRIMARY KEY,
+        username TEXT NOT NULL DEFAULT '',
+        display_name TEXT NOT NULL DEFAULT '',
+        reason TEXT NOT NULL DEFAULT '',
+        blocked_by_telegram_user_id TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
     await client.query(
       `
         INSERT INTO app_config (id, canned_replies, auto_replies, settings)
@@ -1636,13 +1793,23 @@ async function cleanupExpiredData() {
 
     await client.query(`DELETE FROM telegram_updates WHERE created_at < NOW() - INTERVAL '30 days'`);
     await client.query(`DELETE FROM qr_incident_reports WHERE reported_at < NOW() - INTERVAL '180 days'`);
-    await client.query(`DELETE FROM push_subscriptions WHERE updated_at < NOW() - INTERVAL '180 days'`);
+    await client.query(`DELETE FROM blocked_ips WHERE expires_at IS NOT NULL AND expires_at <= NOW()`);
+    await client.query(`
+      DELETE FROM security_events
+      WHERE status <> 'open' AND updated_at < NOW() - INTERVAL '90 days'
+    `);
+    // 离线通知已取消，清理历史订阅以免继续占用数据库。
+    await client.query(`DELETE FROM push_subscriptions`);
     await client.query(`
       DELETE FROM qr_incidents
       WHERE status IN ('resolved','failed')
         AND updated_at < NOW() - INTERVAL '180 days'
     `);
-    await client.query(`DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL '7 days'`);
+    await client.query(
+      `DELETE FROM audit_logs
+       WHERE created_at < NOW() - ($1::int * INTERVAL '1 day')`,
+      [AUDIT_RETENTION_DAYS],
+    );
     await client.query(`DELETE FROM system_metric_samples WHERE created_at < NOW() - INTERVAL '7 days'`);
     await queueObjectDeletes(objectKeys, client);
 
@@ -1839,6 +2006,11 @@ function hashPassword(password) {
   return `scrypt$${salt.toString('base64url')}$${hash.toString('base64url')}`;
 }
 
+// 未知账号也只执行一次 scrypt，避免用户名枚举和额外的 CPU 放大。
+const DUMMY_PASSWORD_HASH = hashPassword(
+  randomBytes(32).toString('base64url'),
+);
+
 function verifyPassword(password, stored) {
   const [scheme, saltText, hashText, extra] = String(stored || '').split('$');
   if (scheme !== 'scrypt' || !saltText || !hashText || extra) return false;
@@ -1963,16 +2135,28 @@ function authenticate(req, kind) {
   return payload;
 }
 
+function userTokenOriginAllowed(req, payload) {
+  if (payload?.kind !== 'user' || !STRICT_CLIENT_ORIGIN) return true;
+  const requestOrigin = normalizeOrigin(req.headers.origin);
+  const tokenOrigin = normalizeOrigin(payload.clientOrigin);
+  return Boolean(requestOrigin && tokenOrigin && requestOrigin === tokenOrigin);
+}
+
 async function authenticateSuper(req) {
-  const token =
-    getBearer(req) ||
-    parseCookies(req)[SESSION_COOKIE] ||
-    '';
+  const bearerToken = getBearer(req);
+  const token = bearerToken || parseCookies(req)[SESSION_COOKIE] || '';
   const payload = verifyToken(token);
   if (
     payload?.kind !== 'super_admin' ||
     !isUuid(payload.adminId) ||
     !Number.isInteger(payload.sessionVersion)
+  ) return null;
+  const requestOrigin = normalizeOrigin(req.headers.origin);
+  const sessionOrigin = normalizeOrigin(payload.clientOrigin);
+  if (
+    (sessionOrigin && requestOrigin &&
+      !timingSafeTextEqual(sessionOrigin, requestOrigin)) ||
+    (!bearerToken && requestOrigin && !sessionOrigin)
   ) return null;
   const cacheKey = `${payload.adminId}:${payload.sessionVersion}`;
   const cached = cacheGet(superAuthCache, cacheKey);
@@ -2080,17 +2264,21 @@ async function writeAudit(
     targetId = '',
     result = 'success',
     metadata = {},
+    actorTenantId = '',
+    actorLicenseId = '',
   } = {},
 ) {
   await pool.query(
     `
       INSERT INTO audit_logs (
-        actor_admin_id, action, target_type, target_id,
-        ip_address, result, metadata
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)
+        actor_admin_id, actor_tenant_id, actor_license_id,
+        action, target_type, target_id, ip_address, result, metadata
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
     `,
     [
       admin?.id || null,
+      isUuid(actorTenantId) ? actorTenantId : null,
+      isUuid(actorLicenseId) ? actorLicenseId : null,
       cleanText(action, 100),
       cleanText(targetType, 80),
       cleanText(targetId, 160),
@@ -2099,6 +2287,16 @@ async function writeAudit(
       JSON.stringify(metadata || {}),
     ],
   );
+}
+
+function writeTenantAudit(req, payload, action, options = {}) {
+  return writeAudit(req, null, action, {
+    ...options,
+    actorTenantId: payload?.tenantId,
+    actorLicenseId: payload?.licenseId,
+    targetType: options.targetType || 'tenant',
+    targetId: options.targetId || payload?.tenantId || '',
+  });
 }
 
 async function writeDistributorAudit(
@@ -2135,41 +2333,98 @@ function normalizeOrigin(origin) {
   return String(origin || '').trim().replace(/\/$/, '');
 }
 
+const nonPublicAddresses = new BlockList();
+for (const [network, prefix] of [
+  ['0.0.0.0', 8],
+  ['10.0.0.0', 8],
+  ['100.64.0.0', 10],
+  ['127.0.0.0', 8],
+  ['169.254.0.0', 16],
+  ['172.16.0.0', 12],
+  ['192.0.0.0', 24],
+  ['192.0.2.0', 24],
+  ['192.168.0.0', 16],
+  ['198.18.0.0', 15],
+  ['198.51.100.0', 24],
+  ['203.0.113.0', 24],
+  ['224.0.0.0', 4],
+  ['240.0.0.0', 4],
+]) {
+  nonPublicAddresses.addSubnet(network, prefix, 'ipv4');
+}
+for (const [network, prefix] of [
+  ['::', 96],
+  ['::', 128],
+  ['::1', 128],
+  ['64:ff9b::', 96],
+  ['64:ff9b:1::', 48],
+  ['100::', 64],
+  ['2001::', 32],
+  ['2001:2::', 48],
+  ['2001:10::', 28],
+  ['2001:20::', 28],
+  ['2001:db8::', 32],
+  ['2002::', 16],
+  ['3fff::', 20],
+  ['5f00::', 16],
+  ['fc00::', 7],
+  ['fe80::', 10],
+  ['ff00::', 8],
+]) {
+  nonPublicAddresses.addSubnet(network, prefix, 'ipv6');
+}
+
+function mappedIpv4Address(address) {
+  const value = String(address || '').toLowerCase();
+  if (!value.startsWith('::ffff:')) return '';
+  const tail = value.slice('::ffff:'.length);
+  if (isIP(tail) === 4) return tail;
+  const parts = tail.split(':');
+  if (
+    parts.length !== 2 ||
+    parts.some((part) => !/^[0-9a-f]{1,4}$/.test(part))
+  ) return '';
+  const high = Number.parseInt(parts[0], 16);
+  const low = Number.parseInt(parts[1], 16);
+  return [high >>> 8, high & 0xff, low >>> 8, low & 0xff].join('.');
+}
+
 function isPublicAddress(address) {
   const version = isIP(address);
-  if (version === 4) {
-    const [a, b, c] = address.split('.').map(Number);
-    return !(
-      a === 0 ||
-      a === 10 ||
-      a === 127 ||
-      (a === 100 && b >= 64 && b <= 127) ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 0 && c === 0) ||
-      (a === 192 && b === 0 && c === 2) ||
-      (a === 192 && b === 168) ||
-      (a === 198 && (b === 18 || b === 19)) ||
-      (a === 198 && b === 51 && c === 100) ||
-      (a === 203 && b === 0 && c === 113) ||
-      a >= 224
-    );
-  }
+  if (version === 4) return !nonPublicAddresses.check(address, 'ipv4');
   if (version === 6) {
-    const value = address.toLowerCase();
-    if (value.startsWith('::ffff:')) {
-      return isPublicAddress(value.slice(7));
-    }
-    return !(
-      value === '::' ||
-      value === '::1' ||
-      /^f[cd]/.test(value) ||
-      /^fe[89ab]/.test(value) ||
-      value.startsWith('ff') ||
-      value.startsWith('2001:db8:')
-    );
+    const mapped = mappedIpv4Address(address);
+    return mapped
+      ? isPublicAddress(mapped)
+      : !nonPublicAddresses.check(address, 'ipv6');
   }
   return false;
+}
+
+function parseTemplateFetchTarget(inputUrl) {
+  let target;
+  try {
+    target = new URL(inputUrl);
+  } catch {
+    throw requestError('只能检测标准 HTTPS 用户端地址。', 400, 'TEMPLATE_URL');
+  }
+  if (
+    target.protocol !== 'https:' ||
+    target.username ||
+    target.password ||
+    (target.port && target.port !== '443')
+  ) {
+    throw requestError('只能检测标准 HTTPS 用户端地址。', 400, 'TEMPLATE_URL');
+  }
+  const hostname = target.hostname.replace(/^\[|\]$/g, '');
+  if (isIP(hostname) && !isPublicAddress(hostname)) {
+    throw requestError(
+      '模板地址不能指向本机、内网或保留网络。',
+      400,
+      'TEMPLATE_SSRF',
+    );
+  }
+  return target;
 }
 
 // 模板检测会访问管理员填写的网址，因此 DNS 必须锁定到公网地址以阻断 SSRF。
@@ -2177,17 +2432,9 @@ function fetchTemplateHtml(inputUrl, redirectCount = 0) {
   return new Promise((resolve, reject) => {
     let target;
     try {
-      target = new URL(inputUrl);
-      if (
-        target.protocol !== 'https:' ||
-        target.username ||
-        target.password ||
-        (target.port && target.port !== '443')
-      ) {
-        throw new Error();
-      }
-    } catch {
-      reject(requestError('只能检测标准 HTTPS 用户端地址。', 400, 'TEMPLATE_URL'));
+      target = parseTemplateFetchTarget(inputUrl);
+    } catch (error) {
+      reject(error);
       return;
     }
     const request = https.request(
@@ -2272,6 +2519,13 @@ function fetchTemplateHtml(inputUrl, redirectCount = 0) {
         requestError('模板网站连接超时。', 504, 'TEMPLATE_TIMEOUT'),
       );
     });
+    const deadline = setTimeout(() => {
+      request.destroy(
+        requestError('模板网站检测超过总时限。', 504, 'TEMPLATE_TIMEOUT'),
+      );
+    }, 15_000);
+    deadline.unref();
+    request.once('close', () => clearTimeout(deadline));
     request.on('error', reject);
     request.end();
   });
@@ -2301,17 +2555,32 @@ function extractTemplateContract(html) {
       /DEFAULT_API_BASE\s*=\s*['"]([^'"]+)['"]/,
     )?.[1] ||
     '';
-  const contractReady = [
+  const contractVersion = cleanText(
+    meta['tuojie-api-contract'] || '',
+    30,
+  );
+  const requiredInlineMarkers = [
     '/api/user/session',
     '/api/user/conversation',
     '/api/events',
     'CLIENT_TEMPLATE_ID',
     'Last-Event-ID',
-  ].every((marker) => String(html).includes(marker));
+  ];
+  const missingMarkers = requiredInlineMarkers.filter(
+    (marker) => !String(html).includes(marker),
+  );
+  // Vite 会把 JS 拆成独立静态资源，部署页面可以用显式 meta 契约代替扫描内联源码。
+  const declaredContractReady =
+    /^v?2(?:\.|$)/i.test(contractVersion) &&
+    Object.hasOwn(meta, 'tuojie-template-id') &&
+    Boolean(clientVersion && apiBase);
+  const contractReady = declaredContractReady || missingMarkers.length === 0;
   return {
     clientVersion: cleanText(clientVersion, 30),
     apiBase: cleanText(apiBase, 300).replace(/\/+$/, ''),
+    contractVersion,
     contractReady,
+    missingMarkers: declaredContractReady ? [] : missingMarkers,
   };
 }
 
@@ -2492,22 +2761,19 @@ function normalizeIp(value) {
 }
 
 function requestIp(req) {
-  const candidates = REQUIRE_CLOUDFLARE
-    ? [req.headers['cf-connecting-ip']]
-    : [
-        req.headers['cf-connecting-ip'],
-        req.headers['true-client-ip'],
-        req.headers['x-real-ip'],
-        ...String(req.headers['x-forwarded-for'] || '')
-          .split(',')
-          .map((item) => item.trim()),
-        req.socket.remoteAddress,
-      ];
-  for (const candidate of candidates) {
-    const ip = normalizeIp(candidate);
-    if (ip) return ip;
+  if (REQUIRE_CLOUDFLARE) {
+    return normalizeIp(req.headers['cf-connecting-ip']) || 'unknown';
   }
-  return 'unknown';
+  const remoteAddress = normalizeIp(req.socket.remoteAddress);
+  const forwarded = String(req.headers['x-forwarded-for'] || '')
+    .split(',')
+    .map(normalizeIp)
+    .filter(Boolean);
+  // 只在连接来自本机/私网反向代理时信任 X-Forwarded-For，且取代理追加的最右端地址。
+  if (remoteAddress && !isPublicAddress(remoteAddress)) {
+    return forwarded.at(-1) || remoteAddress;
+  }
+  return remoteAddress || forwarded.at(-1) || 'unknown';
 }
 
 const CHINA_REGION_CODES = Object.freeze({
@@ -2631,7 +2897,308 @@ function cloudflareVisitorLocation(req) {
   };
 }
 
-function rateLimit(req, res, name, max, windowMs, identity = '') {
+function securityFingerprint(parts) {
+  return createHash('sha256')
+    .update(parts.map((item) => String(item || '')).join('|'))
+    .digest('base64url');
+}
+
+function claimSecurityAlert(fingerprint) {
+  const now = Date.now();
+  if ((securityAlertClaims.get(fingerprint) || 0) > now) return false;
+  securityAlertClaims.delete(fingerprint);
+  makeRoomInExpiringMap(
+    securityAlertClaims,
+    MAX_SECURITY_ALERT_CLAIMS,
+    now,
+    (expiresAt) => expiresAt,
+  );
+  securityAlertClaims.set(fingerprint, now + SECURITY_ALERT_COOLDOWN_MS);
+  return true;
+}
+
+function cleanSecurityDetails(value = {}) {
+  const result = {};
+  for (const [key, item] of Object.entries(value || {}).slice(0, 30)) {
+    if (item === null || ['string', 'number', 'boolean'].includes(typeof item)) {
+      result[cleanText(key, 80)] = typeof item === 'string'
+        ? cleanText(item, 500)
+        : item;
+    }
+  }
+  return result;
+}
+
+function securityKindLabel(kind) {
+  if (kind === 'visitor-session-ip') return '同一网络高频创建访客';
+  if (kind === 'visitor-session-tenant') return '租户访客量异常';
+  if (kind === 'message-conversation') return '单会话消息量异常';
+  if (kind === 'message-tenant') return '租户消息量异常';
+  if (kind === 'suspicious-path') return '敏感路径扫描';
+  if (kind === 'suspicious-agent') return '自动化扫描工具';
+  if (kind === 'template-origin-mismatch') return '伪造用户端来源';
+  if (kind === 'user-token-origin-mismatch') return '访客令牌跨站复用';
+  if (kind.startsWith('rate-limit:')) {
+    return `接口频率异常（${kind.slice('rate-limit:'.length)}）`;
+  }
+  return kind || '异常访问';
+}
+
+function securityEventKeyboard(event) {
+  const rows = [];
+  if (event.license_id) {
+    rows.push([{
+      text: '⛔ 封禁租户卡密',
+      callback_data: `sec:license:${event.id}`,
+    }]);
+  }
+  if (event.ip_address && event.ip_address !== 'unknown') {
+    rows.push([{
+      text: `🛡 封禁此 IP（${SECURITY_IP_BLOCK_HOURS}小时）`,
+      callback_data: `sec:ip:${event.id}`,
+    }]);
+  }
+  rows.push([{
+    text: '✅ 标记已核实',
+    callback_data: `sec:dismiss:${event.id}`,
+  }]);
+  return { inline_keyboard: rows };
+}
+
+async function reportSecurityAnomaly({
+  kind,
+  req = null,
+  tenantId = '',
+  licenseId = '',
+  conversationId = '',
+  count = 1,
+  threshold = 1,
+  severity = 'warning',
+  details = {},
+} = {}) {
+  const tokenPayload = req ? authenticate(req) : null;
+  const resolvedTenantId = isUuid(tenantId)
+    ? tenantId
+    : isUuid(tokenPayload?.tenantId)
+      ? tokenPayload.tenantId
+      : '';
+  let resolvedLicenseId = isUuid(licenseId)
+    ? licenseId
+    : isUuid(tokenPayload?.licenseId)
+      ? tokenPayload.licenseId
+      : '';
+  const ipAddress = req ? cleanText(requestIp(req), 100) : '';
+  const fingerprint = securityFingerprint([
+    kind,
+    resolvedTenantId,
+    isUuid(conversationId) ? conversationId : '',
+    ipAddress,
+    cleanText(details.path, 300),
+  ]);
+  if (!claimSecurityAlert(fingerprint)) return null;
+
+  let tenant = null;
+  if (resolvedTenantId) {
+    const tenantResult = await pool.query(
+      `
+        SELECT t.id,t.name,t.note,t.public_code,
+               l.id AS license_id,l.key_prefix,l.key_suffix,l.duration_code
+        FROM tenants t
+        LEFT JOIN LATERAL (
+          SELECT id,key_prefix,key_suffix,duration_code
+          FROM license_keys
+          WHERE tenant_id=t.id AND status='active'
+          ORDER BY created_at DESC
+          LIMIT 1
+        ) l ON TRUE
+        WHERE t.id=$1
+      `,
+      [resolvedTenantId],
+    );
+    tenant = tenantResult.rows[0] || null;
+    if (!resolvedLicenseId && isUuid(tenant?.license_id)) {
+      resolvedLicenseId = tenant.license_id;
+    }
+  }
+
+  const eventResult = await pool.query(
+    `
+      INSERT INTO security_events (
+        id,kind,severity,fingerprint,tenant_id,license_id,conversation_id,
+        ip_address,user_agent,details,occurrences
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11)
+      ON CONFLICT (fingerprint) WHERE status='open'
+      DO UPDATE SET
+        severity=EXCLUDED.severity,
+        tenant_id=COALESCE(security_events.tenant_id,EXCLUDED.tenant_id),
+        license_id=COALESCE(security_events.license_id,EXCLUDED.license_id),
+        conversation_id=COALESCE(security_events.conversation_id,EXCLUDED.conversation_id),
+        ip_address=COALESCE(NULLIF(EXCLUDED.ip_address,''),security_events.ip_address),
+        user_agent=COALESCE(NULLIF(EXCLUDED.user_agent,''),security_events.user_agent),
+        details=EXCLUDED.details,
+        occurrences=security_events.occurrences + EXCLUDED.occurrences,
+        last_seen_at=NOW(),updated_at=NOW()
+      RETURNING *
+    `,
+    [
+      randomUUID(),
+      cleanText(kind, 100),
+      ['info', 'warning', 'critical'].includes(severity) ? severity : 'warning',
+      fingerprint,
+      resolvedTenantId || null,
+      resolvedLicenseId || null,
+      isUuid(conversationId) ? conversationId : null,
+      ipAddress,
+      cleanText(req?.headers?.['user-agent'], 500),
+      JSON.stringify({
+        ...cleanSecurityDetails(details),
+        count: Math.max(1, Math.trunc(Number(count || 1))),
+        threshold: Math.max(1, Math.trunc(Number(threshold || 1))),
+        windowMinutes: Math.round(ANOMALY_WINDOW_MS / 60_000),
+      }),
+      Math.max(1, Math.trunc(Number(count || 1))),
+    ],
+  );
+  const event = eventResult.rows[0];
+  if (!event || !TELEGRAM_ENABLED) return event || null;
+  const settings = await getPlatformSettings().catch(() => null);
+  if (!settings?.telegramGroupId) return event;
+  const eventDetails = event.details || {};
+  const licenseLabel = tenant?.license_id
+    ? `${tenant.key_prefix || 'VIP'}-*****-*****-*****-${tenant.key_suffix || '?????'}（${LICENSE_DURATIONS[tenant.duration_code]?.label || tenant.duration_code || '未知期限'}）`
+    : '未关联卡密';
+  const sent = await telegramApi('sendMessage', {
+    chat_id: settings.telegramGroupId,
+    text: [
+      `<b>🚨 安全异常告警</b>`,
+      '',
+      `<b>类型</b>：${escapeTelegramHtml(securityKindLabel(event.kind))}`,
+      `<b>次数</b>：<code>${Number(eventDetails.count || count)}</code> / 阈值 <code>${Number(eventDetails.threshold || threshold)}</code>`,
+      `<b>租户</b>：${escapeTelegramHtml(tenant?.name || '未关联租户')}`,
+      tenant?.public_code
+        ? `<b>入口编号</b>：<code>${escapeTelegramHtml(tenant.public_code)}</code>`
+        : '',
+      tenant?.note
+        ? `<b>备注</b>：${escapeTelegramHtml(tenant.note)}`
+        : '',
+      `<b>卡密</b>：<code>${escapeTelegramHtml(licenseLabel)}</code>`,
+      `<b>IP</b>：<code>${escapeTelegramHtml(event.ip_address || 'unknown')}</code>`,
+      eventDetails.path
+        ? `<b>路径</b>：<code>${escapeTelegramHtml(eventDetails.path)}</code>`
+        : '',
+      `<b>时间</b>：${escapeTelegramHtml(formatTelegramDate(event.last_seen_at))}`,
+      '',
+      '系统只做告警，不会自动误封；请由管理员点击下方按钮处理。',
+    ].filter(Boolean).join('\n'),
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+    reply_markup: securityEventKeyboard(event),
+  });
+  await pool.query(
+    `UPDATE security_events
+     SET telegram_chat_id=$2,telegram_message_id=$3,updated_at=NOW()
+     WHERE id=$1`,
+    [event.id, String(settings.telegramGroupId), sent.message_id],
+  );
+  return event;
+}
+
+function scheduleSecurityAnomaly(input) {
+  queueMicrotask(() => {
+    reportSecurityAnomaly(input).catch((error) =>
+      console.error('安全异常记录失败：', error.message),
+    );
+  });
+}
+
+function observeBehaviorCounter(req, {
+  kind,
+  key,
+  limit,
+  tenantId = '',
+  licenseId = '',
+  conversationId = '',
+  details = {},
+  increment = 1,
+}) {
+  if (!key || !Number.isFinite(limit)) return;
+  const now = Date.now();
+  const bucketKey = `${kind}:${key}`;
+  let bucket = behaviorBuckets.get(bucketKey);
+  if (!bucket || bucket.resetAt <= now) {
+    behaviorBuckets.delete(bucketKey);
+    makeRoomInExpiringMap(
+      behaviorBuckets,
+      MAX_BEHAVIOR_BUCKETS,
+      now,
+      (item) => item.resetAt,
+    );
+    bucket = { count: 0, resetAt: now + ANOMALY_WINDOW_MS, alerted: false };
+    behaviorBuckets.set(bucketKey, bucket);
+  }
+  bucket.count += Math.max(1, Math.trunc(Number(increment || 1)));
+  if (bucket.count < limit || bucket.alerted) return;
+  bucket.alerted = true;
+  scheduleSecurityAnomaly({
+    kind,
+    req,
+    tenantId,
+    licenseId,
+    conversationId,
+    count: bucket.count,
+    threshold: limit,
+    details,
+  });
+}
+
+async function refreshBlockedIpCache(force = false) {
+  if (!force && blockedIpCacheExpiresAt > Date.now()) return;
+  if (blockedIpCachePromise) return blockedIpCachePromise;
+  blockedIpCachePromise = pool.query(
+    `SELECT ip_address,expires_at FROM blocked_ips
+     WHERE expires_at IS NULL OR expires_at > NOW()`,
+  ).then((result) => {
+    blockedIpCache.clear();
+    for (const row of result.rows) {
+      blockedIpCache.set(
+        row.ip_address,
+        row.expires_at ? new Date(row.expires_at).getTime() : Infinity,
+      );
+    }
+    blockedIpCacheExpiresAt = Date.now() + BLOCKLIST_CACHE_MS;
+  }).finally(() => {
+    blockedIpCachePromise = null;
+  });
+  return blockedIpCachePromise;
+}
+
+function ipIsBlocked(ipAddress) {
+  const expiresAt = blockedIpCache.get(ipAddress);
+  if (!expiresAt) return false;
+  if (expiresAt <= Date.now()) {
+    blockedIpCache.delete(ipAddress);
+    return false;
+  }
+  return true;
+}
+
+function suspiciousRequest(req, pathname) {
+  const path = String(pathname || '').toLowerCase();
+  const userAgent = String(req.headers['user-agent'] || '').toLowerCase();
+  const pathPatterns = [
+    '/.env', '/.git', '/server.mjs', '/package.json', '/package-lock.json',
+    '/wp-admin', '/wp-login', '/phpmyadmin', '/vendor/phpunit', '/actuator',
+    '/.well-known/security.txt.bak', '.sql', '.bak', '.map',
+  ];
+  const agentPatterns = ['sqlmap', 'nikto', 'masscan', 'nmap scripting engine', 'acunetix', 'nessus'];
+  const matchedPath = pathPatterns.find((pattern) => path.includes(pattern));
+  if (matchedPath) return { kind: 'suspicious-path', reason: matchedPath };
+  const matchedAgent = agentPatterns.find((pattern) => userAgent.includes(pattern));
+  if (matchedAgent) return { kind: 'suspicious-agent', reason: matchedAgent };
+  return null;
+}
+
+function rateLimit(req, res, name, max, windowMs, identity = '', context = {}) {
   const key = `${name}:${identity || requestIp(req)}`;
   const now = Date.now();
   if (now >= nextRateBucketCleanupAt) {
@@ -2643,7 +3210,18 @@ function rateLimit(req, res, name, max, windowMs, identity = '') {
   const current = rateBuckets.get(key);
 
   if (!current || current.resetAt <= now) {
-    rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+    rateBuckets.delete(key);
+    makeRoomInExpiringMap(
+      rateBuckets,
+      MAX_RATE_BUCKETS,
+      now,
+      (item) => item.resetAt,
+    );
+    rateBuckets.set(key, {
+      count: 1,
+      resetAt: now + windowMs,
+      alerted: false,
+    });
     return true;
   }
 
@@ -2653,6 +3231,23 @@ function rateLimit(req, res, name, max, windowMs, identity = '') {
       'Retry-After',
       String(Math.ceil((current.resetAt - now) / 1000)),
     );
+    if (!current.alerted) {
+      current.alerted = true;
+      scheduleSecurityAnomaly({
+        kind: `rate-limit:${name}`,
+        req,
+        tenantId: context.tenantId,
+        licenseId: context.licenseId,
+        conversationId: context.conversationId,
+        count: current.count,
+        threshold: max,
+        severity: name.includes('login') ? 'critical' : 'warning',
+        details: {
+          path: cleanText(req.url, 300),
+          method: cleanText(req.method, 20),
+        },
+      });
+    }
     sendError(res, 429, '操作过于频繁，请稍后再试。', 'RATE_LIMIT');
     return false;
   }
@@ -2751,6 +3346,17 @@ async function readObject(objectKey) {
   return Buffer.from(await result.Body.transformToByteArray());
 }
 
+async function rollbackFreshObject(objectKey) {
+  if (!R2_ENABLED || !objectKey) return;
+  try {
+    await r2.send(
+      new DeleteObjectCommand({ Bucket: R2_BUCKET, Key: objectKey }),
+    );
+  } catch {
+    await queueObjectDeletes([objectKey]).catch(() => {});
+  }
+}
+
 async function queueObjectDeletes(objectKeys, client = pool) {
   const unique = [...new Set(objectKeys.filter(Boolean))];
   if (!unique.length) return;
@@ -2837,27 +3443,33 @@ async function saveAsset({
 }) {
   const id = randomUUID();
   const objectKey = `assets/${kind}/${tenantId || 'platform'}/${id}.webp`;
-  const storedInR2 = await putObject(objectKey, data, mime);
-  const result = await pool.query(
-    `
-      INSERT INTO assets (
-        id, tenant_id, kind, filename, mime, size, storage, object_key, data
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-      RETURNING *
-    `,
-    [
-      id,
-      tenantId,
-      kind,
-      filename,
-      mime,
-      data.length,
-      storedInR2 ? 'r2' : 'database',
-      storedInR2 ? objectKey : null,
-      storedInR2 ? null : data,
-    ],
-  );
-  return result.rows[0];
+  let storedInR2 = false;
+  try {
+    storedInR2 = await putObject(objectKey, data, mime);
+    const result = await pool.query(
+      `
+        INSERT INTO assets (
+          id, tenant_id, kind, filename, mime, size, storage, object_key, data
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        RETURNING *
+      `,
+      [
+        id,
+        tenantId,
+        kind,
+        filename,
+        mime,
+        data.length,
+        storedInR2 ? 'r2' : 'database',
+        storedInR2 ? objectKey : null,
+        storedInR2 ? null : data,
+      ],
+    );
+    return result.rows[0];
+  } catch (error) {
+    if (storedInR2) await rollbackFreshObject(objectKey);
+    throw error;
+  }
 }
 
 async function deleteAsset(assetId, tenantId = undefined) {
@@ -2893,6 +3505,18 @@ async function deleteAsset(assetId, tenantId = undefined) {
   }
 }
 
+async function withImageTransformSlot(task) {
+  if (activeImageTransforms >= MAX_CONCURRENT_UPLOADS) {
+    throw requestError('当前图片处理较多，请稍后重试。', 503, 'IMAGE_BUSY');
+  }
+  activeImageTransforms += 1;
+  try {
+    return await task();
+  } finally {
+    activeImageTransforms -= 1;
+  }
+}
+
 async function prepareImageUpload(req, { maxBytes, width, height }) {
   const mime = String(req.headers['content-type'] || '')
     .split(';')[0]
@@ -2905,25 +3529,27 @@ async function prepareImageUpload(req, { maxBytes, width, height }) {
       'IMAGE_TYPE',
     );
   }
-  const input = await readBody(req, maxBytes);
-  if (!input.length || !mediaContentMatchesMime(input, mime)) {
-    throw requestError('图片内容无效。', 415, 'IMAGE_SIGNATURE');
-  }
-  try {
-    return await sharp(input, {
-      limitInputPixels: 24_000_000,
-      failOn: 'warning',
-    })
-      .rotate()
-      .resize(width, height, {
-        fit: 'cover',
-        position: 'attention',
+  return withImageTransformSlot(async () => {
+    const input = await readBody(req, maxBytes);
+    if (!input.length || !mediaContentMatchesMime(input, mime)) {
+      throw requestError('图片内容无效。', 415, 'IMAGE_SIGNATURE');
+    }
+    try {
+      return await sharp(input, {
+        limitInputPixels: 24_000_000,
+        failOn: 'warning',
       })
-      .webp({ quality: 84, effort: 4 })
-      .toBuffer();
-  } catch {
-    throw requestError('图片无法解析或尺寸异常。', 415, 'IMAGE_INVALID');
-  }
+        .rotate()
+        .resize(width, height, {
+          fit: 'cover',
+          position: 'attention',
+        })
+        .webp({ quality: 84, effort: 4 })
+        .toBuffer();
+    } catch {
+      throw requestError('图片无法解析或尺寸异常。', 415, 'IMAGE_INVALID');
+    }
+  });
 }
 
 
@@ -2939,25 +3565,27 @@ async function prepareQrLogoUpload(req) {
       'QR_LOGO_TYPE',
     );
   }
-  const input = await readBody(req, MAX_QR_LOGO_BYTES);
-  if (!input.length || !mediaContentMatchesMime(input, mime)) {
-    throw requestError('二维码图片内容无效。', 415, 'QR_LOGO_SIGNATURE');
-  }
-  try {
-    return await sharp(input, {
-      limitInputPixels: 24_000_000,
-      failOn: 'warning',
-    })
-      .rotate()
-      .resize(512, 512, {
-        fit: 'contain',
-        background: { r: 255, g: 255, b: 255, alpha: 0 },
+  return withImageTransformSlot(async () => {
+    const input = await readBody(req, MAX_QR_LOGO_BYTES);
+    if (!input.length || !mediaContentMatchesMime(input, mime)) {
+      throw requestError('二维码图片内容无效。', 415, 'QR_LOGO_SIGNATURE');
+    }
+    try {
+      return await sharp(input, {
+        limitInputPixels: 24_000_000,
+        failOn: 'warning',
       })
-      .webp({ quality: 88, effort: 4, alphaQuality: 100 })
-      .toBuffer();
-  } catch {
-    throw requestError('二维码图片无法解析或尺寸异常。', 415, 'QR_LOGO_INVALID');
-  }
+        .rotate()
+        .resize(512, 512, {
+          fit: 'contain',
+          background: { r: 255, g: 255, b: 255, alpha: 0 },
+        })
+        .webp({ quality: 88, effort: 4, alphaQuality: 100 })
+        .toBuffer();
+    } catch {
+      throw requestError('二维码图片无法解析或尺寸异常。', 415, 'QR_LOGO_INVALID');
+    }
+  });
 }
 
 function escapeQrSvgText(value) {
@@ -3204,7 +3832,7 @@ function realtimeConfig() {
     iceServers,
     turnConfigured: Boolean(WEBRTC_TURN_URLS.length && WEBRTC_TURN_USERNAME && WEBRTC_TURN_CREDENTIAL),
     pushEnabled: WEB_PUSH_ENABLED,
-    vapidPublicKey: WEB_PUSH_ENABLED ? VAPID_PUBLIC_KEY : '',
+    vapidPublicKey: '',
   };
 }
 
@@ -3289,94 +3917,6 @@ async function removePushSubscription(payload, body) {
      WHERE endpoint=$1 AND tenant_id=$2 AND conversation_id=$3`,
     [endpoint, payload.tenantId, payload.conversationId],
   );
-}
-
-async function sendConversationPushNotification(
-  conversationId,
-  tenantId,
-  messageRows = [],
-) {
-  if (!WEB_PUSH_ENABLED || conversationHasLiveVisitor(conversationId, tenantId)) {
-    return;
-  }
-  const subscriptions = await pool.query(
-    `SELECT endpoint,p256dh,auth
-     FROM push_subscriptions
-     WHERE tenant_id=$1 AND conversation_id=$2`,
-    [tenantId, conversationId],
-  );
-  if (!subscriptions.rows.length) return;
-  const config = await getConfig(tenantId);
-  const first = messageRows[0] || {};
-  const body = first.type === 'text'
-    ? cleanText(first.text, 120)
-    : first.type === 'audio'
-      ? '你收到了一条新语音消息'
-      : first.type === 'video'
-        ? '你收到了一条新视频消息'
-        : '你收到了一条新图片消息';
-  const payload = JSON.stringify({
-    title: config.settings.siteName || '在线客服',
-    body: body || '客服给你发送了新消息',
-    tenantCode: (await getTenantById(tenantId))?.public_code || '',
-    conversationId,
-    tag: `chat-${conversationId}`,
-  });
-  const stale = [];
-  await Promise.allSettled(subscriptions.rows.map(async (row) => {
-    try {
-      await webpush.sendNotification(
-        {
-          endpoint: row.endpoint,
-          keys: { p256dh: row.p256dh, auth: row.auth },
-        },
-        payload,
-        { TTL: 300, urgency: 'high' },
-      );
-    } catch (error) {
-      if ([404, 410].includes(Number(error?.statusCode))) stale.push(row.endpoint);
-      else console.error('Web Push 发送失败：', error.message);
-    }
-  }));
-  if (stale.length) {
-    await pool.query(`DELETE FROM push_subscriptions WHERE endpoint = ANY($1::text[])`, [stale]);
-  }
-}
-
-async function sendConversationCallNotification(conversationId, tenantId) {
-  if (!WEB_PUSH_ENABLED || conversationHasLiveVisitor(conversationId, tenantId)) return;
-  const subscriptions = await pool.query(
-    `SELECT endpoint,p256dh,auth FROM push_subscriptions
-     WHERE tenant_id=$1 AND conversation_id=$2`,
-    [tenantId, conversationId],
-  );
-  if (!subscriptions.rows.length) return;
-  const config = await getConfig(tenantId);
-  const tenant = await getTenantById(tenantId);
-  const payload = JSON.stringify({
-    title: config.settings.siteName || '在线客服',
-    body: '客服正在呼叫你，点击返回会话接听。',
-    tenantCode: tenant?.public_code || '',
-    conversationId,
-    tag: `call-${conversationId}`,
-    requireInteraction: true,
-  });
-  const stale = [];
-  await Promise.allSettled(subscriptions.rows.map(async (row) => {
-    try {
-      await webpush.sendNotification(
-        { endpoint: row.endpoint, keys: { p256dh: row.p256dh, auth: row.auth } },
-        payload,
-        { TTL: 60, urgency: 'high' },
-      );
-    } catch (error) {
-      if ([404, 410].includes(Number(error?.statusCode))) stale.push(row.endpoint);
-      else console.error('Web Push 来电提醒失败：', error.message);
-    }
-  }));
-  if (stale.length) {
-    await pool.query(`DELETE FROM push_subscriptions WHERE endpoint = ANY($1::text[])`, [stale]);
-  }
 }
 
 function conversationBase(row) {
@@ -3469,7 +4009,8 @@ async function getConfig(tenantId, client = pool) {
         tc.retention_hours,
         tc.frontend_template_id,
         ft.name AS frontend_template_name,
-        ft.base_url AS frontend_base_url
+        ft.base_url AS frontend_base_url,
+        ft.origin AS frontend_origin
       FROM tenant_config tc
       LEFT JOIN frontend_templates ft ON ft.id = tc.frontend_template_id
       WHERE tc.tenant_id = $1
@@ -3493,6 +4034,8 @@ async function getConfig(tenantId, client = pool) {
         result.rows[0].frontend_template_name || '拓界经典版',
       frontendBaseUrl:
         result.rows[0].frontend_base_url || DEFAULT_USER_SITE_URL,
+      frontendOrigin:
+        result.rows[0].frontend_origin || new URL(DEFAULT_USER_SITE_URL).origin,
     },
   };
   return client === pool
@@ -3592,6 +4135,14 @@ function tenantEntryUrl(settings, publicCode) {
   const url = new URL(base);
   url.searchParams.set('tenant', publicCode);
   return url.toString();
+}
+
+function tenantQrEntryUrl(publicCode) {
+  const base = new URL(QR_ENTRY_BASE);
+  base.pathname = `${base.pathname.replace(/\/+$/, '')}/q/${encodeURIComponent(publicCode)}`;
+  base.search = '';
+  base.hash = '';
+  return base.toString();
 }
 
 async function getPlatformSettings(client = pool) {
@@ -4781,7 +5332,7 @@ async function handleUpload(req, res, payload, conversation) {
     });
   } catch (error) {
     minuteCounters.uploadFailures += 1;
-    if (storedInR2) await queueObjectDeletes([objectKey]).catch(() => {});
+    if (storedInR2) await rollbackFreshObject(objectKey);
     throw error;
   }
 }
@@ -6003,6 +6554,8 @@ async function handleTenantLogin(req, res) {
       targetType: 'tenant',
       targetId: license?.tenant_id || '',
       result: 'failed',
+      actorTenantId: license?.tenant_id || '',
+      actorLicenseId: license?.id || '',
       metadata: { code: cleanText(error.code || 'ERROR', 80) },
     }).catch(() => {});
     if (error.code === 'TENANT_EXPIRED') {
@@ -6014,6 +6567,9 @@ async function handleTenantLogin(req, res) {
   await writeAudit(req, null, 'tenant.login', {
     targetType: 'tenant',
     targetId: tenant.id,
+    actorTenantId: tenant.id,
+    actorLicenseId: license.id,
+    metadata: { newlyActivated },
   }).catch(() => {});
   if (newlyActivated) {
     requestExpiryReminderReschedule();
@@ -6148,6 +6704,34 @@ function telegramOperatorAllowed(chat, userId) {
     ['group', 'supergroup'].includes(chat?.type) &&
       TELEGRAM_ALLOWED_GROUP_IDS.has(String(chat.id)),
   );
+}
+
+async function telegramOperatorAllowedAsync(chat, userId) {
+  if (telegramOperatorAllowed(chat, userId)) return true;
+  if (
+    userId == null ||
+    !['group', 'supergroup'].includes(chat?.type)
+  ) return false;
+  const settings = await getPlatformSettings().catch(() => null);
+  const chatId = String(chat.id);
+  if (
+    !TELEGRAM_ALLOWED_GROUP_IDS.has(chatId) &&
+    String(settings?.telegramGroupId || '') !== chatId
+  ) return false;
+
+  const cacheKey = `${chatId}:${userId}`;
+  const cached = telegramGroupAdminCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.allowed;
+  const member = await telegramApi('getChatMember', {
+    chat_id: chat.id,
+    user_id: userId,
+  }).catch(() => null);
+  const allowed = ['creator', 'administrator'].includes(member?.status);
+  telegramGroupAdminCache.set(cacheKey, {
+    allowed,
+    expiresAt: Date.now() + 5 * 60_000,
+  });
+  return allowed;
 }
 
 async function telegramApi(method, payload) {
@@ -6551,29 +7135,50 @@ async function clearQrIncidentKeyboard(incident) {
 }
 
 function domainChangeMessage(oldDomain, newDomain) {
-  return `域名 ${oldDomain} 已更换为 ${newDomain}。之前域名的链接和二维码已不可使用，请立即使用新域名和新二维码。`;
+  return `模板域名已由 ${oldDomain} 更换为 ${newDomain}。二维码属于活码，可以继续长期使用；旧链接现已不可用，请在“链接生成”中复制新的链接。`;
 }
 
 async function publishDomainChange(incident, oldDomain, newDomain) {
   const message = domainChangeMessage(oldDomain, newDomain);
-  publishEvent(
-    {
-      type: 'platform-domain-changed',
-      oldDomain,
-      newDomain,
-      tenantId: incident.tenant_id,
-      tenantName: incident.tenant_name || '',
-      templateName: incident.template_name || '',
-      message,
-      at: nowIso(),
-    },
-    { targetKind: 'tenant_admin' },
+  const affected = await pool.query(
+    `SELECT tenant_id FROM tenant_config WHERE frontend_template_id=$1`,
+    [incident.template_id],
   );
+  const tenantIds = affected.rows.map((row) => row.tenant_id).filter(isUuid);
+  if (tenantIds.length) {
+    await pool.query(
+      `
+        INSERT INTO announcements (
+          id,type,title,content,scope,tenant_ids,starts_at,ends_at,
+          display_mode,force_modal,active
+        ) VALUES (
+          $1,'important','用户端模板域名已更换',$2,'selected',$3::jsonb,
+          NOW(),NOW() + INTERVAL '30 days','both',TRUE,TRUE
+        )
+      `,
+      [randomUUID(), message, JSON.stringify(tenantIds)],
+    );
+  }
+  for (const tenantId of tenantIds) {
+    publishEvent(
+      {
+        type: 'platform-domain-changed',
+        oldDomain,
+        newDomain,
+        tenantId,
+        templateName: incident.template_name || '',
+        message,
+        at: nowIso(),
+      },
+      { tenantId, targetKind: 'tenant_admin' },
+    );
+  }
   broadcastSuper({
     type: 'frontend_catalog_updated',
     oldDomain,
     newDomain,
   });
+  return tenantIds.length;
 }
 
 async function sendQrResolvedTelegram(incident, oldDomain, newDomain, source) {
@@ -6593,7 +7198,7 @@ async function sendQrResolvedTelegram(incident, oldDomain, newDomain, source) {
       `<b>旧域名</b>：<code>${escapeTelegramHtml(oldDomain)}</code>`,
       `<b>新域名</b>：<code>${escapeTelegramHtml(newDomain)}</code>`,
       '',
-      '已向所有在线租户后台推送更换通知。旧链接和旧二维码已不可使用。',
+      '已向正在使用该模板的租户推送并保存通知。旧链接已不可用，原二维码为活码，可继续使用。',
     ].join('\n'),
     parse_mode: 'HTML',
     link_preview_options: { is_disabled: true },
@@ -6638,7 +7243,14 @@ async function resolveQrIncidentDomain(
       SET status='processing',
           resolved_by_telegram_user_id=$2,
           processing_started_at=NOW(),error='',updated_at=NOW()
-      WHERE id=$1 AND status IN ('open','failed')
+      WHERE id=$1
+        AND (
+          status IN ('open','failed')
+          OR (
+            status='processing'
+            AND processing_started_at < NOW() - INTERVAL '15 minutes'
+          )
+        )
       RETURNING id
     `,
     [incident.id, cleanText(telegramUserId, 80)],
@@ -6746,13 +7358,13 @@ async function sendQrReviewTelegram(incident, domain, clickCount, reason = '') {
       `<b>编号</b>：<code>${escapeTelegramHtml(incident.public_code)}</code>`,
       `<b>模板</b>：${escapeTelegramHtml(incident.template_name)}`,
       `<b>异常域名</b>：<code>${escapeTelegramHtml(domain)}</code>`,
-      `<b>30分钟点击次数</b>：<code>${clickCount}</code>`,
+      `<b>${QR_INCIDENT_WINDOW_MINUTES}分钟点击次数</b>：<code>${clickCount}</code>`,
       incident.reporter_key_suffix
         ? `<b>报告卡密</b>：<code>${escapeTelegramHtml(`${incident.reporter_key_prefix || ''}***${incident.reporter_key_suffix}`)}</code>`
         : '<b>报告卡密</b>：未知',
       '',
-      clickCount >= 6
-        ? '⚠️ 该租户在半小时内点击二维码异常达到 6 次以上，请管理员先核实。'
+      clickCount >= QR_INCIDENT_REVIEW_THRESHOLD
+        ? `⚠️ 该租户在${QR_INCIDENT_WINDOW_MINUTES}分钟内点击二维码异常达到 ${QR_INCIDENT_REVIEW_THRESHOLD} 次以上，请管理员先核实。`
         : `自动更换未完成：${escapeTelegramHtml(reason || '未知错误')}`,
       '核实后可点击下方按钮自动处理。',
     ].join('\n'),
@@ -6793,8 +7405,9 @@ async function createQrIncidentReport(tenant, template, reporter = {}) {
   const countResult = await pool.query(
     `SELECT COUNT(*)::int AS count
      FROM qr_incident_reports
-     WHERE tenant_id=$1 AND reported_at >= NOW() - INTERVAL '30 minutes'`,
-    [tenant.id],
+     WHERE tenant_id=$1
+       AND reported_at >= NOW() - ($2::int * INTERVAL '1 minute')`,
+    [tenant.id, QR_INCIDENT_WINDOW_MINUTES],
   );
   const clickCount = Number(countResult.rows[0]?.count || 1);
 
@@ -6808,14 +7421,14 @@ async function createQrIncidentReport(tenant, template, reporter = {}) {
   if (existing.rows[0]) {
     await pool.query(
       `UPDATE qr_incidents
-       SET click_count_30m=$2,reporter_license_id=COALESCE($3,reporter_license_id),
+       SET click_count_10m=$2,reporter_license_id=COALESCE($3,reporter_license_id),
            requires_admin_review=requires_admin_review OR $4,updated_at=NOW()
        WHERE id=$1`,
       [
         existing.rows[0].id,
         clickCount,
         isUuid(reporter.licenseId) ? reporter.licenseId : null,
-        clickCount >= 6,
+        clickCount >= QR_INCIDENT_REVIEW_THRESHOLD,
       ],
     );
     return {
@@ -6823,7 +7436,7 @@ async function createQrIncidentReport(tenant, template, reporter = {}) {
       duplicate: true,
       status: existing.rows[0].status,
       clickCount,
-      requiresAdminReview: clickCount >= 6,
+      requiresAdminReview: clickCount >= QR_INCIDENT_REVIEW_THRESHOLD,
     };
   }
 
@@ -6831,7 +7444,7 @@ async function createQrIncidentReport(tenant, template, reporter = {}) {
   await pool.query(
     `INSERT INTO qr_incidents (
        id,tenant_id,template_id,reported_base_url,status,
-       reporter_license_id,click_count_30m,requires_admin_review
+       reporter_license_id,click_count_10m,requires_admin_review
      ) VALUES ($1,$2,$3,$4,'open',$5,$6,$7)`,
     [
       incidentId,
@@ -6840,13 +7453,13 @@ async function createQrIncidentReport(tenant, template, reporter = {}) {
       template.base_url,
       isUuid(reporter.licenseId) ? reporter.licenseId : null,
       clickCount,
-      clickCount >= 6,
+      clickCount >= QR_INCIDENT_REVIEW_THRESHOLD,
     ],
   );
   let incident = await getQrIncident(incidentId);
   const domain = displayTemplateDomain(template.base_url);
 
-  if (clickCount >= 6) {
+  if (clickCount >= QR_INCIDENT_REVIEW_THRESHOLD) {
     await sendQrReviewTelegram(incident, domain, clickCount);
     broadcastSuper({ type: 'qr-incident-updated' });
     return {
@@ -6970,7 +7583,7 @@ async function handleQrIncidentCallback(callback) {
   if (!match || !isUuid(match[2])) return false;
   const chat = callback.message?.chat;
   const userId = callback.from?.id;
-  if (!telegramOperatorAllowed(chat, userId)) {
+  if (!(await telegramOperatorAllowedAsync(chat, userId))) {
     await telegramApi('answerCallbackQuery', {
       callback_query_id: callback.id,
       text: '当前用户或群组未被授权。',
@@ -7053,9 +7666,343 @@ async function handleQrIncidentDomainReply(message, targetDomain) {
   }
 }
 
+async function clearTelegramCallbackKeyboard(message) {
+  if (!message?.chat?.id || !message?.message_id) return;
+  await telegramApi('editMessageReplyMarkup', {
+    chat_id: message.chat.id,
+    message_id: message.message_id,
+    reply_markup: { inline_keyboard: [] },
+  }).catch(() => {});
+}
+
+async function handleSecurityEventCallback(callback) {
+  const match = String(callback?.data || '').match(
+    /^sec:(license|ip|dismiss):([0-9a-f-]+)$/i,
+  );
+  if (!match || !isUuid(match[2])) return false;
+  const chat = callback.message?.chat;
+  const userId = callback.from?.id;
+  if (!(await telegramOperatorAllowedAsync(chat, userId))) {
+    await telegramApi('answerCallbackQuery', {
+      callback_query_id: callback.id,
+      text: '仅该管理群的管理员可以执行此操作。',
+      show_alert: true,
+    });
+    return true;
+  }
+  await telegramApi('answerCallbackQuery', {
+    callback_query_id: callback.id,
+    text: '正在处理…',
+  }).catch(() => {});
+
+  try {
+    const eventResult = await pool.query(
+      `
+        SELECT se.*,t.name AS tenant_name,t.public_code,
+               lk.key_prefix,lk.key_suffix,lk.status AS license_status,
+               lk.tenant_id AS license_tenant_id
+        FROM security_events se
+        LEFT JOIN tenants t ON t.id=se.tenant_id
+        LEFT JOIN license_keys lk ON lk.id=se.license_id
+        WHERE se.id=$1
+        LIMIT 1
+      `,
+      [match[2]],
+    );
+    const event = eventResult.rows[0];
+    if (!event) throw new Error('安全事件不存在。');
+    if (event.status !== 'open') {
+      await clearTelegramCallbackKeyboard(callback.message);
+      throw new Error('该安全事件已经被处理。');
+    }
+
+    let resultText = '';
+    let disconnectedTenantId = '';
+    if (match[1] === 'license') {
+      if (!isUuid(event.license_id)) throw new Error('该事件没有可封禁的关联卡密。');
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const licenseResult = await client.query(
+          `SELECT id,status,tenant_id FROM license_keys WHERE id=$1 FOR UPDATE`,
+          [event.license_id],
+        );
+        const license = licenseResult.rows[0];
+        if (!license) throw new Error('关联卡密不存在。');
+        if (license.status !== 'revoked') {
+          await client.query(
+            `UPDATE license_keys
+             SET status='revoked',revoked_at=NOW(),updated_at=NOW()
+             WHERE id=$1`,
+            [license.id],
+          );
+        }
+        if (isUuid(license.tenant_id)) {
+          await client.query(
+            `UPDATE tenants
+             SET status='suspended',session_version=session_version+1,
+                 updated_at=NOW()
+             WHERE id=$1`,
+            [license.tenant_id],
+          );
+          disconnectedTenantId = license.tenant_id;
+        }
+        await client.query(
+          `UPDATE security_events
+           SET status='blocked',handled_by_telegram_user_id=$2,
+               handled_at=NOW(),updated_at=NOW()
+           WHERE id=$1`,
+          [event.id, String(userId || '')],
+        );
+        await client.query(
+          `INSERT INTO audit_logs (actor_license_id,action,target_type,target_id,metadata)
+           VALUES ($1,'security.license_block','security_event',$2,$3::jsonb)`,
+          [
+            event.license_id,
+            event.id,
+            JSON.stringify({
+              telegramUserId: String(userId || ''),
+              tenantId: disconnectedTenantId || event.tenant_id || '',
+              kind: event.kind,
+            }),
+          ],
+        );
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+      resultText = `⛔ 已封禁卡密 ${event.key_prefix || 'VIP'}-***-${event.key_suffix || '?????'}${disconnectedTenantId ? '，并立即中断该租户会话' : ''}。`;
+    } else if (match[1] === 'ip') {
+      if (!isIP(event.ip_address)) throw new Error('该事件没有可封禁的有效 IP。');
+      const expiresAt = new Date(
+        Date.now() + SECURITY_IP_BLOCK_HOURS * 60 * 60_000,
+      );
+      await pool.query(
+        `
+          INSERT INTO blocked_ips (
+            ip_address,reason,security_event_id,
+            blocked_by_telegram_user_id,expires_at
+          ) VALUES ($1,$2,$3,$4,$5)
+          ON CONFLICT (ip_address) DO UPDATE SET
+            reason=EXCLUDED.reason,
+            security_event_id=EXCLUDED.security_event_id,
+            blocked_by_telegram_user_id=EXCLUDED.blocked_by_telegram_user_id,
+            expires_at=EXCLUDED.expires_at,updated_at=NOW()
+        `,
+        [
+          event.ip_address,
+          `Telegram 处理安全事件：${event.kind}`,
+          event.id,
+          String(userId || ''),
+          expiresAt.toISOString(),
+        ],
+      );
+      await pool.query(
+        `UPDATE security_events
+         SET status='blocked',handled_by_telegram_user_id=$2,
+             handled_at=NOW(),updated_at=NOW()
+         WHERE id=$1`,
+        [event.id, String(userId || '')],
+      );
+      blockedIpCache.set(event.ip_address, expiresAt.getTime());
+      resultText = `🛡 已封禁 IP ${event.ip_address} ${SECURITY_IP_BLOCK_HOURS} 小时。`;
+    } else {
+      await pool.query(
+        `UPDATE security_events
+         SET status='dismissed',handled_by_telegram_user_id=$2,
+             handled_at=NOW(),updated_at=NOW()
+         WHERE id=$1`,
+        [event.id, String(userId || '')],
+      );
+      resultText = '✅ 该安全事件已标记为已核实，未封禁用户。';
+    }
+
+    await clearTelegramCallbackKeyboard(callback.message);
+    if (disconnectedTenantId) {
+      invalidateTenantCaches(disconnectedTenantId);
+      disconnectTenant(disconnectedTenantId, {
+        type: 'license-revoked',
+        message: `你的卡密已被管理员禁用，如有疑问请联系 Telegram ${CUSTOMER_SERVICE_TELEGRAM}。`,
+        supportTelegram: CUSTOMER_SERVICE_TELEGRAM,
+        at: nowIso(),
+      });
+      broadcastSuper({ type: 'licenses-updated' });
+      broadcastSuper({ type: 'tenants-updated' });
+    }
+    await telegramApi('sendMessage', {
+      chat_id: chat.id,
+      text: resultText,
+      ...telegramThread(callback.message),
+    });
+  } catch (error) {
+    await telegramApi('sendMessage', {
+      chat_id: chat.id,
+      text: `❌ 处理失败：${cleanText(error.message, 300)}`,
+      ...telegramThread(callback.message),
+    }).catch(() => {});
+  }
+  return true;
+}
+
+async function telegramUserIsBlocked(userId) {
+  const key = String(userId || '');
+  if (!/^\d+$/.test(key)) return false;
+  const cached = telegramBlockedUserCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.blocked;
+  const result = await pool.query(
+    `SELECT 1 FROM telegram_blocked_users WHERE user_id=$1 LIMIT 1`,
+    [key],
+  );
+  const blocked = Boolean(result.rows[0]);
+  telegramBlockedUserCache.set(key, {
+    blocked,
+    expiresAt: Date.now() + (blocked ? 10 : 1) * 60_000,
+  });
+  return blocked;
+}
+
+function telegramPrivateContent(message) {
+  const text = cleanText(message.text || message.caption, 1500);
+  if (text) return text;
+  if (message.photo) return '[图片]';
+  if (message.video) return '[视频]';
+  if (message.voice) return '[语音]';
+  if (message.audio) return '[音频]';
+  if (message.document) return `[文件] ${cleanText(message.document.file_name, 200)}`;
+  if (message.sticker) return `[贴纸] ${cleanText(message.sticker.emoji, 20)}`;
+  if (message.contact) return '[联系人]';
+  if (message.location) return '[位置]';
+  return '[不支持预览的消息类型]';
+}
+
+function telegramUserChatUrl(user) {
+  const username = cleanText(user?.username, 80);
+  return /^[A-Za-z0-9_]{5,32}$/.test(username)
+    ? `https://t.me/${username}`
+    : `tg://user?id=${encodeURIComponent(String(user?.id || ''))}`;
+}
+
+async function handleTelegramPrivateInbound(message) {
+  if (message?.chat?.type !== 'private' || message?.from?.is_bot) return false;
+  const userId = String(message.from?.id || '');
+  if (!/^\d+$/.test(userId) || TELEGRAM_ALLOWED_USER_IDS.has(userId)) {
+    return false;
+  }
+  if (await telegramUserIsBlocked(userId)) {
+    await telegramApi('sendMessage', {
+      chat_id: message.chat.id,
+      text: '你已被管理员禁止访问机器人。你的 Telegram 用户 ID 和相关记录已被保留；Telegram 机器人无法获取你的 IP。',
+    }).catch(() => {});
+    return true;
+  }
+  const settings = await getPlatformSettings().catch(() => null);
+  if (!settings?.telegramGroupId) {
+    await telegramApi('sendMessage', {
+      chat_id: message.chat.id,
+      text: '管理员消息群尚未配置，请稍后再试。',
+    }).catch(() => {});
+    return true;
+  }
+  const displayName = telegramDisplayName(message.from) || '未设置姓名';
+  const username = cleanText(message.from.username, 80);
+  await telegramApi('sendMessage', {
+    chat_id: settings.telegramGroupId,
+    text: [
+      '<b>📨 机器人收到新私信</b>',
+      '',
+      `<b>用户</b>：${escapeTelegramHtml(displayName)}`,
+      `<b>用户名</b>：${username ? `@${escapeTelegramHtml(username)}` : '未设置'}`,
+      `<b>Telegram ID</b>：<code>${escapeTelegramHtml(userId)}</code>`,
+      `<b>内容</b>：${escapeTelegramHtml(telegramPrivateContent(message))}`,
+    ].join('\n'),
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '💬 点击与他聊天', url: telegramUserChatUrl(message.from) }],
+        [{ text: '⛔ 禁止他访问机器人', callback_data: `tg:block:${userId}` }],
+      ],
+    },
+  });
+  if (!message.text && !message.caption) {
+    await telegramApi('copyMessage', {
+      chat_id: settings.telegramGroupId,
+      from_chat_id: message.chat.id,
+      message_id: message.message_id,
+    }).catch(() => {});
+  }
+  await telegramApi('sendMessage', {
+    chat_id: message.chat.id,
+    text: '✅ 你的消息已转发给管理员。',
+  }).catch(() => {});
+  return true;
+}
+
+async function handleTelegramUserBlockCallback(callback) {
+  const match = String(callback?.data || '').match(/^tg:block:(\d+)$/);
+  if (!match) return false;
+  const chat = callback.message?.chat;
+  const operatorId = callback.from?.id;
+  if (!(await telegramOperatorAllowedAsync(chat, operatorId))) {
+    await telegramApi('answerCallbackQuery', {
+      callback_query_id: callback.id,
+      text: '仅该管理群的管理员可以执行此操作。',
+      show_alert: true,
+    });
+    return true;
+  }
+  const targetUserId = match[1];
+  await telegramApi('answerCallbackQuery', {
+    callback_query_id: callback.id,
+    text: '正在禁止该用户…',
+  }).catch(() => {});
+  const userChat = await telegramApi('getChat', {
+    chat_id: targetUserId,
+  }).catch(() => ({}));
+  await pool.query(
+    `
+      INSERT INTO telegram_blocked_users (
+        user_id,username,display_name,reason,blocked_by_telegram_user_id
+      ) VALUES ($1,$2,$3,$4,$5)
+      ON CONFLICT (user_id) DO UPDATE SET
+        username=EXCLUDED.username,display_name=EXCLUDED.display_name,
+        reason=EXCLUDED.reason,
+        blocked_by_telegram_user_id=EXCLUDED.blocked_by_telegram_user_id,
+        updated_at=NOW()
+    `,
+    [
+      targetUserId,
+      cleanText(userChat.username, 80),
+      telegramDisplayName(userChat),
+      '管理群管理员通过私信通知封禁',
+      String(operatorId || ''),
+    ],
+  );
+  telegramBlockedUserCache.set(targetUserId, {
+    blocked: true,
+    expiresAt: Number.POSITIVE_INFINITY,
+  });
+  await clearTelegramCallbackKeyboard(callback.message);
+  await telegramApi('sendMessage', {
+    chat_id: targetUserId,
+    text: '你已被管理员禁止访问机器人。你的 Telegram 用户 ID 和相关记录已被保留；Telegram 机器人无法获取你的 IP。',
+  }).catch(() => {});
+  await telegramApi('sendMessage', {
+    chat_id: chat.id,
+    text: `⛔ 已禁止 Telegram 用户 ${targetUserId} 继续访问机器人。`,
+    ...telegramThread(callback.message),
+  });
+  return true;
+}
+
 async function processTelegramUpdate(update) {
   const message = update?.message;
   const callback = update?.callback_query;
+
+  if (message && (await handleTelegramPrivateInbound(message))) return;
 
   if (message?.text) {
     const chat = message.chat;
@@ -7090,7 +8037,7 @@ async function processTelegramUpdate(update) {
       !qrDomainReply.matched
     ) return;
 
-    if (!telegramOperatorAllowed(chat, userId)) {
+    if (!(await telegramOperatorAllowedAsync(chat, userId))) {
       await telegramApi('sendMessage', {
         chat_id: chatId,
         text: '⛔ 当前用户或群组未被授权使用此机器人。',
@@ -7230,13 +8177,21 @@ async function processTelegramUpdate(update) {
     if (await handleQrIncidentCallback(callback)) return;
   }
 
+  if (callback?.data?.startsWith('sec:')) {
+    if (await handleSecurityEventCallback(callback)) return;
+  }
+
+  if (callback?.data?.startsWith('tg:block:')) {
+    if (await handleTelegramUserBlockCallback(callback)) return;
+  }
+
   if (callback?.data?.startsWith('license:')) {
     const chat = callback.message?.chat;
     const chatId = chat?.id;
     const userId = callback.from?.id;
     const code = callback.data.slice(8);
 
-    if (!telegramOperatorAllowed(chat, userId)) {
+    if (!(await telegramOperatorAllowedAsync(chat, userId))) {
       await telegramApi('answerCallbackQuery', {
         callback_query_id: callback.id,
         text: '当前用户或群组未被授权。',
@@ -8897,10 +9852,20 @@ async function getSuperLicensePage(options = {}) {
 }
 
 async function getSuperTenants(
-  { cursor = null, limit = 10000, search = '' } = {},
+  { cursor = null, limit = 10000, search = '', status = '' } = {},
 ) {
   const decoded = decodeCursor(cursor);
   const keyword = cleanText(search, 120).trim();
+  const requestedStatus = [
+    'active',
+    'expired',
+    'revoked',
+    'archived',
+    'superseded',
+    'none',
+  ].includes(status)
+    ? status
+    : '';
   const result = await pool.query(`
     WITH tenant_page AS MATERIALIZED (
       SELECT
@@ -8909,6 +9874,8 @@ async function getSuperTenants(
         l.key_prefix,
         l.key_suffix,
         l.key_ciphertext,
+        l.duration_code,
+        l.duration_days,
         l.expires_at,
         l.status AS license_status,
         l.generated_by_admin_id,
@@ -8951,8 +9918,15 @@ async function getSuperTenants(
           OR COALESCE(owner_d.username,'') ILIKE '%' || $3 || '%'
           OR COALESCE(owner_d.display_name,'') ILIKE '%' || $3 || '%'
         )
+        AND (
+          $4::text=''
+          OR ($4='active' AND l.status='active' AND l.expires_at>NOW())
+          OR ($4='expired' AND l.status='active' AND l.expires_at<=NOW())
+          OR ($4='none' AND l.id IS NULL)
+          OR ($4 NOT IN ('active','expired','none') AND l.status=$4)
+        )
       ORDER BY t.updated_at DESC,t.id DESC
-      LIMIT $4
+      LIMIT $5
     )
     SELECT
       t.*,
@@ -8979,7 +9953,13 @@ async function getSuperTenants(
       WHERE c.tenant_id = t.id
     ) media ON TRUE
     ORDER BY t.updated_at DESC,t.id DESC
-  `, [decoded?.at || null, decoded?.id || null, keyword, limit]);
+  `, [
+    decoded?.at || null,
+    decoded?.id || null,
+    keyword,
+    requestedStatus,
+    limit,
+  ]);
   return result.rows.map((row) => ({
     id: row.id,
     publicCode: row.public_code,
@@ -8999,7 +9979,19 @@ async function getSuperTenants(
     maskedKey: row.license_id
       ? decryptLicenseKey(row.key_ciphertext) || licenseHint(row)
       : '',
-    licenseStatus: row.license_status || '',
+    licenseStatus: row.license_id
+      ? effectiveLicenseStatus({
+          status: row.license_status,
+          expires_at: row.expires_at,
+        })
+      : '',
+    licenseDurationCode: row.duration_code || '',
+    licenseDurationDays: Number(row.duration_days || 0),
+    licenseDurationLabel:
+      LICENSE_DURATIONS[row.duration_code]?.label || row.duration_code || '',
+    licenseExpiresAt: row.expires_at
+      ? new Date(row.expires_at).toISOString()
+      : null,
     generator:
       row.generated_by_username ||
       (row.generated_by_distributor_username
@@ -9427,7 +10419,7 @@ async function handleDistributorLogin(req, res) {
   const row = result.rows[0];
   const passwordOk = row
     ? verifyPassword(body.password, row.password_hash)
-    : verifyPassword(body.password, hashPassword('invalid-password'));
+    : verifyPassword(body.password, DUMMY_PASSWORD_HASH);
   if (!row?.enabled || !passwordOk) {
     await writeDistributorAudit(
       req,
@@ -9939,7 +10931,7 @@ async function handleSuperLogin(req, res) {
   const row = result.rows[0];
   const passwordOk = row
     ? verifyPassword(body.password, row.password_hash)
-    : verifyPassword(body.password, hashPassword('invalid-password'));
+    : verifyPassword(body.password, DUMMY_PASSWORD_HASH);
   const secret = row?.totp_secret_ciphertext
     ? decryptSecret(row.totp_secret_ciphertext)
     : '';
@@ -9974,6 +10966,7 @@ async function handleSuperLogin(req, res) {
       kind: 'super_admin',
       adminId: row.id,
       sessionVersion: Number(row.session_version),
+      clientOrigin: normalizeOrigin(req.headers.origin),
     },
     8 * 60 * 60,
   );
@@ -10063,7 +11056,6 @@ async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
   }
   const admin = await authenticateSuper(req);
   if (!admin) {
-    res.setHeader('Set-Cookie', sessionCookie('', 0));
     if (req.method === 'GET' && pathname === '/api/super/bootstrap') {
       return sendJson(res, 200, {
         ok: true,
@@ -10525,6 +11517,70 @@ async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
     return sendJson(res, 201, { ok: true, licenses });
   }
 
+  if (
+    req.method === 'POST' &&
+    pathname === '/api/super/licenses/archive-expired'
+  ) {
+    requireRole(admin, 'manager');
+    const client = await pool.connect();
+    let archived = [];
+    try {
+      await client.query('BEGIN');
+      const result = await client.query(
+        `
+          UPDATE license_keys
+          SET status='archived',archived_at=NOW(),updated_at=NOW()
+          WHERE status='active' AND expires_at<=NOW()
+          RETURNING id,tenant_id,generated_by_distributor_id
+        `,
+      );
+      archived = result.rows;
+      const tenantIds = [...new Set(
+        archived.map((row) => row.tenant_id).filter(isUuid),
+      )];
+      if (tenantIds.length) {
+        await client.query(
+          `UPDATE tenants
+           SET status='suspended',session_version=session_version+1,
+               updated_at=NOW()
+           WHERE id=ANY($1::uuid[])`,
+          [tenantIds],
+        );
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    const tenantIds = [...new Set(
+      archived.map((row) => row.tenant_id).filter(isUuid),
+    )];
+    for (const tenantId of tenantIds) {
+      invalidateTenantAccessCaches(tenantId);
+      disconnectTenant(tenantId, {
+        type: 'force-logout',
+        message: '卡密已到期并归档。',
+        at: nowIso(),
+      });
+    }
+    await writeAudit(req, admin, 'license.archive_expired', {
+      targetType: 'license_batch',
+      metadata: {
+        count: archived.length,
+        tenantCount: tenantIds.length,
+      },
+    });
+    broadcastSuper({ type: 'licenses-updated' });
+    if (tenantIds.length) broadcastSuper({ type: 'tenants-updated' });
+    return sendJson(res, 200, {
+      ok: true,
+      archivedCount: archived.length,
+      tenantCount: tenantIds.length,
+    });
+  }
+
   const licenseMatch = pathname.match(
     /^\/api\/super\/licenses\/([0-9a-f-]+)(?:\/(reveal|copy))?$/i,
   );
@@ -10732,6 +11788,7 @@ async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
           cursor: url.searchParams.get('cursor'),
           limit: pageLimit(url),
           search: url.searchParams.get('search') || '',
+          status: url.searchParams.get('status') || '',
         })
       : null;
     return sendJson(res, 200, {
@@ -11680,6 +12737,16 @@ return sendJson(res, 200, { ok: true });
     pathname === '/api/super/templates/validate'
   ) {
     requireRole(admin, 'operations');
+    if (
+      !rateLimit(
+        req,
+        res,
+        'template-validate',
+        20,
+        10 * 60_000,
+        admin.id,
+      )
+    ) return;
     const body = await readJson(req, 32 * 1024);
     const baseUrl = cleanText(body.baseUrl, 500);
     const minimumVersion =
@@ -11701,7 +12768,9 @@ return sendJson(res, 200, { ok: true });
           status: 0,
           clientVersion: '',
           apiBase: '',
+          contractVersion: '',
           contractReady: false,
+          missingMarkers: [],
           compatible: false,
           message: cleanText(error.message, 300),
         },
@@ -11741,6 +12810,8 @@ return sendJson(res, 200, { ok: true });
         finalUrl: fetched.finalUrl,
         status: fetched.status,
         clientVersion: contract.clientVersion,
+        contractVersion: contract.contractVersion,
+        missingMarkers: contract.missingMarkers,
       },
     });
     return sendJson(res, 200, {
@@ -11751,7 +12822,9 @@ return sendJson(res, 200, { ok: true });
         finalUrl: fetched.finalUrl,
         clientVersion: contract.clientVersion,
         apiBase: contract.apiBase,
+        contractVersion: contract.contractVersion,
         contractReady: contract.contractReady,
+        missingMarkers: contract.missingMarkers,
         backendCompatible,
         compatible,
         message,
@@ -11765,6 +12838,16 @@ return sendJson(res, 200, { ok: true });
     const templateId = templateMatch[1];
     if (req.method === 'POST' && templateMatch[2] === 'cover') {
       requireRole(admin, 'operations');
+      if (
+        !rateLimit(
+          req,
+          res,
+          'template-cover-upload',
+          12,
+          10 * 60_000,
+          admin.id,
+        )
+      ) return;
       const data = await prepareImageUpload(req, {
         maxBytes: MAX_COVER_BYTES,
         width: 1200,
@@ -12016,11 +13099,32 @@ return sendJson(res, 200, { ok: true });
           CASE WHEN d.username IS NOT NULL
             THEN '二级代理 · ' || d.username
             ELSE NULL
-          END
-        ) AS username
+          END,
+          CASE WHEN actor_tenant.id IS NOT NULL
+            THEN '租户 · ' || COALESCE(NULLIF(actor_tenant.name,''),actor_tenant.public_code)
+            ELSE NULL
+          END,
+          '系统任务'
+        ) AS username,
+        CASE
+          WHEN sa.id IS NOT NULL THEN 'super_admin'
+          WHEN d.id IS NOT NULL THEN 'distributor'
+          WHEN actor_tenant.id IS NOT NULL THEN 'tenant'
+          ELSE 'system'
+        END AS actor_type,
+        actor_tenant.name AS actor_tenant_name,
+        actor_tenant.public_code AS actor_tenant_code,
+        actor_tenant.note AS actor_tenant_note,
+        actor_license.key_prefix AS actor_license_prefix,
+        actor_license.key_suffix AS actor_license_suffix,
+        actor_license.duration_code AS actor_license_duration_code,
+        actor_license.status AS actor_license_status,
+        actor_license.expires_at AS actor_license_expires_at
       FROM audit_logs al
       LEFT JOIN super_admins sa ON sa.id=al.actor_admin_id
       LEFT JOIN distributors d ON d.id=al.actor_distributor_id
+      LEFT JOIN tenants actor_tenant ON actor_tenant.id=al.actor_tenant_id
+      LEFT JOIN license_keys actor_license ON actor_license.id=al.actor_license_id
       WHERE ($1::bigint IS NULL OR al.id < $1)
       ORDER BY al.id DESC
       LIMIT $2
@@ -12175,10 +13279,13 @@ async function getReadinessStatus() {
   }
 }
 
-async function router(req, res) {
+async function router(req, res, parsedRequestUrl = null) {
   setCommonHeaders(req, res);
 
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const url = parsedRequestUrl || parseRequestUrl(req.url);
+  if (!url) {
+    return sendError(res, 400, '请求地址格式无效。', 'INVALID_URL');
+  }
   const rawPathname = url.pathname.replace(/\/+$/, '') || '/';
 
   if (req.method === 'GET' && rawPathname === '/health/live') {
@@ -12219,6 +13326,49 @@ async function router(req, res) {
       databaseTime: readiness.databaseTime,
       cacheSeconds: READINESS_CACHE_MS / 1000,
     });
+  }
+
+  await refreshBlockedIpCache();
+  const ipAddress = requestIp(req);
+  if (ipIsBlocked(ipAddress)) {
+    return sendError(res, 403, '此网络地址已被管理员禁止访问。', 'IP_BLOCKED');
+  }
+  const suspicious = suspiciousRequest(req, rawPathname);
+  if (suspicious) {
+    scheduleSecurityAnomaly({
+      kind: suspicious.kind,
+      req,
+      severity: 'critical',
+      count: 1,
+      threshold: 1,
+      details: { path: rawPathname, reason: suspicious.reason },
+    });
+    return sendError(res, 404, '资源不存在。', 'NOT_FOUND');
+  }
+  if (
+    rawPathname.startsWith('/api/') &&
+    rawPathname !== '/api/telegram/webhook' &&
+    !rateLimit(req, res, 'api-request', 360, 60_000)
+  ) return;
+
+  const qrEntryMatch = rawPathname.match(/^\/q\/([A-Za-z0-9_-]{8,80})$/);
+  if (['GET', 'HEAD'].includes(req.method) && qrEntryMatch) {
+    if (!rateLimit(req, res, 'qr-entry', 120, 60_000)) return;
+    const publicCode = cleanText(qrEntryMatch[1], 80);
+    const tenant = await getTenantByCode(publicCode);
+    if (!tenant) {
+      return sendError(res, 404, '二维码入口不存在。', 'QR_NOT_FOUND');
+    }
+    if (tenantAccessIssue(tenant)) {
+      return sendError(res, 410, '该二维码对应的客服服务当前不可用。', 'QR_INACTIVE');
+    }
+    const config = await getConfig(tenant.id);
+    const target = tenantEntryUrl(config.settings, tenant.public_code);
+    res.statusCode = 302;
+    res.setHeader('Location', target);
+    res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    return res.end();
   }
 
   await refreshApprovedOrigins();
@@ -12346,6 +13496,14 @@ async function router(req, res) {
     if (body.clientTemplateId && !isUuid(body.clientTemplateId)) {
       return sendError(res, 400, '用户端模板标识无效。', 'CLIENT_TEMPLATE');
     }
+    if (REQUIRE_CLIENT_TEMPLATE_ID && !body.clientTemplateId) {
+      return sendError(
+        res,
+        403,
+        '当前用户端缺少受信任的模板标识。',
+        'CLIENT_TEMPLATE',
+      );
+    }
     const selectedTemplateId = config.settings.frontendTemplateId;
     if (
       !isUuid(selectedTemplateId) ||
@@ -12357,6 +13515,31 @@ async function router(req, res) {
         403,
         '此链接不是该租户当前选择的用户端。',
         'CLIENT_TEMPLATE',
+      );
+    }
+    const approvedTemplateOrigin = normalizeOrigin(
+      config.settings.frontendOrigin,
+    );
+    if (
+      STRICT_CLIENT_ORIGIN &&
+      (!requestOrigin || requestOrigin !== approvedTemplateOrigin)
+    ) {
+      scheduleSecurityAnomaly({
+        kind: 'template-origin-mismatch',
+        req,
+        severity: 'critical',
+        tenantId: tenant.id,
+        details: {
+          path: pathname,
+          requestOrigin: requestOrigin || '(missing)',
+          approvedOrigin: approvedTemplateOrigin,
+        },
+      });
+      return sendError(
+        res,
+        403,
+        '此页面来源不是该租户当前批准的用户端。',
+        'CLIENT_ORIGIN',
       );
     }
     const template = await pool.query(
@@ -12451,8 +13634,12 @@ async function router(req, res) {
           cleanText(body.referrerUrl, 500),
           cleanText(body.networkType, 30),
           cleanText(body.networkEffectiveType, 30),
-          Number.isFinite(downlink) ? downlink : null,
-          Number.isFinite(rtt) ? Math.trunc(rtt) : null,
+          Number.isFinite(downlink)
+            ? Math.max(0, Math.min(10000, downlink))
+            : null,
+          Number.isFinite(rtt)
+            ? Math.max(0, Math.min(120000, Math.trunc(rtt)))
+            : null,
           typeof body.saveData === 'boolean' ? body.saveData : null,
           resolvedClientTemplateId,
           cleanText(body.clientVersion, 30),
@@ -12513,6 +13700,22 @@ async function router(req, res) {
         conversationId,
         tenant.id,
       );
+      observeBehaviorCounter(req, {
+        kind: 'visitor-session-ip',
+        key: `${tenant.id}:${requestIp(req)}`,
+        limit: ANOMALY_VISITOR_IP_LIMIT,
+        tenantId: tenant.id,
+        conversationId,
+        details: { path: pathname },
+      });
+      observeBehaviorCounter(req, {
+        kind: 'visitor-session-tenant',
+        key: tenant.id,
+        limit: ANOMALY_VISITOR_TENANT_LIMIT,
+        tenantId: tenant.id,
+        conversationId,
+        details: { path: pathname },
+      });
     }
     return sendJson(res, 201, {
       ok: true,
@@ -12528,6 +13731,8 @@ async function router(req, res) {
           conversationId,
           visitorKey,
           sessionVersion: Number(tenant.session_version || 1),
+          clientOrigin: requestOrigin,
+          clientTemplateId: resolvedClientTemplateId,
         },
         tenant.access_expires_at,
       ),
@@ -12571,6 +13776,22 @@ async function router(req, res) {
       )
     ) {
       return sendError(res, 401, '登录已失效。', 'AUTH');
+    }
+    if (payload.kind === 'user' && !userTokenOriginAllowed(req, payload)) {
+      scheduleSecurityAnomaly({
+        kind: 'user-token-origin-mismatch',
+        req,
+        severity: 'critical',
+        tenantId: payload.tenantId,
+        conversationId: payload.conversationId,
+        details: { path: pathname },
+      });
+      return sendError(
+        res,
+        403,
+        '访客会话不能在其他站点使用。',
+        'CLIENT_ORIGIN',
+      );
     }
 
     let tenant = null;
@@ -12794,6 +14015,22 @@ async function router(req, res) {
         'AUTH',
       );
     }
+    if (!userTokenOriginAllowed(req, payload)) {
+      scheduleSecurityAnomaly({
+        kind: 'user-token-origin-mismatch',
+        req,
+        severity: 'critical',
+        tenantId: payload.tenantId,
+        conversationId: payload.conversationId,
+        details: { path: pathname },
+      });
+      return sendError(
+        res,
+        403,
+        '访客会话不能在其他站点使用。',
+        'CLIENT_ORIGIN',
+      );
+    }
 
     const tenant = await getTenantById(payload.tenantId);
     if (tenantAccessIssue(tenant)) return sendTenantAccessError(res,tenant,'user');
@@ -12944,6 +14181,10 @@ async function router(req, res) {
           40,
           60_000,
           `${payload.tenantId}:${conversation.id}`,
+          {
+            tenantId: payload.tenantId,
+            conversationId: conversation.id,
+          },
         )
       ) return;
       const body = await readJson(req);
@@ -12953,6 +14194,25 @@ async function router(req, res) {
         payload.tenantId,
         { includeConversation: apiVersion < 2 },
       );
+      const messageIncrement = Math.max(1, result.messages?.length || 1);
+      observeBehaviorCounter(req, {
+        kind: 'message-conversation',
+        key: `${payload.tenantId}:${conversation.id}`,
+        limit: ANOMALY_MESSAGE_CONVERSATION_LIMIT,
+        tenantId: payload.tenantId,
+        conversationId: conversation.id,
+        increment: messageIncrement,
+        details: { path: pathname },
+      });
+      observeBehaviorCounter(req, {
+        kind: 'message-tenant',
+        key: payload.tenantId,
+        limit: ANOMALY_MESSAGE_TENANT_LIMIT,
+        tenantId: payload.tenantId,
+        conversationId: conversation.id,
+        increment: messageIncrement,
+        details: { path: pathname },
+      });
       await broadcastMessageResult(
         result,
         'user-message',
@@ -13022,6 +14282,7 @@ async function router(req, res) {
         settings: config.settings,
         templates,
         entryUrl: tenantEntryUrl(config.settings, tenant.public_code),
+        qrEntryUrl: tenantQrEntryUrl(tenant.public_code),
         ...notices,
       });
     }
@@ -13068,6 +14329,7 @@ async function router(req, res) {
           config.settings,
           activeTenant.public_code,
         ),
+        qrEntryUrl: tenantQrEntryUrl(activeTenant.public_code),
         ...notices,
       });
     }
@@ -13138,7 +14400,7 @@ async function router(req, res) {
       } finally {
         databaseClient.release();
       }
-      await writeAudit(req, null, 'tenant.config.update', {
+      await writeTenantAudit(req, payload, 'tenant.config.update', {
         targetType: 'tenant',
         targetId: payload.tenantId,
         metadata: {
@@ -13162,6 +14424,7 @@ async function router(req, res) {
         autoReplies: updated.autoReplies,
         settings: updated.settings,
         entryUrl: tenantEntryUrl(updated.settings, tenant.public_code),
+        qrEntryUrl: tenantQrEntryUrl(tenant.public_code),
       });
     }
 
@@ -13170,6 +14433,17 @@ async function router(req, res) {
       pathname === '/api/admin/brand/avatar'
     ) {
       await requireTenantFeature('tenant_branding', payload.tenantId);
+      if (
+        !rateLimit(
+          req,
+          res,
+          'tenant-avatar-upload',
+          12,
+          10 * 60_000,
+          payload.tenantId,
+          { tenantId: payload.tenantId, licenseId: payload.licenseId },
+        )
+      ) return;
       const data = await prepareImageUpload(req, {
         maxBytes: MAX_AVATAR_BYTES,
         width: 512,
@@ -13202,7 +14476,7 @@ async function router(req, res) {
         await deleteAsset(oldAssetId, payload.tenantId);
       }
       invalidateTenantCaches(payload.tenantId);
-      await writeAudit(req, null, 'tenant.avatar.update', {
+      await writeTenantAudit(req, payload, 'tenant.avatar.update', {
         targetType: 'tenant',
         targetId: payload.tenantId,
       }).catch((error) =>
@@ -13241,7 +14515,7 @@ async function router(req, res) {
         await deleteAsset(oldAssetId, payload.tenantId);
       }
       invalidateTenantCaches(payload.tenantId);
-      await writeAudit(req, null, 'tenant.avatar.delete', {
+      await writeTenantAudit(req, payload, 'tenant.avatar.delete', {
         targetType: 'tenant',
         targetId: payload.tenantId,
       }).catch((error) =>
@@ -13256,6 +14530,17 @@ async function router(req, res) {
     }
 
     if (req.method === 'POST' && pathname === '/api/admin/qr/logo') {
+      if (
+        !rateLimit(
+          req,
+          res,
+          'tenant-qr-logo-upload',
+          12,
+          10 * 60_000,
+          payload.tenantId,
+          { tenantId: payload.tenantId, licenseId: payload.licenseId },
+        )
+      ) return;
       const data = await prepareQrLogoUpload(req);
       const current = await getConfig(payload.tenantId);
       const oldAssetId = cleanText(current.settings.qrLogoAssetId, 80);
@@ -13290,7 +14575,7 @@ async function router(req, res) {
         null,
         payload.tenantId,
       );
-      await writeAudit(req, null, 'tenant.qr_logo.update', {
+      await writeTenantAudit(req, payload, 'tenant.qr_logo.update', {
         targetType: 'tenant',
         targetId: payload.tenantId,
       }).catch(() => {});
@@ -13323,7 +14608,7 @@ async function router(req, res) {
         null,
         payload.tenantId,
       );
-      await writeAudit(req, null, 'tenant.qr_logo.delete', {
+      await writeTenantAudit(req, payload, 'tenant.qr_logo.delete', {
         targetType: 'tenant',
         targetId: payload.tenantId,
       }).catch(() => {});
@@ -13396,7 +14681,7 @@ async function router(req, res) {
       const incident = await createQrIncidentReport(activeTenant, template, {
         licenseId: payload.licenseId,
       });
-      await writeAudit(req, null, 'tenant.qr_incident.report', {
+      await writeTenantAudit(req, payload, 'tenant.qr_incident.report', {
         targetType: 'frontend_template',
         targetId: template.id,
         metadata: { incidentId: incident.id, duplicate: incident.duplicate },
@@ -13415,6 +14700,17 @@ async function router(req, res) {
     }
 
     if (req.method === 'GET' && pathname === '/api/admin/qr') {
+      if (
+        !rateLimit(
+          req,
+          res,
+          'tenant-qr-render',
+          30,
+          60_000,
+          payload.tenantId,
+          { tenantId: payload.tenantId, licenseId: payload.licenseId },
+        )
+      ) return;
       const config = await getConfig(payload.tenantId);
       const previewTemplateId = cleanText(
         url.searchParams.get('templateId'),
@@ -13452,7 +14748,8 @@ async function router(req, res) {
           frontendBaseUrl: template.rows[0].base_url,
         };
       }
-      const entryUrl = tenantEntryUrl(entrySettings, activeTenant.public_code);
+      // 活码只保存稳定跳转入口；模板预览与后续换域名不会改变二维码内容。
+      const entryUrl = tenantQrEntryUrl(activeTenant.public_code);
       const logoData = await readTenantQrLogo(
         payload.tenantId,
         config.settings.qrLogoAssetId,
@@ -13546,28 +14843,40 @@ async function router(req, res) {
       }
       await requireTenantFeature('message_actions', payload.tenantId);
       if (req.method === 'DELETE' && !messageActionMatch[3]) {
+        const deleted = await deleteAdminMessage(
+          conversationId,
+          messageId,
+          payload.tenantId,
+          apiVersion,
+        );
+        await writeTenantAudit(req, payload, 'tenant.message.delete', {
+          targetType: 'message',
+          targetId: messageId,
+          metadata: { conversationId },
+        }).catch(() => {});
         return sendJson(res, 200, {
           ok: true,
-          ...(await deleteAdminMessage(
-            conversationId,
-            messageId,
-            payload.tenantId,
-            apiVersion,
-          )),
+          ...deleted,
         });
       }
       if (
         req.method === 'POST' &&
         messageActionMatch[3] === 'recall'
       ) {
+        const recalled = await recallAdminMessage(
+          conversationId,
+          messageId,
+          payload.tenantId,
+          apiVersion,
+        );
+        await writeTenantAudit(req, payload, 'tenant.message.recall', {
+          targetType: 'message',
+          targetId: messageId,
+          metadata: { conversationId },
+        }).catch(() => {});
         return sendJson(res, 200, {
           ok: true,
-          ...(await recallAdminMessage(
-            conversationId,
-            messageId,
-            payload.tenantId,
-            apiVersion,
-          )),
+          ...recalled,
         });
       }
     }
@@ -13674,6 +14983,22 @@ async function router(req, res) {
           `,
           [conversationId, status, visitorName, visitorNote, payload.tenantId],
         );
+        const changedFields = [];
+        if (status !== conversation.status) changedFields.push('status');
+        if (visitorName !== conversation.visitor_name) changedFields.push('visitorName');
+        if (visitorNote !== (conversation.visitor_note || '')) changedFields.push('visitorNote');
+        if (changedFields.length) {
+          await writeTenantAudit(req, payload, 'tenant.conversation.update', {
+            targetType: 'conversation',
+            targetId: conversationId,
+            metadata: {
+              changedFields,
+              status,
+              visitorName,
+              hasVisitorNote: Boolean(visitorNote),
+            },
+          }).catch(() => {});
+        }
 
         const summary = await getConversationSummaryById(
           conversationId,
@@ -13757,6 +15082,13 @@ async function router(req, res) {
           conversationId,
           payload.tenantId,
         );
+        await writeTenantAudit(req, payload, 'tenant.conversation.delete', {
+          targetType: 'conversation',
+          targetId: conversationId,
+          metadata: {
+            visitorName: cleanText(conversation.visitor_name, 40),
+          },
+        }).catch(() => {});
         return sendJson(res, 200, { ok: true });
       }
 
@@ -13776,11 +15108,6 @@ async function router(req, res) {
             targetKind: 'user',
           },
         );
-        if (signal.action === 'offer') {
-          sendConversationCallNotification(conversationId, payload.tenantId).catch((error) => {
-            console.error('发送来电推送失败：', error.message);
-          });
-        }
         return sendJson(res, 200, { ok: true });
       }
 
@@ -13813,13 +15140,6 @@ async function router(req, res) {
           payload.tenantId,
           apiVersion,
         );
-        sendConversationPushNotification(
-          conversationId,
-          payload.tenantId,
-          result.messages || (result.message ? [result.message] : []),
-        ).catch((error) =>
-          console.error('离线推送处理失败：', error.message),
-        );
         return sendJson(res, 201, {
           ok: true,
           message: result.message,
@@ -13834,6 +15154,14 @@ async function router(req, res) {
     const payload = authenticate(req);
     if (!payload) {
       return sendError(res, 401, '没有权限读取媒体。', 'AUTH');
+    }
+    if (payload.kind === 'user' && !userTokenOriginAllowed(req, payload)) {
+      return sendError(
+        res,
+        403,
+        '访客会话不能在其他站点使用。',
+        'CLIENT_ORIGIN',
+      );
     }
 
     const attachmentId = safeDecodeURIComponent(
@@ -13912,7 +15240,12 @@ async function router(req, res) {
 
 const server = http.createServer((req, res) => {
   const requestStartedAt = performance.now();
-  const requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const requestUrl = parseRequestUrl(req.url);
+  if (!requestUrl) {
+    setCommonHeaders(req, res);
+    sendError(res, 400, '请求地址格式无效。', 'INVALID_URL');
+    return;
+  }
   const rawRequestPath = requestUrl.pathname.replace(/\/+$/, '') || '/';
   const requestPath = normalizeApiPath(rawRequestPath).pathname;
   minuteCounters.requests += 1;
@@ -13948,7 +15281,7 @@ const server = http.createServer((req, res) => {
     routeCounters.set(routeKey, routeMetric);
     if (res.statusCode < 500) scheduleActiveDatabaseWork(requestPath);
   });
-  router(req, res).catch((error) => {
+  router(req, res, requestUrl).catch((error) => {
     console.error('请求处理失败：', error);
     if (res.headersSent) {
       res.destroy();
