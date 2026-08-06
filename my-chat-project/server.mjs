@@ -35,7 +35,7 @@ const PUBLIC_API_BASE = String(
 const QR_ENTRY_BASE = String(
   process.env.QR_ENTRY_BASE || PUBLIC_API_BASE,
 ).replace(/\/+$/, '');
-const APP_VERSION = String(process.env.APP_VERSION || '2.3.1').trim();
+const APP_VERSION = String(process.env.APP_VERSION || '2.3.2').trim();
 const SUPPORT_TELEGRAM = String(
   process.env.SUPPORT_TELEGRAM || '@YingYingUu',
 ).trim();
@@ -724,7 +724,7 @@ async function initDatabase() {
         key_ciphertext TEXT,
         key_prefix TEXT NOT NULL,
         key_suffix TEXT NOT NULL,
-        duration_code TEXT NOT NULL CHECK (duration_code IN ('1d','7d','30d','180d','365d')),
+        duration_code TEXT NOT NULL CHECK (duration_code IN ('1h','1d','7d','30d','180d','365d')),
         duration_days INTEGER NOT NULL CHECK (duration_days > 0),
         status TEXT NOT NULL DEFAULT 'unused' CHECK (status IN ('unused','active','superseded','revoked')),
         telegram_chat_id TEXT,
@@ -946,7 +946,7 @@ async function initDatabase() {
       CREATE TABLE IF NOT EXISTS distributor_license_quotas (
         distributor_id UUID NOT NULL REFERENCES distributors(id) ON DELETE CASCADE,
         duration_code TEXT NOT NULL
-          CHECK (duration_code IN ('1d','7d','30d','180d','365d')),
+          CHECK (duration_code IN ('1h','1d','7d','30d','180d','365d')),
         remaining_count INTEGER NOT NULL DEFAULT 0 CHECK (remaining_count >= 0),
         generated_count BIGINT NOT NULL DEFAULT 0 CHECK (generated_count >= 0),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -958,7 +958,7 @@ async function initDatabase() {
         id BIGSERIAL PRIMARY KEY,
         distributor_id UUID NOT NULL REFERENCES distributors(id) ON DELETE CASCADE,
         duration_code TEXT NOT NULL
-          CHECK (duration_code IN ('1d','7d','30d','180d','365d')),
+          CHECK (duration_code IN ('1h','1d','7d','30d','180d','365d')),
         action TEXT NOT NULL,
         change_amount INTEGER NOT NULL,
         balance_before INTEGER NOT NULL CHECK (balance_before >= 0),
@@ -1216,6 +1216,24 @@ async function initDatabase() {
     `);
 
     await client.query(`
+      CREATE TABLE IF NOT EXISTS visitor_groups (
+        id UUID PRIMARY KEY,
+        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        name TEXT NOT NULL CHECK (char_length(name) BETWEEN 1 AND 40),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS visitor_groups_tenant_name_unique_idx
+      ON visitor_groups (tenant_id, lower(name))
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS visitor_groups_tenant_updated_idx
+      ON visitor_groups (tenant_id, updated_at DESC)
+    `);
+
+    await client.query(`
       CREATE TABLE IF NOT EXISTS conversations (
         id UUID PRIMARY KEY,
         visitor_key_hash TEXT NOT NULL,
@@ -1248,6 +1266,7 @@ async function initDatabase() {
     await client.query(`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS client_template_id UUID`);
     await client.query(`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS client_version TEXT NOT NULL DEFAULT ''`);
     await client.query(`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ`);
+    await client.query(`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS visitor_group_id UUID REFERENCES visitor_groups(id) ON DELETE SET NULL`);
     await client.query(`ALTER TABLE license_keys ADD COLUMN IF NOT EXISTS telegram_username TEXT`);
     await client.query(`ALTER TABLE license_keys ADD COLUMN IF NOT EXISTS telegram_display_name TEXT`);
     await client.query(`ALTER TABLE license_keys ADD COLUMN IF NOT EXISTS key_ciphertext TEXT`);
@@ -1389,6 +1408,48 @@ async function initDatabase() {
         IF NOT EXISTS (
           SELECT 1
           FROM pg_constraint
+          WHERE conrelid = 'license_keys'::regclass
+            AND conname = 'license_keys_duration_code_check'
+            AND pg_get_constraintdef(oid) LIKE '%1h%'
+        ) THEN
+          ALTER TABLE license_keys
+            DROP CONSTRAINT IF EXISTS license_keys_duration_code_check;
+          ALTER TABLE license_keys
+            ADD CONSTRAINT license_keys_duration_code_check
+            CHECK (duration_code IN ('1h','1d','7d','30d','180d','365d'));
+        END IF;
+
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conrelid = 'distributor_license_quotas'::regclass
+            AND conname = 'distributor_license_quotas_duration_code_check'
+            AND pg_get_constraintdef(oid) LIKE '%1h%'
+        ) THEN
+          ALTER TABLE distributor_license_quotas
+            DROP CONSTRAINT IF EXISTS distributor_license_quotas_duration_code_check;
+          ALTER TABLE distributor_license_quotas
+            ADD CONSTRAINT distributor_license_quotas_duration_code_check
+            CHECK (duration_code IN ('1h','1d','7d','30d','180d','365d'));
+        END IF;
+
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conrelid = 'distributor_quota_logs'::regclass
+            AND conname = 'distributor_quota_logs_duration_code_check'
+            AND pg_get_constraintdef(oid) LIKE '%1h%'
+        ) THEN
+          ALTER TABLE distributor_quota_logs
+            DROP CONSTRAINT IF EXISTS distributor_quota_logs_duration_code_check;
+          ALTER TABLE distributor_quota_logs
+            ADD CONSTRAINT distributor_quota_logs_duration_code_check
+            CHECK (duration_code IN ('1h','1d','7d','30d','180d','365d'));
+        END IF;
+
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint
           WHERE conrelid = 'attachments'::regclass
             AND conname = 'attachments_mime_check'
             AND pg_get_constraintdef(oid) LIKE '%video/mp4%'
@@ -1472,6 +1533,10 @@ async function initDatabase() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS conversations_tenant_page_idx
       ON conversations (tenant_id, updated_at DESC, id DESC)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS conversations_tenant_group_page_idx
+      ON conversations (tenant_id, visitor_group_id, updated_at DESC, id DESC)
     `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS tenants_updated_page_idx
@@ -2092,11 +2157,12 @@ function sessionCookie(token, maxAge = 8 * 60 * 60) {
 }
 
 const LICENSE_DURATIONS = Object.freeze({
-  '1d': { label: '一日卡', days: 1 },
-  '7d': { label: '周卡', days: 7 },
-  '30d': { label: '月卡', days: 30 },
-  '180d': { label: '半年卡', days: 180 },
-  '365d': { label: '年卡', days: 365 },
+  '1h': { label: '一小时卡', days: 1, hours: 1 },
+  '1d': { label: '一日卡', days: 1, hours: 24 },
+  '7d': { label: '周卡', days: 7, hours: 7 * 24 },
+  '30d': { label: '月卡', days: 30, hours: 30 * 24 },
+  '180d': { label: '半年卡', days: 180, hours: 180 * 24 },
+  '365d': { label: '年卡', days: 365, hours: 365 * 24 },
 });
 const DISTRIBUTOR_DURATION_CODES = Object.freeze(
   Object.keys(LICENSE_DURATIONS),
@@ -2107,6 +2173,23 @@ function cleanDurationCodes(value) {
     ? [...new Set(value)].filter((code) => LICENSE_DURATIONS[code])
     : [];
 }
+
+function licenseDurationMilliseconds(license) {
+  const configured = LICENSE_DURATIONS[license?.duration_code];
+  if (Number.isFinite(configured?.hours) && configured.hours > 0) {
+    return configured.hours * 3_600_000;
+  }
+  return Math.max(1, Number(license?.duration_days || 1)) * 86_400_000;
+}
+
+function licenseUnusedDurationLabel(license) {
+  const configured = LICENSE_DURATIONS[license?.duration_code];
+  if (configured?.hours && configured.hours < 24) {
+    return `${configured.hours} 小时`;
+  }
+  return `${configured?.days || Math.max(1, Number(license?.duration_days || 1))} 天`;
+}
+
 function generateLicenseKey() {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
   const bytes = randomBytes(20);
@@ -3926,6 +4009,7 @@ function conversationBase(row) {
     tenantId: row.tenant_id || null,
     visitorName: row.visitor_name,
     visitorNote: row.visitor_note || '',
+    visitorGroupId: row.visitor_group_id || null,
     status: row.status,
     createdAt: new Date(row.created_at).toISOString(),
     updatedAt: new Date(row.updated_at).toISOString(),
@@ -4637,9 +4721,50 @@ async function getAllSummaries(tenantId) {
   return result.rows.map(conversationSummary);
 }
 
+const MAX_VISITOR_GROUPS_PER_TENANT = 50;
+
+function cleanVisitorGroupName(value) {
+  return cleanText(value, 40).replace(/\s+/g, ' ');
+}
+
+function publicVisitorGroupRow(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    visitorCount: Number(row.visitor_count || 0),
+    createdAt: new Date(row.created_at).toISOString(),
+    updatedAt: new Date(row.updated_at).toISOString(),
+  };
+}
+
+async function getVisitorGroups(tenantId, queryClient = pool) {
+  if (!isUuid(tenantId)) return [];
+  const result = await queryClient.query(
+    `
+      SELECT
+        vg.id,vg.name,vg.created_at,vg.updated_at,
+        COUNT(c.id)::int AS visitor_count
+      FROM visitor_groups vg
+      LEFT JOIN conversations c
+        ON c.tenant_id=vg.tenant_id
+       AND c.visitor_group_id=vg.id
+      WHERE vg.tenant_id=$1
+      GROUP BY vg.id,vg.name,vg.created_at,vg.updated_at
+      ORDER BY lower(vg.name),vg.id
+    `,
+    [tenantId],
+  );
+  return result.rows.map(publicVisitorGroupRow);
+}
+
 async function getAllSummariesPage(
   tenantId,
-  { cursor = null, limit = API_PAGE_DEFAULT, search = '' } = {},
+  {
+    cursor = null,
+    limit = API_PAGE_DEFAULT,
+    search = '',
+    groupId = '',
+  } = {},
 ) {
   if (!isUuid(tenantId)) {
     return {
@@ -4651,6 +4776,9 @@ async function getAllSummariesPage(
   }
   const decoded = decodeCursor(cursor);
   const keyword = cleanText(search, 120).trim();
+  const requestedGroup = cleanText(groupId, 50);
+  const selectedGroupId = isUuid(requestedGroup) ? requestedGroup : null;
+  const onlyUngrouped = requestedGroup === 'ungrouped';
   const result = await pool.query(
     `
       SELECT
@@ -4684,10 +4812,20 @@ async function getAllSummariesPage(
           OR c.ip_location ILIKE '%' || $4 || '%'
           OR COALESCE(latest.text,'') ILIKE '%' || $4 || '%'
         )
+        AND ($5::uuid IS NULL OR c.visitor_group_id=$5::uuid)
+        AND (NOT $6::boolean OR c.visitor_group_id IS NULL)
       ORDER BY c.updated_at DESC,c.id DESC
-      LIMIT ($5::int + 1)
+      LIMIT ($7::int + 1)
     `,
-    [tenantId, decoded?.at || null, decoded?.id || null, keyword, limit],
+    [
+      tenantId,
+      decoded?.at || null,
+      decoded?.id || null,
+      keyword,
+      selectedGroupId,
+      onlyUngrouped,
+      limit,
+    ],
   );
   const hasMore = result.rows.length > limit;
   const pageRows = result.rows.slice(0, limit);
@@ -6500,7 +6638,7 @@ async function handleTenantLogin(req, res) {
     }
     if (license.status === 'unused') {
       const tenantId = randomUUID();
-      const expiry = new Date(Date.now() + Number(license.duration_days) * 86_400_000);
+      const expiry = new Date(Date.now() + licenseDurationMilliseconds(license));
       const tenantResult = await client.query(
         `
           INSERT INTO tenants (
@@ -6635,7 +6773,7 @@ async function handleTenantRenew(req, res) {
       throw error;
     }
     const base = Math.max(Date.now(), new Date(tenant.access_expires_at).getTime());
-    newExpiry = new Date(base + Number(newLicense.duration_days) * 86_400_000);
+    newExpiry = new Date(base + licenseDurationMilliseconds(newLicense));
     const tenantResult = await client.query(
       `
         UPDATE tenants
@@ -6754,6 +6892,7 @@ async function telegramApi(method, payload) {
 function telegramGenerateKeyboard() {
   return {
     inline_keyboard: [
+      [{ text: '一小时卡', callback_data: 'license:1h' }],
       [
         { text: '一日卡', callback_data: 'license:1d' },
         { text: '周卡', callback_data: 'license:7d' },
@@ -6799,7 +6938,7 @@ function telegramGeneratedLicenseText(created) {
     '请保护好你的卡密 不要泄露！',
     '',
     `卡密类型：${created.duration.label}`,
-    `有效时长：首次登录后台后 ${created.duration.days} 天`,
+    `有效时长：首次登录后台后 ${licenseUnusedDurationLabel(created.row)}`,
     '',
     '<b>卡密</b>',
     `<code>${created.licenseKey}</code>`,
@@ -6964,7 +7103,7 @@ async function sendAllLicenses(chatId, message, requestedPage = 1) {
     const fullKey = decryptLicenseKey(row.key_ciphertext);
     const expiry =
       row.status === 'unused'
-        ? `首次登录后 ${row.duration_days} 天`
+        ? `首次登录后 ${licenseUnusedDurationLabel(row)}`
         : formatTelegramDate(row.expires_at);
     lines.push(
       `${offset + index + 1}. ${fullKey || `${licenseHint(row)}（历史卡密可按尾号禁用）`} · ${telegramLicenseStatus(row)}`,
@@ -9629,6 +9768,12 @@ function publicLicenseRow(row) {
     fullKey,
     durationCode: row.duration_code,
     durationDays: Number(row.duration_days),
+    durationHours: Number(
+      LICENSE_DURATIONS[row.duration_code]?.hours ||
+        Number(row.duration_days || 1) * 24,
+    ),
+    durationLabel:
+      LICENSE_DURATIONS[row.duration_code]?.label || row.duration_code,
     status: effectiveLicenseStatus(row),
     storedStatus: row.status,
     generator:
@@ -10000,6 +10145,10 @@ async function getSuperTenants(
       : '',
     licenseDurationCode: row.duration_code || '',
     licenseDurationDays: Number(row.duration_days || 0),
+    licenseDurationHours: Number(
+      LICENSE_DURATIONS[row.duration_code]?.hours ||
+        Number(row.duration_days || 0) * 24,
+    ),
     licenseDurationLabel:
       LICENSE_DURATIONS[row.duration_code]?.label || row.duration_code || '',
     licenseExpiresAt: row.expires_at
@@ -10204,6 +10353,12 @@ function publicDistributorLicenseRow(row, distributorId) {
     fullKey,
     durationCode: row.duration_code,
     durationDays: Number(row.duration_days),
+    durationHours: Number(
+      LICENSE_DURATIONS[row.duration_code]?.hours ||
+        Number(row.duration_days || 1) * 24,
+    ),
+    durationLabel:
+      LICENSE_DURATIONS[row.duration_code]?.label || row.duration_code,
     status: effectiveLicenseStatus(row),
     activatedAt: row.activated_at
       ? new Date(row.activated_at).toISOString()
@@ -14274,7 +14429,7 @@ async function router(req, res, parsedRequestUrl = null) {
 
     if (req.method === 'GET' && pathname === '/api/admin/bootstrap') {
       const tenant = activeTenant;
-      const [conversationResult, config, templates, notices] = await Promise.all([
+      const [conversationResult, config, templates, notices, visitorGroups] = await Promise.all([
         apiVersion >= 2
           ? getAllSummariesPage(payload.tenantId, {
               limit: pageLimit(url),
@@ -14283,6 +14438,7 @@ async function router(req, res, parsedRequestUrl = null) {
         getConfig(payload.tenantId),
         getTemplateCatalog({ tenantId: payload.tenantId }),
         getTenantNotices(payload.tenantId),
+        getVisitorGroups(payload.tenantId),
       ]);
       return sendJson(res, 200, {
         ok: true,
@@ -14301,6 +14457,7 @@ async function router(req, res, parsedRequestUrl = null) {
         autoReplies: config.autoReplies,
         settings: config.settings,
         templates,
+        visitorGroups,
         entryUrl: tenantEntryUrl(config.settings, tenant.public_code),
         qrEntryUrl: tenantQrEntryUrl(tenant.public_code),
         ...notices,
@@ -14313,6 +14470,7 @@ async function router(req, res, parsedRequestUrl = null) {
             cursor: url.searchParams.get('cursor'),
             limit: pageLimit(url),
             search: url.searchParams.get('search') || '',
+            groupId: url.searchParams.get('groupId') || '',
           })
         : null;
       const conversations = apiVersion >= 2
@@ -14331,6 +14489,186 @@ async function router(req, res, parsedRequestUrl = null) {
               }
             : undefined,
       });
+    }
+
+    if (req.method === 'GET' && pathname === '/api/admin/visitor-groups') {
+      return sendJson(res, 200, {
+        ok: true,
+        visitorGroups: await getVisitorGroups(payload.tenantId),
+      });
+    }
+
+    if (req.method === 'POST' && pathname === '/api/admin/visitor-groups') {
+      if (
+        !rateLimit(
+          req,
+          res,
+          'visitor-group-write',
+          60,
+          60_000,
+          payload.tenantId,
+        )
+      ) return;
+      const body = await readJson(req, 32 * 1024);
+      const name = cleanVisitorGroupName(body.name);
+      if (!name) {
+        return sendError(
+          res,
+          400,
+          '请输入分组名称。',
+          'VISITOR_GROUP_NAME',
+        );
+      }
+      const databaseClient = await pool.connect();
+      let groupId = '';
+      try {
+        await databaseClient.query('BEGIN');
+        await databaseClient.query(
+          `SELECT id FROM tenants WHERE id=$1 FOR UPDATE`,
+          [payload.tenantId],
+        );
+        const countResult = await databaseClient.query(
+          `SELECT COUNT(*)::int AS count FROM visitor_groups WHERE tenant_id=$1`,
+          [payload.tenantId],
+        );
+        if (Number(countResult.rows[0]?.count || 0) >= MAX_VISITOR_GROUPS_PER_TENANT) {
+          throw requestError(
+            `每个租户最多创建 ${MAX_VISITOR_GROUPS_PER_TENANT} 个访客分组。`,
+            409,
+            'VISITOR_GROUP_LIMIT',
+          );
+        }
+        groupId = randomUUID();
+        await databaseClient.query(
+          `
+            INSERT INTO visitor_groups (id,tenant_id,name)
+            VALUES ($1,$2,$3)
+          `,
+          [groupId, payload.tenantId, name],
+        );
+        await databaseClient.query('COMMIT');
+      } catch (error) {
+        await databaseClient.query('ROLLBACK').catch(() => {});
+        if (error.code === '23505') {
+          return sendError(
+            res,
+            409,
+            '已经存在同名访客分组。',
+            'VISITOR_GROUP_DUPLICATE',
+          );
+        }
+        throw error;
+      } finally {
+        databaseClient.release();
+      }
+      await writeTenantAudit(req, payload, 'tenant.visitor_group.create', {
+        targetType: 'visitor_group',
+        targetId: groupId,
+        metadata: { name },
+      }).catch(() => {});
+      const visitorGroups = await getVisitorGroups(payload.tenantId);
+      broadcast(
+        { type: 'visitor-groups-updated', visitorGroups },
+        null,
+        payload.tenantId,
+      );
+      return sendJson(res, 201, { ok: true, visitorGroups });
+    }
+
+    const visitorGroupMatch = pathname.match(
+      /^\/api\/admin\/visitor-groups\/([0-9a-f-]+)$/i,
+    );
+    if (visitorGroupMatch && isUuid(visitorGroupMatch[1])) {
+      const visitorGroupId = visitorGroupMatch[1];
+      if (
+        ['PATCH', 'DELETE'].includes(req.method) &&
+        !rateLimit(
+          req,
+          res,
+          'visitor-group-write',
+          60,
+          60_000,
+          payload.tenantId,
+        )
+      ) return;
+      if (req.method === 'PATCH') {
+        const body = await readJson(req, 32 * 1024);
+        const name = cleanVisitorGroupName(body.name);
+        if (!name) {
+          return sendError(
+            res,
+            400,
+            '请输入分组名称。',
+            'VISITOR_GROUP_NAME',
+          );
+        }
+        let updated;
+        try {
+          updated = await pool.query(
+            `
+              UPDATE visitor_groups
+              SET name=$3,updated_at=NOW()
+              WHERE id=$1 AND tenant_id=$2
+              RETURNING id
+            `,
+            [visitorGroupId, payload.tenantId, name],
+          );
+        } catch (error) {
+          if (error.code === '23505') {
+            return sendError(
+              res,
+              409,
+              '已经存在同名访客分组。',
+              'VISITOR_GROUP_DUPLICATE',
+            );
+          }
+          throw error;
+        }
+        if (!updated.rows[0]) {
+          return sendError(res, 404, '访客分组不存在。', 'NOT_FOUND');
+        }
+        await writeTenantAudit(req, payload, 'tenant.visitor_group.update', {
+          targetType: 'visitor_group',
+          targetId: visitorGroupId,
+          metadata: { name },
+        }).catch(() => {});
+        const visitorGroups = await getVisitorGroups(payload.tenantId);
+        broadcast(
+          { type: 'visitor-groups-updated', visitorGroups },
+          null,
+          payload.tenantId,
+        );
+        return sendJson(res, 200, { ok: true, visitorGroups });
+      }
+      if (req.method === 'DELETE') {
+        const deleted = await pool.query(
+          `
+            DELETE FROM visitor_groups
+            WHERE id=$1 AND tenant_id=$2
+            RETURNING name
+          `,
+          [visitorGroupId, payload.tenantId],
+        );
+        if (!deleted.rows[0]) {
+          return sendError(res, 404, '访客分组不存在。', 'NOT_FOUND');
+        }
+        await writeTenantAudit(req, payload, 'tenant.visitor_group.delete', {
+          targetType: 'visitor_group',
+          targetId: visitorGroupId,
+          metadata: { name: deleted.rows[0].name },
+        }).catch(() => {});
+        const visitorGroups = await getVisitorGroups(payload.tenantId);
+        broadcast(
+          {
+            type: 'visitor-groups-updated',
+            visitorGroups,
+            deletedGroupId: visitorGroupId,
+          },
+          null,
+          payload.tenantId,
+        );
+        return sendJson(res, 200, { ok: true, visitorGroups });
+      }
     }
 
     if (req.method === 'GET' && pathname === '/api/admin/config') {
@@ -14994,19 +15332,60 @@ async function router(req, res, parsedRequestUrl = null) {
             ? cleanText(body.visitorName, 40) || conversation.visitor_name
             : conversation.visitor_name;
         const visitorNote = body.visitorNote !== undefined ? cleanText(body.visitorNote,80) : conversation.visitor_note || '';
+        let visitorGroupId = conversation.visitor_group_id || null;
+        if (body.visitorGroupId !== undefined) {
+          if (body.visitorGroupId === null || body.visitorGroupId === '') {
+            visitorGroupId = null;
+          } else if (!isUuid(body.visitorGroupId)) {
+            return sendError(
+              res,
+              400,
+              '访客分组无效。',
+              'VISITOR_GROUP_INVALID',
+            );
+          } else {
+            const visitorGroup = await pool.query(
+              `SELECT id FROM visitor_groups WHERE id=$1 AND tenant_id=$2`,
+              [body.visitorGroupId, payload.tenantId],
+            );
+            if (!visitorGroup.rows[0]) {
+              return sendError(
+                res,
+                404,
+                '访客分组不存在。',
+                'VISITOR_GROUP_NOT_FOUND',
+              );
+            }
+            visitorGroupId = visitorGroup.rows[0].id;
+          }
+        }
 
         await pool.query(
           `
             UPDATE conversations
-            SET status = $2, visitor_name = $3, visitor_note = $4, updated_at = NOW()
-            WHERE id = $1 AND tenant_id = $5
+            SET status = $2,
+                visitor_name = $3,
+                visitor_note = $4,
+                visitor_group_id = $5,
+                updated_at = NOW()
+            WHERE id = $1 AND tenant_id = $6
           `,
-          [conversationId, status, visitorName, visitorNote, payload.tenantId],
+          [
+            conversationId,
+            status,
+            visitorName,
+            visitorNote,
+            visitorGroupId,
+            payload.tenantId,
+          ],
         );
         const changedFields = [];
         if (status !== conversation.status) changedFields.push('status');
         if (visitorName !== conversation.visitor_name) changedFields.push('visitorName');
         if (visitorNote !== (conversation.visitor_note || '')) changedFields.push('visitorNote');
+        const visitorGroupChanged =
+          visitorGroupId !== (conversation.visitor_group_id || null);
+        if (visitorGroupChanged) changedFields.push('visitorGroupId');
         if (changedFields.length) {
           await writeTenantAudit(req, payload, 'tenant.conversation.update', {
             targetType: 'conversation',
@@ -15016,6 +15395,7 @@ async function router(req, res, parsedRequestUrl = null) {
               status,
               visitorName,
               hasVisitorNote: Boolean(visitorNote),
+              visitorGroupId,
             },
           }).catch(() => {});
         }
@@ -15062,9 +15442,22 @@ async function router(req, res, parsedRequestUrl = null) {
             payload.tenantId,
           );
         }
+        let updatedVisitorGroups;
+        if (visitorGroupChanged) {
+          updatedVisitorGroups = await getVisitorGroups(payload.tenantId);
+          broadcast(
+            {
+              type: 'visitor-groups-updated',
+              visitorGroups: updatedVisitorGroups,
+            },
+            null,
+            payload.tenantId,
+          );
+        }
         return sendJson(res, 200, {
           ok: true,
           conversation: publicConversation,
+          visitorGroups: updatedVisitorGroups,
         });
       }
 
@@ -15109,6 +15502,14 @@ async function router(req, res, parsedRequestUrl = null) {
             visitorName: cleanText(conversation.visitor_name, 40),
           },
         }).catch(() => {});
+        if (conversation.visitor_group_id) {
+          const visitorGroups = await getVisitorGroups(payload.tenantId);
+          broadcast(
+            { type: 'visitor-groups-updated', visitorGroups },
+            null,
+            payload.tenantId,
+          );
+        }
         return sendJson(res, 200, { ok: true });
       }
 
