@@ -1,6 +1,6 @@
 {
   "name": "tuojie-cloud-service",
-  "version": "2.1.0",
+  "version": "2.3.1",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,14 +8,25 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs",
-    "test": "node --test tests/*.test.mjs"
+    "dev:frontend": "vite",
+    "build": "vite build",
+    "build:deployments": "node tools/build-deployments.mjs",
+    "preview": "vite preview",
+    "check": "node --check server.mjs && node tools/verify-frontends.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "verify": "npm run check && npm test && npm run build"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1097.0",
     "pg": "^8.22.0",
     "qrcode": "^1.5.4",
-    "sharp": "^0.35.3",
-    "web-push": "^3.6.7"
+    "sharp": "^0.35.3"
+  },
+  "devDependencies": {
+    "html-minifier-terser": "^7.2.0",
+    "javascript-obfuscator": "^4.2.2",
+    "postcss": "^8.5.26",
+    "terser": "^5.49.2",
+    "vite": "^7.3.6"
   }
 }
