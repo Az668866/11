@@ -3,7 +3,7 @@ services:
     name: neon-chat-backend
     runtime: node
     plan: standard
-    buildCommand: npm ci
+    buildCommand: npm ci --omit=dev
     startCommand: npm start
     healthCheckPath: /health
     envVars:
@@ -17,13 +17,23 @@ services:
         generateValue: true
       - key: PUBLIC_API_BASE
         value: https://api.ykf000.com
+      - key: QR_ENTRY_BASE
+        value: https://api.ykf000.com
       - key: APP_VERSION
-        value: 1.8.1
+        value: 2.3.1
       - key: SUPPORT_TELEGRAM
         value: "@YingYingUu"
       - key: COOKIE_DOMAIN
         value: .ykf000.com
       - key: REQUIRE_CLOUDFLARE
+        value: "false"
+      - key: STRICT_CLIENT_ORIGIN
+        value: "true"
+      - key: REQUIRE_CLIENT_TEMPLATE_ID
+        value: "false"
+      - key: LEGACY_API_ENABLED
+        value: "false"
+      - key: REQUIRE_SUPER_ADMIN_TOTP
         value: "false"
       - key: CLOUDFLARE_ORIGIN_SECRET
         sync: false
@@ -47,11 +57,33 @@ services:
         value: 1
       - key: MAX_CONCURRENT_UPLOADS
         value: 4
+      - key: QR_INCIDENT_WINDOW_MINUTES
+        value: 10
+      - key: QR_INCIDENT_REVIEW_THRESHOLD
+        value: 3
+      - key: ANOMALY_VISITOR_IP_10M
+        value: 12
+      - key: ANOMALY_VISITOR_TENANT_10M
+        value: 120
+      - key: ANOMALY_MESSAGES_CONVERSATION_10M
+        value: 80
+      - key: ANOMALY_MESSAGES_TENANT_10M
+        value: 600
+      - key: SECURITY_IP_BLOCK_HOURS
+        value: 24
+      - key: AUDIT_RETENTION_DAYS
+        value: 90
       - key: SUPER_ADMIN_USERNAME
         sync: false
       - key: SUPER_ADMIN_PASSWORD
         sync: false
       - key: SUPER_ADMIN_TOTP_SECRET
+        sync: false
+      - key: WEBRTC_TURN_URLS
+        sync: false
+      - key: WEBRTC_TURN_USERNAME
+        sync: false
+      - key: WEBRTC_TURN_CREDENTIAL
         sync: false
       - key: R2_ACCOUNT_ID
         sync: false
@@ -78,4 +110,6 @@ services:
       - key: TELEGRAM_ALLOWED_USER_IDS
         sync: false
       - key: TELEGRAM_ALLOWED_GROUP_IDS
+        sync: false
+      - key: NETLIFY_AUTH_TOKEN
         sync: false
