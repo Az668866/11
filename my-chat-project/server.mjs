@@ -35,7 +35,7 @@ const PUBLIC_API_BASE = String(
 const QR_ENTRY_BASE = String(
   process.env.QR_ENTRY_BASE || PUBLIC_API_BASE,
 ).replace(/\/+$/, '');
-const APP_VERSION = String(process.env.APP_VERSION || '2.3.2').trim();
+const APP_VERSION = String(process.env.APP_VERSION || '2.3.3').trim();
 const SUPPORT_TELEGRAM = String(
   process.env.SUPPORT_TELEGRAM || '@YingYingUu',
 ).trim();
@@ -1004,6 +1004,9 @@ async function initDatabase() {
       ON audit_logs (created_at DESC)
     `);
     await client.query(`
+      DROP INDEX IF EXISTS audit_logs_created_at_idx
+    `);
+    await client.query(`
       CREATE INDEX IF NOT EXISTS license_keys_distributor_created_idx
       ON license_keys (generated_by_distributor_id, created_at DESC)
     `);
@@ -1137,6 +1140,9 @@ async function initDatabase() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS system_metric_samples_created_idx
       ON system_metric_samples (created_at DESC)
+    `);
+    await client.query(`
+      DROP INDEX IF EXISTS system_metric_samples_created_at_idx
     `);
     await client.query(`
       CREATE TABLE IF NOT EXISTS daily_reports (
@@ -1539,6 +1545,10 @@ async function initDatabase() {
       ON conversations (tenant_id, visitor_group_id, updated_at DESC, id DESC)
     `);
     await client.query(`
+      CREATE INDEX IF NOT EXISTS tenant_config_frontend_template_idx
+      ON tenant_config (frontend_template_id)
+    `);
+    await client.query(`
       CREATE INDEX IF NOT EXISTS tenants_updated_page_idx
       ON tenants (updated_at DESC, id DESC)
     `);
@@ -1599,14 +1609,6 @@ async function initDatabase() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS telegram_updates_created_at_idx
       ON telegram_updates (created_at)
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS audit_logs_created_at_idx
-      ON audit_logs (created_at)
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS system_metric_samples_created_at_idx
-      ON system_metric_samples (created_at)
     `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS tenants_expiry_reminder_idx
@@ -4140,17 +4142,17 @@ async function getTemplateCatalog(
         ft.client_version, ft.min_backend_version, ft.status,
         ft.selection_closed, ft.sort_order, ft.recommended, ft.is_default,
         ft.test_tenant_ids,
-        (
+        CASE WHEN $1::boolean THEN (
           SELECT COUNT(*)::int
           FROM tenant_config tc
           WHERE tc.frontend_template_id = ft.id
-        ) AS usage_count,
-        (
+        ) ELSE 0 END AS usage_count,
+        CASE WHEN $1::boolean THEN (
           SELECT COUNT(*)::int
           FROM qr_incidents qi
           WHERE qi.template_id = ft.id
             AND qi.status IN ('open','processing')
-        ) AS active_incident_count
+        ) ELSE 0 END AS active_incident_count
       FROM frontend_templates ft
       WHERE $1::boolean
          OR (
@@ -4779,7 +4781,7 @@ async function getAllSummariesPage(
   const requestedGroup = cleanText(groupId, 50);
   const selectedGroupId = isUuid(requestedGroup) ? requestedGroup : null;
   const onlyUngrouped = requestedGroup === 'ungrouped';
-  const result = await pool.query(
+  const pagePromise = pool.query(
     `
       SELECT
         c.*,
@@ -4787,10 +4789,7 @@ async function getAllSummariesPage(
         latest.type AS latest_type,
         latest.text AS latest_text,
         latest.role AS latest_role,
-        latest.created_at AS latest_created_at,
-        COUNT(*) OVER()::int AS _total_count,
-        COUNT(*) FILTER (WHERE c.status='open') OVER()::int AS _open_count,
-        COALESCE(SUM(c.unread_admin) OVER(),0)::int AS _unread_count
+        latest.created_at AS latest_created_at
       FROM conversations c
       LEFT JOIN LATERAL (
         SELECT m.id,m.type,m.text,m.role,m.created_at
@@ -4827,10 +4826,57 @@ async function getAllSummariesPage(
       limit,
     ],
   );
+  const totalsPromise = decoded
+    ? Promise.resolve(null)
+    : keyword
+      ? pool.query(
+          `
+            SELECT
+              COUNT(*)::int AS total_count,
+              COUNT(*) FILTER (WHERE c.status='open')::int AS open_count,
+              COALESCE(SUM(c.unread_admin),0)::int AS unread_count
+            FROM conversations c
+            LEFT JOIN LATERAL (
+              SELECT m.text
+              FROM messages m
+              WHERE m.conversation_id=c.id
+              ORDER BY m.created_at DESC,m.id DESC
+              LIMIT 1
+            ) latest ON TRUE
+            WHERE c.tenant_id=$1
+              AND (
+                c.visitor_name ILIKE '%' || $2 || '%'
+                OR c.visitor_note ILIKE '%' || $2 || '%'
+                OR c.ip_address ILIKE '%' || $2 || '%'
+                OR c.ip_location ILIKE '%' || $2 || '%'
+                OR COALESCE(latest.text,'') ILIKE '%' || $2 || '%'
+              )
+              AND ($3::uuid IS NULL OR c.visitor_group_id=$3::uuid)
+              AND (NOT $4::boolean OR c.visitor_group_id IS NULL)
+          `,
+          [tenantId, keyword, selectedGroupId, onlyUngrouped],
+        )
+      : pool.query(
+          `
+            SELECT
+              COUNT(*)::int AS total_count,
+              COUNT(*) FILTER (WHERE status='open')::int AS open_count,
+              COALESCE(SUM(unread_admin),0)::int AS unread_count
+            FROM conversations
+            WHERE tenant_id=$1
+              AND ($2::uuid IS NULL OR visitor_group_id=$2::uuid)
+              AND (NOT $3::boolean OR visitor_group_id IS NULL)
+          `,
+          [tenantId, selectedGroupId, onlyUngrouped],
+        );
+  const [result, totalsResult] = await Promise.all([
+    pagePromise,
+    totalsPromise,
+  ]);
   const hasMore = result.rows.length > limit;
   const pageRows = result.rows.slice(0, limit);
   const last = pageRows.at(-1);
-  const totalsRow = pageRows[0] || {};
+  const totalsRow = totalsResult?.rows?.[0] || {};
   return {
     items: pageRows.map(conversationSummary),
     nextCursor:
@@ -4844,9 +4890,9 @@ async function getAllSummariesPage(
     totals: decoded
       ? null
       : {
-          all: Number(totalsRow._total_count || 0),
-          open: Number(totalsRow._open_count || 0),
-          unread: Number(totalsRow._unread_count || 0),
+          all: Number(totalsRow.total_count || 0),
+          open: Number(totalsRow.open_count || 0),
+          unread: Number(totalsRow.unread_count || 0),
         },
   };
 }
@@ -6371,7 +6417,7 @@ async function touchConversation(conversationId, body = {}, req = null, tenantId
     : { location: '', timezone: '' };
   const downlink = Number(body.downlinkMbps);
   const rtt = Number(body.rttMs);
-  await pool.query(
+  const result = await pool.query(
     `
       UPDATE conversations SET
         last_seen_at = NOW(),
@@ -6415,6 +6461,7 @@ async function touchConversation(conversationId, body = {}, req = null, tenantId
           OR ($10 <> '' AND network_type IS DISTINCT FROM $10)
           OR ($11 <> '' AND network_effective_type IS DISTINCT FROM $11)
         )
+      RETURNING *
     `,
     [
       conversationId,
@@ -6436,6 +6483,7 @@ async function touchConversation(conversationId, body = {}, req = null, tenantId
       tenantId,
     ],
   );
+  return result.rows[0] || null;
 }
 
 async function createLicenseRecord(
@@ -14317,29 +14365,25 @@ async function router(req, res, parsedRequestUrl = null) {
 
     if (req.method === 'PATCH' && pathname === '/api/user/presence') {
       const body = await readJson(req, 32 * 1024);
-      await touchConversation(
+      const updated = await touchConversation(
         conversation.id,
         body,
         req,
         payload.tenantId,
       );
-      const updated = await getConversationRow(
-        conversation.id,
-        pool,
-        false,
-        payload.tenantId,
-      );
-      publishEvent(
-        {
-          type: 'summary-updated',
-          conversation: conversationBase(updated),
-        },
-        {
-          tenantId: payload.tenantId,
-          conversationId: conversation.id,
-          targetKind: 'tenant_admin',
-        },
-      );
+      if (updated) {
+        publishEvent(
+          {
+            type: 'summary-updated',
+            conversation: conversationBase(updated),
+          },
+          {
+            tenantId: payload.tenantId,
+            conversationId: conversation.id,
+            targetKind: 'tenant_admin',
+          },
+        );
+      }
       return sendJson(res, 200, { ok: true });
     }
 
