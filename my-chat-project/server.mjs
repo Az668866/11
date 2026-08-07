@@ -36,7 +36,7 @@ const PUBLIC_API_BASE = String(
 const QR_ENTRY_BASE = String(
   process.env.QR_ENTRY_BASE || PUBLIC_API_BASE,
 ).replace(/\/+$/, '');
-const APP_VERSION = String(process.env.APP_VERSION || '2.4.4').trim();
+const APP_VERSION = String(process.env.APP_VERSION || '2.4.5').trim();
 const SUPPORT_TELEGRAM = String(
   process.env.SUPPORT_TELEGRAM || '@YingYingUu',
 ).trim();
@@ -205,8 +205,8 @@ const ANOMALY_MESSAGE_CONVERSATION_LIMIT = Math.trunc(
 const ANOMALY_MESSAGE_TENANT_LIMIT = Math.trunc(
   envNumber('ANOMALY_MESSAGES_TENANT_10M', 600, 50, 1_000_000),
 );
-// 来源不一致仍会立即拒绝，但必须连续出现才通知管理员。这样可以挡住
-// 令牌跨站复用，同时避免移动端 WebView/PWA 换域名时的一次性旧会话误报。
+// 未登录的模板来源不一致必须连续出现才通知管理员；带有效签名令牌的
+// 跨来源复用会结合租户当前批准来源单独作高置信判定并立即告警。
 const ANOMALY_ORIGIN_MISMATCH_LIMIT = Math.trunc(
   envNumber('ANOMALY_ORIGIN_MISMATCH_10M', 3, 2, 1000),
 );
@@ -1664,6 +1664,21 @@ async function initDatabase() {
       $migration$
     `);
 
+    // 旧代理缺少的新期限额度只在启动迁移时一次性补齐，读取列表或登录时
+    // 不再反复执行 ON CONFLICT 写操作。
+    await client.query(
+      `
+        INSERT INTO distributor_license_quotas (
+          distributor_id,duration_code
+        )
+        SELECT d.id,c.duration_code
+        FROM distributors d
+        CROSS JOIN unnest($1::text[]) AS c(duration_code)
+        ON CONFLICT (distributor_id,duration_code) DO NOTHING
+      `,
+      [DISTRIBUTOR_DURATION_CODES],
+    );
+
     await client.query(`
       CREATE INDEX IF NOT EXISTS conversations_updated_at_idx
       ON conversations (updated_at DESC)
@@ -2413,27 +2428,88 @@ function userTokenOriginAllowed(req, payload) {
   return inspectUserTokenOrigin(req, payload).allowed;
 }
 
-function rejectInvalidUserTokenOrigin(req, res, payload, pathname) {
+function observeConfirmedUserOriginReuse(
+  req,
+  payload,
+  pathname,
+  { requestOrigin = '', tokenOrigin = '', approvedOrigin = '' } = {},
+) {
+  observeBehaviorCounter(req, {
+    kind: 'user-token-origin-mismatch',
+    key: securityFingerprint([
+      payload.tenantId,
+      payload.conversationId,
+      requestOrigin,
+      tokenOrigin,
+    ]),
+    limit: 1,
+    severity: 'critical',
+    tenantId: payload.tenantId,
+    conversationId: payload.conversationId,
+    details: {
+      path: pathname,
+      requestOrigin,
+      tokenOrigin,
+      approvedOrigin,
+      confidence: 'high',
+      detection: 'confirmed-cross-origin-token-reuse',
+      allowLicenseBlock: true,
+    },
+  });
+}
+
+async function rejectInvalidUserTokenOrigin(req, res, payload, pathname) {
   const check = inspectUserTokenOrigin(req, payload);
-  if (check.allowed) return false;
+  if (check.reason === 'disabled') return false;
+
+  // 只靠“请求 Origin 与令牌 Origin 不同”无法区分盗用和正常换域。
+  // 这里复用五分钟租户配置缓存，把当前租户实际批准的来源作为第三个信号：
+  // - 请求来自当前批准来源：旧令牌/PWA 缓存，安全换新且不告警；
+  // - 请求与令牌来自不同来源，且请求并非当前批准来源：高置信跨站复用。
+  const config = await getConfig(payload.tenantId);
+  const approvedOrigin = normalizeOrigin(config.settings?.frontendOrigin);
+  const approvedTemplateId = cleanText(
+    config.settings?.frontendTemplateId,
+    80,
+  );
+  const tokenTemplateId = cleanText(payload.clientTemplateId, 80);
+  const requestUsesApprovedOrigin = Boolean(
+    check.requestOrigin &&
+      approvedOrigin &&
+      timingSafeTextEqual(check.requestOrigin, approvedOrigin),
+  );
+  const tokenUsesApprovedOrigin = Boolean(
+    check.tokenOrigin &&
+      approvedOrigin &&
+      timingSafeTextEqual(check.tokenOrigin, approvedOrigin),
+  );
+  const tokenUsesApprovedTemplate = Boolean(
+    approvedTemplateId &&
+      tokenTemplateId &&
+      timingSafeTextEqual(tokenTemplateId, approvedTemplateId),
+  );
+
+  if (
+    check.allowed &&
+    tokenUsesApprovedOrigin &&
+    tokenUsesApprovedTemplate
+  ) return false;
+
+  if (requestUsesApprovedOrigin) {
+    sendError(
+      res,
+      401,
+      '访客会话需要安全换新，请稍候重试。',
+      'TOKEN_REFRESH_REQUIRED',
+    );
+    return true;
+  }
+
   if (check.reason === 'mismatch') {
-    observeBehaviorCounter(req, {
-      kind: 'user-token-origin-mismatch',
-      key: securityFingerprint([
-        payload.tenantId,
-        payload.conversationId,
-        check.requestOrigin,
-        check.tokenOrigin,
-      ]),
-      limit: ANOMALY_ORIGIN_MISMATCH_LIMIT,
-      severity: 'critical',
-      tenantId: payload.tenantId,
-      conversationId: payload.conversationId,
-      details: {
-        path: pathname,
-        requestOrigin: check.requestOrigin,
-        tokenOrigin: check.tokenOrigin,
-      },
+    observeConfirmedUserOriginReuse(req, payload, pathname, {
+      requestOrigin: check.requestOrigin,
+      tokenOrigin: check.tokenOrigin,
+      approvedOrigin,
     });
     sendError(
       res,
@@ -2446,9 +2522,18 @@ function rejectInvalidUserTokenOrigin(req, res, payload, pathname) {
   if (check.reason === 'legacy-token') {
     sendError(
       res,
-      401,
-      '访客会话需要安全换新，请重新建立连接。',
-      'TOKEN_REFRESH_REQUIRED',
+      403,
+      '旧访客会话不属于该租户当前用户端，请从商家客服入口重新打开。',
+      'CLIENT_ORIGIN',
+    );
+    return true;
+  }
+  if (check.allowed) {
+    sendError(
+      res,
+      403,
+      '此访客会话来自租户已经停用的用户端，请从最新客服入口重新打开。',
+      'CLIENT_ORIGIN',
     );
     return true;
   }
@@ -3157,6 +3242,25 @@ function requestIp(req) {
   return remoteAddress || forwarded.at(-1) || 'unknown';
 }
 
+function securityIpBlockable(value) {
+  const address = normalizeIp(value);
+  return Boolean(
+    address &&
+      isPublicAddress(address) &&
+      !isCloudflareAddress(address),
+  );
+}
+
+function securityIpNote(value) {
+  const address = normalizeIp(value);
+  if (!address) return '无效地址，不可封禁';
+  if (isCloudflareAddress(address)) {
+    return 'Cloudflare 边缘节点，不可封禁';
+  }
+  if (!isPublicAddress(address)) return '非公网地址，不可封禁';
+  return '';
+}
+
 const CHINA_REGION_CODES = Object.freeze({
   AH: '安徽', BJ: '北京', CQ: '重庆', FJ: '福建', GD: '广东',
   GS: '甘肃', GX: '广西', GZ: '贵州', HA: '河南', HB: '湖北',
@@ -3318,24 +3422,31 @@ function securityKindLabel(kind) {
   if (kind === 'suspicious-path') return '敏感路径扫描';
   if (kind === 'suspicious-agent') return '自动化扫描工具';
   if (kind === 'template-origin-mismatch') return '用户端部署来源连续不匹配';
-  if (kind === 'user-token-origin-mismatch') return '访客令牌连续跨站复用';
+  if (kind === 'user-token-origin-mismatch') return '访客令牌跨站复用（高置信）';
   if (kind.startsWith('rate-limit:')) {
     return `接口频率异常（${kind.slice('rate-limit:'.length)}）`;
   }
   return kind || '异常访问';
 }
 
+function securityDetectionLabel(value) {
+  if (value === 'confirmed-cross-origin-token-reuse') {
+    return '有效访客令牌已确认从未批准的其他来源跨站使用';
+  }
+  return cleanText(value, 160);
+}
+
 function securityEventKeyboard(event) {
   const rows = [];
   // 访客异常不等于租户卡密被盗，禁止把普通来源/频率告警直接变成
-  // “封禁租户”按钮。只有将来由服务端明确标记凭据滥用的事件才开放。
+  // “封禁租户”按钮。只有服务端多信号确认凭据跨站滥用时才开放。
   if (event.license_id && event.details?.allowLicenseBlock === true) {
     rows.push([{
       text: '⛔ 封禁租户卡密',
       callback_data: `sec:license:${event.id}`,
     }]);
   }
-  if (event.ip_address && event.ip_address !== 'unknown') {
+  if (securityIpBlockable(event.ip_address)) {
     rows.push([{
       text: `🛡 封禁此 IP（${SECURITY_IP_BLOCK_HOURS}小时）`,
       callback_data: `sec:ip:${event.id}`,
@@ -3395,6 +3506,7 @@ async function reportSecurityAnomaly({
   );
   if (!claimSecurityAlert(fingerprint)) return null;
 
+  try {
   let tenant = null;
   if (resolvedTenantId) {
     const tenantResult = await pool.query(
@@ -3479,6 +3591,7 @@ async function reportSecurityAnomaly({
   );
   if (!telegramClaim.rows[0]) return event;
   const eventDetails = event.details || {};
+  const ipNote = securityIpNote(event.ip_address);
   const licenseLabel = tenant?.license_id
     ? `${tenant.key_prefix || 'VIP'}-*****-*****-*****-${tenant.key_suffix || '?????'}（${LICENSE_DURATIONS[tenant.duration_code]?.label || tenant.duration_code || '未知期限'}）`
     : '未关联卡密';
@@ -3498,7 +3611,22 @@ async function reportSecurityAnomaly({
           ? `<b>备注</b>：${escapeTelegramHtml(tenant.note)}`
           : '',
         `<b>卡密</b>：<code>${escapeTelegramHtml(licenseLabel)}</code>`,
-        `<b>IP</b>：<code>${escapeTelegramHtml(event.ip_address || 'unknown')}</code>`,
+        `<b>IP</b>：<code>${escapeTelegramHtml(event.ip_address || 'unknown')}</code>${ipNote ? `（${escapeTelegramHtml(ipNote)}）` : ''}`,
+        eventDetails.confidence
+          ? `<b>置信度</b>：${eventDetails.confidence === 'high' ? '高（多信号确认）' : escapeTelegramHtml(eventDetails.confidence)}`
+          : '',
+        eventDetails.detection
+          ? `<b>判定</b>：${escapeTelegramHtml(securityDetectionLabel(eventDetails.detection))}`
+          : '',
+        eventDetails.requestOrigin
+          ? `<b>请求来源</b>：<code>${escapeTelegramHtml(eventDetails.requestOrigin)}</code>`
+          : '',
+        eventDetails.tokenOrigin
+          ? `<b>令牌来源</b>：<code>${escapeTelegramHtml(eventDetails.tokenOrigin)}</code>`
+          : '',
+        eventDetails.approvedOrigin
+          ? `<b>租户批准来源</b>：<code>${escapeTelegramHtml(eventDetails.approvedOrigin)}</code>`
+          : '',
         eventDetails.path
           ? `<b>路径</b>：<code>${escapeTelegramHtml(eventDetails.path)}</code>`
           : '',
@@ -3523,16 +3651,22 @@ async function reportSecurityAnomaly({
        WHERE id=$1 AND telegram_message_id=-1`,
       [event.id],
     ).catch(() => {});
+    securityAlertClaims.delete(fingerprint);
     throw error;
   }
   return event;
+  } catch (error) {
+    securityAlertClaims.delete(fingerprint);
+    throw error;
+  }
 }
 
-function scheduleSecurityAnomaly(input) {
+function scheduleSecurityAnomaly(input, onFailure = null) {
   queueMicrotask(() => {
-    reportSecurityAnomaly(input).catch((error) =>
-      console.error('安全异常记录失败：', error.message),
-    );
+    reportSecurityAnomaly(input).catch((error) => {
+      if (typeof onFailure === 'function') onFailure();
+      console.error('安全异常记录失败：', error.message);
+    });
   });
 }
 
@@ -3565,17 +3699,22 @@ function observeBehaviorCounter(req, {
   bucket.count += Math.max(1, Math.trunc(Number(increment || 1)));
   if (bucket.count < limit || bucket.alerted) return;
   bucket.alerted = true;
-  scheduleSecurityAnomaly({
-    kind,
-    req,
-    tenantId,
-    licenseId,
-    conversationId,
-    severity,
-    count: bucket.count,
-    threshold: limit,
-    details,
-  });
+  scheduleSecurityAnomaly(
+    {
+      kind,
+      req,
+      tenantId,
+      licenseId,
+      conversationId,
+      severity,
+      count: bucket.count,
+      threshold: limit,
+      details,
+    },
+    () => {
+      if (behaviorBuckets.get(bucketKey) === bucket) bucket.alerted = false;
+    },
+  );
 }
 
 async function refreshBlockedIpCache(force = false) {
@@ -3660,20 +3799,25 @@ function rateLimit(req, res, name, max, windowMs, identity = '', context = {}) {
     );
     if (!current.alerted) {
       current.alerted = true;
-      scheduleSecurityAnomaly({
-        kind: `rate-limit:${name}`,
-        req,
-        tenantId: context.tenantId,
-        licenseId: context.licenseId,
-        conversationId: context.conversationId,
-        count: current.count,
-        threshold: max,
-        severity: name.includes('login') ? 'critical' : 'warning',
-        details: {
-          path: cleanText(req.url, 300),
-          method: cleanText(req.method, 20),
+      scheduleSecurityAnomaly(
+        {
+          kind: `rate-limit:${name}`,
+          req,
+          tenantId: context.tenantId,
+          licenseId: context.licenseId,
+          conversationId: context.conversationId,
+          count: current.count,
+          threshold: max,
+          severity: name.includes('login') ? 'critical' : 'warning',
+          details: {
+            path: cleanText(req.url, 300),
+            method: cleanText(req.method, 20),
+          },
         },
-      });
+        () => {
+          if (rateBuckets.get(key) === current) current.alerted = false;
+        },
+      );
     }
     sendError(res, 429, '操作过于频繁，请稍后再试。', 'RATE_LIMIT');
     return false;
@@ -3901,6 +4045,11 @@ async function saveAsset({
 
 async function deleteAsset(assetId, tenantId = undefined) {
   if (!isUuid(assetId)) return;
+  if (
+    tenantId !== undefined &&
+    tenantId !== null &&
+    !isUuid(tenantId)
+  ) return;
   const params = [assetId];
   const tenantClause =
     tenantId === undefined
@@ -6672,7 +6821,12 @@ async function handleUpload(req, res, payload, conversation) {
   await requireTenantFeature('media_album', payload.tenantId);
 
   const rateIdentity = `${payload.kind}:${payload.tenantId}:${conversation.id}`;
-  if (!rateLimit(req, res, 'upload', 30, 60_000, rateIdentity)) return;
+  if (
+    !rateLimit(req, res, 'upload', 30, 60_000, rateIdentity, {
+      tenantId: payload.tenantId,
+      conversationId: conversation.id,
+    })
+  ) return;
 
   const mime = String(req.headers['content-type'] || '')
     .split(';')[0]
@@ -9178,9 +9332,19 @@ async function handleSecurityEventCallback(callback) {
     let disconnectedTenantId = '';
     if (match[1] === 'license') {
       if (!isUuid(event.license_id)) throw new Error('该事件没有可封禁的关联卡密。');
+      if (event.details?.allowLicenseBlock !== true) {
+        throw new Error('该事件未达到可封禁卡密的高置信安全条件。');
+      }
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
+        const eventLock = await client.query(
+          `SELECT status FROM security_events WHERE id=$1 FOR UPDATE`,
+          [event.id],
+        );
+        if (eventLock.rows[0]?.status !== 'open') {
+          throw new Error('该安全事件已经被处理。');
+        }
         const licenseResult = await client.query(
           `SELECT id,status,tenant_id FROM license_keys WHERE id=$1 FOR UPDATE`,
           [event.license_id],
@@ -9213,14 +9377,14 @@ async function handleSecurityEventCallback(callback) {
           [event.id, String(userId || '')],
         );
         await client.query(
-          `INSERT INTO audit_logs (actor_license_id,action,target_type,target_id,metadata)
-           VALUES ($1,'security.license_block','security_event',$2,$3::jsonb)`,
+          `INSERT INTO audit_logs (action,target_type,target_id,metadata)
+           VALUES ('security.license_block','security_event',$1,$2::jsonb)`,
           [
-            event.license_id,
             event.id,
             JSON.stringify({
               telegramUserId: String(userId || ''),
               tenantId: disconnectedTenantId || event.tenant_id || '',
+              licenseId: event.license_id,
               kind: event.kind,
             }),
           ],
@@ -9234,47 +9398,86 @@ async function handleSecurityEventCallback(callback) {
       }
       resultText = `⛔ 已封禁卡密 ${event.key_prefix || 'VIP'}-***-${event.key_suffix || '?????'}${disconnectedTenantId ? '，并立即中断该租户会话' : ''}。`;
     } else if (match[1] === 'ip') {
-      if (!isIP(event.ip_address)) throw new Error('该事件没有可封禁的有效 IP。');
+      if (!securityIpBlockable(event.ip_address)) {
+        throw new Error(
+          isCloudflareAddress(normalizeIp(event.ip_address))
+            ? '该地址属于 Cloudflare 边缘节点，不能封禁共享基础设施 IP。'
+            : '该事件没有可封禁的公网 IP。',
+        );
+      }
+      const blockedAddress = normalizeIp(event.ip_address);
       const expiresAt = new Date(
         Date.now() + SECURITY_IP_BLOCK_HOURS * 60 * 60_000,
       );
-      await pool.query(
-        `
-          INSERT INTO blocked_ips (
-            ip_address,reason,security_event_id,
-            blocked_by_telegram_user_id,expires_at
-          ) VALUES ($1,$2,$3,$4,$5)
-          ON CONFLICT (ip_address) DO UPDATE SET
-            reason=EXCLUDED.reason,
-            security_event_id=EXCLUDED.security_event_id,
-            blocked_by_telegram_user_id=EXCLUDED.blocked_by_telegram_user_id,
-            expires_at=EXCLUDED.expires_at,updated_at=NOW()
-        `,
-        [
-          event.ip_address,
-          `Telegram 处理安全事件：${event.kind}`,
-          event.id,
-          String(userId || ''),
-          expiresAt.toISOString(),
-        ],
-      );
-      await pool.query(
-        `UPDATE security_events
-         SET status='blocked',handled_by_telegram_user_id=$2,
-             handled_at=NOW(),updated_at=NOW()
-         WHERE id=$1`,
-        [event.id, String(userId || '')],
-      );
-      blockedIpCache.set(event.ip_address, expiresAt.getTime());
-      resultText = `🛡 已封禁 IP ${event.ip_address} ${SECURITY_IP_BLOCK_HOURS} 小时。`;
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const eventLock = await client.query(
+          `SELECT status FROM security_events WHERE id=$1 FOR UPDATE`,
+          [event.id],
+        );
+        if (eventLock.rows[0]?.status !== 'open') {
+          throw new Error('该安全事件已经被处理。');
+        }
+        await client.query(
+          `
+            INSERT INTO blocked_ips (
+              ip_address,reason,security_event_id,
+              blocked_by_telegram_user_id,expires_at
+            ) VALUES ($1,$2,$3,$4,$5)
+            ON CONFLICT (ip_address) DO UPDATE SET
+              reason=EXCLUDED.reason,
+              security_event_id=EXCLUDED.security_event_id,
+              blocked_by_telegram_user_id=EXCLUDED.blocked_by_telegram_user_id,
+              expires_at=EXCLUDED.expires_at,updated_at=NOW()
+          `,
+          [
+            blockedAddress,
+            `Telegram 处理安全事件：${event.kind}`,
+            event.id,
+            String(userId || ''),
+            expiresAt.toISOString(),
+          ],
+        );
+        await client.query(
+          `UPDATE security_events
+           SET status='blocked',handled_by_telegram_user_id=$2,
+               handled_at=NOW(),updated_at=NOW()
+           WHERE id=$1`,
+          [event.id, String(userId || '')],
+        );
+        await client.query(
+          `INSERT INTO audit_logs (action,target_type,target_id,ip_address,metadata)
+           VALUES ('security.ip_block','security_event',$1,$2,$3::jsonb)`,
+          [
+            event.id,
+            blockedAddress,
+            JSON.stringify({
+              telegramUserId: String(userId || ''),
+              kind: event.kind,
+              expiresAt: expiresAt.toISOString(),
+            }),
+          ],
+        );
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
+      blockedIpCache.set(blockedAddress, expiresAt.getTime());
+      resultText = `🛡 已封禁 IP ${blockedAddress} ${SECURITY_IP_BLOCK_HOURS} 小时。`;
     } else {
-      await pool.query(
+      const dismissed = await pool.query(
         `UPDATE security_events
          SET status='dismissed',handled_by_telegram_user_id=$2,
              handled_at=NOW(),updated_at=NOW()
-         WHERE id=$1`,
+         WHERE id=$1 AND status='open'
+         RETURNING id`,
         [event.id, String(userId || '')],
       );
+      if (!dismissed.rows[0]) throw new Error('该安全事件已经被处理。');
       resultText = '✅ 该安全事件已标记为已核实，未封禁用户。';
     }
 
@@ -9352,7 +9555,7 @@ async function handleTelegramPrivateInbound(message) {
   if (await telegramUserIsBlocked(userId)) {
     await telegramApi('sendMessage', {
       chat_id: message.chat.id,
-      text: '你已被管理员禁止访问机器人。你的 Telegram 用户 ID 和相关记录已被保存；',
+      text: '你已被管理员禁止访问机器人。你的 Telegram 用户 ID 和相关记录已被保留；Telegram 机器人无法获取你的 IP。',
     }).catch(() => {});
     return true;
   }
@@ -9394,7 +9597,7 @@ async function handleTelegramPrivateInbound(message) {
   }
   await telegramApi('sendMessage', {
     chat_id: message.chat.id,
-    text: '你没有权限访问此机器人。',
+    text: '✅ 你的消息已转发给管理员。',
   }).catch(() => {});
   return true;
 }
@@ -11425,6 +11628,12 @@ async function getSuperTenants(
     requestedStatus,
     limit,
   ]);
+  const presenceByTenant = new Map(
+    getRealtimePresenceSnapshot().tenants.map((item) => [
+      item.tenantId,
+      item,
+    ]),
+  );
   return result.rows.map((row) => ({
     id: row.id,
     publicCode: row.public_code,
@@ -11477,19 +11686,10 @@ async function getSuperTenants(
     visitorsToday: Number(row.visitors_today || 0),
     messagesToday: Number(row.messages_today || 0),
     mediaBytes: Number(row.media_bytes || 0),
-    onlineDevices: [...sseClients].filter(
-      (client) =>
-        client.kind === 'tenant_admin' && client.tenantId === row.id,
-    ).length,
-    onlineVisitors: new Set(
-      [...sseClients]
-        .filter(
-          (client) =>
-            client.kind === 'user' && client.tenantId === row.id,
-        )
-        .map((client) => client.conversationId)
-        .filter(Boolean),
-    ).size,
+    onlineDevices: Number(presenceByTenant.get(row.id)?.adminDevices || 0),
+    onlineVisitors: Number(
+      presenceByTenant.get(row.id)?.onlineVisitors || 0,
+    ),
   }));
 }
 
@@ -11535,7 +11735,6 @@ async function ensureDistributorQuotas(distributorId, client = pool) {
 }
 
 async function getDistributorQuotaMap(distributorId, client = pool) {
-  await ensureDistributorQuotas(distributorId, client);
   const result = await client.query(
     `
       SELECT duration_code,remaining_count,generated_count,updated_at
@@ -11601,18 +11800,6 @@ async function getSuperDistributors() {
   );
   const distributorIds = result.rows.map((row) => row.id);
   if (!distributorIds.length) return [];
-  await pool.query(
-    `
-      INSERT INTO distributor_license_quotas (
-        distributor_id,duration_code
-      )
-      SELECT d.distributor_id,c.duration_code
-      FROM unnest($1::uuid[]) AS d(distributor_id)
-      CROSS JOIN unnest($2::text[]) AS c(duration_code)
-      ON CONFLICT (distributor_id,duration_code) DO NOTHING
-    `,
-    [distributorIds, DISTRIBUTOR_DURATION_CODES],
-  );
   const quotaResult = await pool.query(
     `
       SELECT distributor_id,duration_code,remaining_count,
@@ -11755,20 +11942,16 @@ async function getDistributorTenants(distributorId, options = {}) {
     [distributorId, cursor?.at || null, cursor?.id || null, limit + 1],
   );
   const hasMore = result.rows.length > limit;
+  const presenceByTenant = new Map(
+    getDistributorPresenceSnapshot(distributorId).tenants.map((item) => [
+      item.tenantId,
+      item,
+    ]),
+  );
   const items = result.rows.slice(0, limit).map((row) => {
-    const onlineDevices = [...sseClients].filter(
-      (client) =>
-        client.kind === 'tenant_admin' && client.tenantId === row.id,
-    ).length;
-    const onlineVisitors = new Set(
-      [...sseClients]
-        .filter(
-          (client) =>
-            client.kind === 'user' && client.tenantId === row.id,
-        )
-        .map((client) => client.conversationId)
-        .filter(Boolean),
-    ).size;
+    const live = presenceByTenant.get(row.id);
+    const onlineDevices = Number(live?.adminDevices || 0);
+    const onlineVisitors = Number(live?.onlineVisitors || 0);
     return {
       id: row.id,
       publicCode: row.public_code,
@@ -11822,7 +12005,7 @@ async function getDistributorTenants(distributorId, options = {}) {
 }
 
 async function getDistributorDashboard(distributorId) {
-  const [result, tenantResult, quotas] = await Promise.all([
+  const [result, quotas] = await Promise.all([
     pool.query(
       `
         SELECT
@@ -11834,46 +12017,27 @@ async function getDistributorDashboard(distributorId) {
           COUNT(*) FILTER (
             WHERE status='active' AND expires_at<=NOW()
           )::int AS license_expired,
-          COUNT(*) FILTER (WHERE status='revoked')::int AS license_revoked
+          COUNT(*) FILTER (WHERE status='revoked')::int AS license_revoked,
+          (SELECT COUNT(*)::int FROM tenants
+           WHERE owner_distributor_id=$1) AS tenant_total
         FROM license_keys
         WHERE generated_by_distributor_id=$1
       `,
       [distributorId],
     ),
-    pool.query(
-      `SELECT id FROM tenants WHERE owner_distributor_id=$1`,
-      [distributorId],
-    ),
     getDistributorQuotaMap(distributorId),
   ]);
   const row = result.rows[0] || {};
-  const tenantIds = new Set(tenantResult.rows.map((item) => item.id));
-  const onlineTenantIds = new Set(
-    [...sseClients]
-      .filter(
-        (client) =>
-          client.kind === 'tenant_admin' &&
-          tenantIds.has(client.tenantId),
-      )
-      .map((client) => client.tenantId),
-  );
-  const chattingTenantIds = new Set(
-    [...sseClients]
-      .filter(
-        (client) =>
-          client.kind === 'user' && tenantIds.has(client.tenantId),
-      )
-      .map((client) => client.tenantId),
-  );
+  const presence = getDistributorPresenceSnapshot(distributorId);
   return {
     licenseTotal: Number(row.license_total || 0),
     licenseUnused: Number(row.license_unused || 0),
     licenseActive: Number(row.license_active || 0),
     licenseExpired: Number(row.license_expired || 0),
     licenseRevoked: Number(row.license_revoked || 0),
-    tenantTotal: tenantIds.size,
-    onlineTenants: onlineTenantIds.size,
-    chattingTenants: chattingTenantIds.size,
+    tenantTotal: Number(row.tenant_total || 0),
+    onlineTenants: presence.onlineTenants,
+    chattingTenants: presence.chattingTenants,
     quotas,
   };
 }
@@ -11913,7 +12077,6 @@ async function handleDistributorLogin(req, res) {
       'DISTRIBUTOR_LOGIN',
     );
   }
-  await ensureDistributorQuotas(row.id);
   await pool.query(
     `UPDATE distributors SET last_login_at=NOW(),updated_at=NOW() WHERE id=$1`,
     [row.id],
@@ -11960,13 +12123,10 @@ async function handleDistributorRoutes(req, res, url, pathname, apiVersion = 1) 
   }
 
   if (req.method === 'GET' && pathname === '/api/distributor/bootstrap') {
-    const [quotas, dashboard] = await Promise.all([
-      getDistributorQuotaMap(distributor.id),
-      getDistributorDashboard(distributor.id),
-    ]);
+    const dashboard = await getDistributorDashboard(distributor.id);
     return sendJson(res, 200, {
       ok: true,
-      distributor: distributorAccountPayload(distributor, quotas),
+      distributor: distributorAccountPayload(distributor, dashboard.quotas),
       dashboard,
     });
   }
@@ -14850,6 +15010,20 @@ async function router(req, res, parsedRequestUrl = null) {
 
   const origin = req.headers.origin;
   if (origin && !originAllowed(origin)) {
+    const userPayload = authenticate(req, 'user');
+    const requestOrigin = normalizeOrigin(origin);
+    const tokenOrigin = normalizeOrigin(userPayload?.clientOrigin);
+    if (
+      userPayload &&
+      requestOrigin &&
+      tokenOrigin &&
+      !timingSafeTextEqual(requestOrigin, tokenOrigin)
+    ) {
+      observeConfirmedUserOriginReuse(req, userPayload, rawPathname, {
+        requestOrigin,
+        tokenOrigin,
+      });
+    }
     return sendError(res, 403, '来源域名未被允许。', 'ORIGIN');
   }
 
@@ -15089,11 +15263,13 @@ async function router(req, res, parsedRequestUrl = null) {
     }
     let created = false;
     if (!conversationId) {
-      const countResult = await pool.query(
-        `SELECT COUNT(*)::int AS count FROM conversations WHERE tenant_id=$1`,
-        [tenant.id],
+      const capacityResult = await pool.query(
+        `SELECT 1 FROM conversations
+         WHERE tenant_id=$1
+         LIMIT 1 OFFSET $2`,
+        [tenant.id, MAX_CONVERSATIONS - 1],
       );
-      if (countResult.rows[0].count >= MAX_CONVERSATIONS) {
+      if (capacityResult.rows[0]) {
         return sendError(
           res,
           503,
@@ -15282,7 +15458,7 @@ async function router(req, res, parsedRequestUrl = null) {
     }
     if (
       payload.kind === 'user' &&
-      rejectInvalidUserTokenOrigin(req, res, payload, pathname)
+      await rejectInvalidUserTokenOrigin(req, res, payload, pathname)
     ) return;
 
     let tenant = null;
@@ -15506,7 +15682,7 @@ async function router(req, res, parsedRequestUrl = null) {
         'AUTH',
       );
     }
-    if (rejectInvalidUserTokenOrigin(req, res, payload, pathname)) return;
+    if (await rejectInvalidUserTokenOrigin(req, res, payload, pathname)) return;
 
     const tenant = await getTenantById(payload.tenantId);
     if (tenantAccessIssue(tenant)) return sendTenantAccessError(res,tenant,'user');
@@ -17183,7 +17359,7 @@ async function router(req, res, parsedRequestUrl = null) {
     }
     if (
       payload.kind === 'user' &&
-      rejectInvalidUserTokenOrigin(req, res, payload, pathname)
+      await rejectInvalidUserTokenOrigin(req, res, payload, pathname)
     ) return;
 
     const attachmentId = safeDecodeURIComponent(
