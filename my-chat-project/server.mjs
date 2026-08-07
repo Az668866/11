@@ -21,6 +21,7 @@ import {
 import pg from 'pg';
 import QRCode from 'qrcode';
 import sharp from 'sharp';
+import webpush from 'web-push';
 
 const { Pool } = pg;
 
@@ -35,7 +36,7 @@ const PUBLIC_API_BASE = String(
 const QR_ENTRY_BASE = String(
   process.env.QR_ENTRY_BASE || PUBLIC_API_BASE,
 ).replace(/\/+$/, '');
-const APP_VERSION = String(process.env.APP_VERSION || '2.3.3').trim();
+const APP_VERSION = String(process.env.APP_VERSION || '2.4.0').trim();
 const SUPPORT_TELEGRAM = String(
   process.env.SUPPORT_TELEGRAM || '@YingYingUu',
 ).trim();
@@ -242,8 +243,25 @@ const TOKEN_TTL_SECONDS = Math.min(
 const DB_POOL_MAX = Math.trunc(
   envNumber('DB_POOL_MAX', 5, 1, 20),
 );
-// 用户端已取消安装与离线通知；保留旧 API 契约，但不再发送 Web Push。
-const WEB_PUSH_ENABLED = false;
+const WEB_PUSH_VAPID_PUBLIC_KEY = String(
+  process.env.WEB_PUSH_VAPID_PUBLIC_KEY || '',
+).trim();
+const WEB_PUSH_VAPID_PRIVATE_KEY = String(
+  process.env.WEB_PUSH_VAPID_PRIVATE_KEY || '',
+).trim();
+const WEB_PUSH_SUBJECT = String(
+  process.env.WEB_PUSH_SUBJECT || 'mailto:security@example.com',
+).trim();
+const WEB_PUSH_ENABLED = Boolean(
+  WEB_PUSH_VAPID_PUBLIC_KEY && WEB_PUSH_VAPID_PRIVATE_KEY,
+);
+if (WEB_PUSH_ENABLED) {
+  webpush.setVapidDetails(
+    WEB_PUSH_SUBJECT,
+    WEB_PUSH_VAPID_PUBLIC_KEY,
+    WEB_PUSH_VAPID_PRIVATE_KEY,
+  );
+}
 const WEBRTC_STUN_URLS = String(
   process.env.WEBRTC_STUN_URLS || 'stun:stun.l.google.com:19302',
 )
@@ -468,6 +486,9 @@ const tenantCodeAccessCache = new Map();
 const tenantAdminAccessCache = new Map();
 const superAuthCache = new Map();
 const distributorAuthCache = new Map();
+const pushSubscriptionCache = new Map();
+const PUSH_SUBSCRIPTION_CACHE_MS = 60_000;
+const MAX_PUSH_SUBSCRIPTION_CACHE = 2_000;
 let approvedOriginCache = new Set(STATIC_ALLOWED_ORIGINS);
 let approvedOriginCacheExpiresAt = 0;
 let nextEventId = 1;
@@ -1295,6 +1316,25 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS push_subscriptions_conversation_idx
       ON push_subscriptions (tenant_id, conversation_id)
     `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS call_sessions (
+        id UUID PRIMARY KEY,
+        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        mode TEXT NOT NULL DEFAULT 'audio' CHECK (mode IN ('audio','video')),
+        offer JSONB NOT NULL,
+        status TEXT NOT NULL DEFAULT 'ringing'
+          CHECK (status IN ('ringing','answered','ended')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '2 minutes'
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS call_sessions_conversation_active_idx
+      ON call_sessions (tenant_id, conversation_id, expires_at DESC)
+      WHERE status='ringing'
+    `);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS attachments (
@@ -1865,8 +1905,15 @@ async function cleanupExpiredData() {
       DELETE FROM security_events
       WHERE status <> 'open' AND updated_at < NOW() - INTERVAL '90 days'
     `);
-    // 离线通知已取消，清理历史订阅以免继续占用数据库。
-    await client.query(`DELETE FROM push_subscriptions`);
+    // 会话删除时订阅会级联清理；这里只处理长期失联的旧浏览器订阅。
+    await client.query(
+      `DELETE FROM push_subscriptions
+       WHERE updated_at < NOW() - INTERVAL '30 days'`,
+    );
+    await client.query(
+      `DELETE FROM call_sessions
+       WHERE expires_at <= NOW() OR status='ended'`,
+    );
     await client.query(`
       DELETE FROM qr_incidents
       WHERE status IN ('resolved','failed')
@@ -2220,11 +2267,70 @@ function authenticate(req, kind) {
   return payload;
 }
 
-function userTokenOriginAllowed(req, payload) {
-  if (payload?.kind !== 'user' || !STRICT_CLIENT_ORIGIN) return true;
+function inspectUserTokenOrigin(req, payload) {
+  if (payload?.kind !== 'user' || !STRICT_CLIENT_ORIGIN) {
+    return { allowed: true, reason: 'disabled', requestOrigin: '', tokenOrigin: '' };
+  }
   const requestOrigin = normalizeOrigin(req.headers.origin);
   const tokenOrigin = normalizeOrigin(payload.clientOrigin);
-  return Boolean(requestOrigin && tokenOrigin && requestOrigin === tokenOrigin);
+  if (!tokenOrigin) {
+    return { allowed: false, reason: 'legacy-token', requestOrigin, tokenOrigin };
+  }
+  if (!requestOrigin) {
+    return { allowed: false, reason: 'missing-origin', requestOrigin, tokenOrigin };
+  }
+  return {
+    allowed: timingSafeTextEqual(requestOrigin, tokenOrigin),
+    reason: requestOrigin === tokenOrigin ? 'match' : 'mismatch',
+    requestOrigin,
+    tokenOrigin,
+  };
+}
+
+function userTokenOriginAllowed(req, payload) {
+  return inspectUserTokenOrigin(req, payload).allowed;
+}
+
+function rejectInvalidUserTokenOrigin(req, res, payload, pathname) {
+  const check = inspectUserTokenOrigin(req, payload);
+  if (check.allowed) return false;
+  if (check.reason === 'mismatch') {
+    scheduleSecurityAnomaly({
+      kind: 'user-token-origin-mismatch',
+      req,
+      severity: 'critical',
+      tenantId: payload.tenantId,
+      conversationId: payload.conversationId,
+      details: {
+        path: pathname,
+        requestOrigin: check.requestOrigin,
+        tokenOrigin: check.tokenOrigin,
+      },
+    });
+    sendError(
+      res,
+      403,
+      '访客会话不能在其他站点使用。',
+      'CLIENT_ORIGIN',
+    );
+    return true;
+  }
+  if (check.reason === 'legacy-token') {
+    sendError(
+      res,
+      401,
+      '访客会话需要安全换新，请重新建立连接。',
+      'TOKEN_REFRESH_REQUIRED',
+    );
+    return true;
+  }
+  sendError(
+    res,
+    403,
+    '浏览器没有提供可验证的页面来源，请从商家客服入口重新打开。',
+    'CLIENT_ORIGIN_MISSING',
+  );
+  return true;
 }
 
 async function authenticateSuper(req) {
@@ -2482,6 +2588,52 @@ function isPublicAddress(address) {
     return mapped
       ? isPublicAddress(mapped)
       : !nonPublicAddresses.check(address, 'ipv6');
+  }
+  return false;
+}
+
+// Cloudflare 官方公布的源站地址段。只有代理链的最邻近公网地址属于这些
+// 网段，或 Worker 携带了源站密钥时，才信任 CF-Connecting-IP。
+const cloudflareAddresses = new BlockList();
+for (const [network, prefix] of [
+  ['103.21.244.0', 22],
+  ['103.22.200.0', 22],
+  ['103.31.4.0', 22],
+  ['104.16.0.0', 13],
+  ['104.24.0.0', 14],
+  ['108.162.192.0', 18],
+  ['131.0.72.0', 22],
+  ['141.101.64.0', 18],
+  ['162.158.0.0', 15],
+  ['172.64.0.0', 13],
+  ['173.245.48.0', 20],
+  ['188.114.96.0', 20],
+  ['190.93.240.0', 20],
+  ['197.234.240.0', 22],
+  ['198.41.128.0', 17],
+]) {
+  cloudflareAddresses.addSubnet(network, prefix, 'ipv4');
+}
+for (const [network, prefix] of [
+  ['2400:cb00::', 32],
+  ['2606:4700::', 32],
+  ['2803:f800::', 32],
+  ['2405:b500::', 32],
+  ['2405:8100::', 32],
+  ['2a06:98c0::', 29],
+  ['2c0f:f248::', 32],
+]) {
+  cloudflareAddresses.addSubnet(network, prefix, 'ipv6');
+}
+
+function isCloudflareAddress(address) {
+  const version = isIP(address);
+  if (version === 4) return cloudflareAddresses.check(address, 'ipv4');
+  if (version === 6) {
+    const mapped = mappedIpv4Address(address);
+    return mapped
+      ? cloudflareAddresses.check(mapped, 'ipv4')
+      : cloudflareAddresses.check(address, 'ipv6');
   }
   return false;
 }
@@ -2846,15 +2998,31 @@ function normalizeIp(value) {
 }
 
 function requestIp(req) {
-  if (REQUIRE_CLOUDFLARE) {
-    return normalizeIp(req.headers['cf-connecting-ip']) || 'unknown';
-  }
   const remoteAddress = normalizeIp(req.socket.remoteAddress);
   const forwarded = String(req.headers['x-forwarded-for'] || '')
     .split(',')
     .map(normalizeIp)
     .filter(Boolean);
-  // 只在连接来自本机/私网反向代理时信任 X-Forwarded-For，且取代理追加的最右端地址。
+  const nearestPublicProxy = isPublicAddress(remoteAddress)
+    ? remoteAddress
+    : [...forwarded].reverse().find(isPublicAddress) || '';
+  const cloudflareIp = normalizeIp(req.headers['cf-connecting-ip']);
+  const workerSecretValid = Boolean(
+    CLOUDFLARE_ORIGIN_SECRET &&
+      timingSafeTextEqual(
+        req.headers['x-tuojie-origin-secret'],
+        CLOUDFLARE_ORIGIN_SECRET,
+      ),
+  );
+  if (
+    cloudflareIp &&
+    (workerSecretValid || isCloudflareAddress(nearestPublicProxy))
+  ) {
+    return cloudflareIp;
+  }
+  if (REQUIRE_CLOUDFLARE) return 'unknown';
+  // Render 等受控反向代理会把直接客户端追加到链尾；Cloudflare 链已在上面
+  // 单独验证并还原真实 IP，避免把 172.64.0.0/13 等边缘节点记成访客。
   if (remoteAddress && !isPublicAddress(remoteAddress)) {
     return forwarded.at(-1) || remoteAddress;
   }
@@ -3021,8 +3189,8 @@ function securityKindLabel(kind) {
   if (kind === 'message-tenant') return '租户消息量异常';
   if (kind === 'suspicious-path') return '敏感路径扫描';
   if (kind === 'suspicious-agent') return '自动化扫描工具';
-  if (kind === 'template-origin-mismatch') return '伪造用户端来源';
-  if (kind === 'user-token-origin-mismatch') return '访客令牌跨站复用';
+  if (kind === 'template-origin-mismatch') return '用户端来源不匹配';
+  if (kind === 'user-token-origin-mismatch') return '访客令牌明确跨站复用';
   if (kind.startsWith('rate-limit:')) {
     return `接口频率异常（${kind.slice('rate-limit:'.length)}）`;
   }
@@ -3073,13 +3241,28 @@ async function reportSecurityAnomaly({
       ? tokenPayload.licenseId
       : '';
   const ipAddress = req ? cleanText(requestIp(req), 100) : '';
-  const fingerprint = securityFingerprint([
-    kind,
-    resolvedTenantId,
-    isUuid(conversationId) ? conversationId : '',
-    ipAddress,
-    cleanText(details.path, 300),
-  ]);
+  const cleanedDetails = cleanSecurityDetails(details);
+  const isOriginMismatch = [
+    'template-origin-mismatch',
+    'user-token-origin-mismatch',
+  ].includes(kind);
+  const fingerprint = securityFingerprint(
+    isOriginMismatch
+      ? [
+          kind,
+          resolvedTenantId,
+          isUuid(conversationId) ? conversationId : '',
+          cleanedDetails.requestOrigin,
+          cleanedDetails.approvedOrigin || cleanedDetails.tokenOrigin,
+        ]
+      : [
+          kind,
+          resolvedTenantId,
+          isUuid(conversationId) ? conversationId : '',
+          ipAddress,
+          cleanedDetails.path,
+        ],
+  );
   if (!claimSecurityAlert(fingerprint)) return null;
 
   let tenant = null;
@@ -3122,7 +3305,12 @@ async function reportSecurityAnomaly({
         user_agent=COALESCE(NULLIF(EXCLUDED.user_agent,''),security_events.user_agent),
         details=EXCLUDED.details,
         occurrences=security_events.occurrences + EXCLUDED.occurrences,
-        last_seen_at=NOW(),updated_at=NOW()
+        last_seen_at=NOW(),
+        updated_at=CASE
+          WHEN security_events.telegram_message_id=-1
+            THEN security_events.updated_at
+          ELSE NOW()
+        END
       RETURNING *
     `,
     [
@@ -3136,7 +3324,7 @@ async function reportSecurityAnomaly({
       ipAddress,
       cleanText(req?.headers?.['user-agent'], 500),
       JSON.stringify({
-        ...cleanSecurityDetails(details),
+        ...cleanedDetails,
         count: Math.max(1, Math.trunc(Number(count || 1))),
         threshold: Math.max(1, Math.trunc(Number(threshold || 1))),
         windowMinutes: Math.round(ANOMALY_WINDOW_MS / 60_000),
@@ -3148,43 +3336,65 @@ async function reportSecurityAnomaly({
   if (!event || !TELEGRAM_ENABLED) return event || null;
   const settings = await getPlatformSettings().catch(() => null);
   if (!settings?.telegramGroupId) return event;
+  // 数据库原子占位，保证多实例或多路径同时命中时，同一未处理事件只发一条。
+  const telegramClaim = await pool.query(
+    `UPDATE security_events
+     SET telegram_message_id=-1,updated_at=NOW()
+     WHERE id=$1 AND (
+       telegram_message_id IS NULL
+       OR (telegram_message_id=-1 AND updated_at < NOW() - INTERVAL '5 minutes')
+     )
+     RETURNING id`,
+    [event.id],
+  );
+  if (!telegramClaim.rows[0]) return event;
   const eventDetails = event.details || {};
   const licenseLabel = tenant?.license_id
     ? `${tenant.key_prefix || 'VIP'}-*****-*****-*****-${tenant.key_suffix || '?????'}（${LICENSE_DURATIONS[tenant.duration_code]?.label || tenant.duration_code || '未知期限'}）`
     : '未关联卡密';
-  const sent = await telegramApi('sendMessage', {
-    chat_id: settings.telegramGroupId,
-    text: [
-      `<b>🚨 安全异常告警</b>`,
-      '',
-      `<b>类型</b>：${escapeTelegramHtml(securityKindLabel(event.kind))}`,
-      `<b>次数</b>：<code>${Number(eventDetails.count || count)}</code> / 阈值 <code>${Number(eventDetails.threshold || threshold)}</code>`,
-      `<b>租户</b>：${escapeTelegramHtml(tenant?.name || '未关联租户')}`,
-      tenant?.public_code
-        ? `<b>入口编号</b>：<code>${escapeTelegramHtml(tenant.public_code)}</code>`
-        : '',
-      tenant?.note
-        ? `<b>备注</b>：${escapeTelegramHtml(tenant.note)}`
-        : '',
-      `<b>卡密</b>：<code>${escapeTelegramHtml(licenseLabel)}</code>`,
-      `<b>IP</b>：<code>${escapeTelegramHtml(event.ip_address || 'unknown')}</code>`,
-      eventDetails.path
-        ? `<b>路径</b>：<code>${escapeTelegramHtml(eventDetails.path)}</code>`
-        : '',
-      `<b>时间</b>：${escapeTelegramHtml(formatTelegramDate(event.last_seen_at))}`,
-      '',
-      '系统只做告警，不会自动误封；请由管理员点击下方按钮处理。',
-    ].filter(Boolean).join('\n'),
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-    reply_markup: securityEventKeyboard(event),
-  });
-  await pool.query(
-    `UPDATE security_events
-     SET telegram_chat_id=$2,telegram_message_id=$3,updated_at=NOW()
-     WHERE id=$1`,
-    [event.id, String(settings.telegramGroupId), sent.message_id],
-  );
+  try {
+    const sent = await telegramApi('sendMessage', {
+      chat_id: settings.telegramGroupId,
+      text: [
+        `<b>🚨 安全异常告警</b>`,
+        '',
+        `<b>类型</b>：${escapeTelegramHtml(securityKindLabel(event.kind))}`,
+        `<b>次数</b>：<code>${Number(eventDetails.count || count)}</code> / 阈值 <code>${Number(eventDetails.threshold || threshold)}</code>`,
+        `<b>租户</b>：${escapeTelegramHtml(tenant?.name || '未关联租户')}`,
+        tenant?.public_code
+          ? `<b>入口编号</b>：<code>${escapeTelegramHtml(tenant.public_code)}</code>`
+          : '',
+        tenant?.note
+          ? `<b>备注</b>：${escapeTelegramHtml(tenant.note)}`
+          : '',
+        `<b>卡密</b>：<code>${escapeTelegramHtml(licenseLabel)}</code>`,
+        `<b>IP</b>：<code>${escapeTelegramHtml(event.ip_address || 'unknown')}</code>`,
+        eventDetails.path
+          ? `<b>路径</b>：<code>${escapeTelegramHtml(eventDetails.path)}</code>`
+          : '',
+        `<b>时间</b>：${escapeTelegramHtml(formatTelegramDate(event.last_seen_at))}`,
+        '',
+        '系统只做告警，不会自动误封；请由管理员点击下方按钮处理。',
+      ].filter(Boolean).join('\n'),
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: securityEventKeyboard(event),
+    });
+    await pool.query(
+      `UPDATE security_events
+       SET telegram_chat_id=$2,telegram_message_id=$3,updated_at=NOW()
+       WHERE id=$1 AND telegram_message_id=-1`,
+      [event.id, String(settings.telegramGroupId), sent.message_id],
+    );
+  } catch (error) {
+    await pool.query(
+      `UPDATE security_events
+       SET telegram_message_id=NULL,updated_at=NOW()
+       WHERE id=$1 AND telegram_message_id=-1`,
+      [event.id],
+    ).catch(() => {});
+    throw error;
+  }
   return event;
 }
 
@@ -3917,7 +4127,7 @@ function realtimeConfig() {
     iceServers,
     turnConfigured: Boolean(WEBRTC_TURN_URLS.length && WEBRTC_TURN_USERNAME && WEBRTC_TURN_CREDENTIAL),
     pushEnabled: WEB_PUSH_ENABLED,
-    vapidPublicKey: '',
+    vapidPublicKey: WEB_PUSH_ENABLED ? WEB_PUSH_VAPID_PUBLIC_KEY : '',
   };
 }
 
@@ -3930,7 +4140,8 @@ function parseCallSignal(body = {}) {
   if (!isUuid(callId)) {
     throw requestError('通话编号无效。', 400, 'CALL_ID');
   }
-  const signal = { action, callId };
+  const mode = cleanText(body.mode, 10) === 'video' ? 'video' : 'audio';
+  const signal = { action, callId, mode };
   if (action === 'offer' || action === 'answer') {
     const sdp = body.sdp;
     if (!sdp || typeof sdp !== 'object' || !['offer','answer'].includes(sdp.type)) {
@@ -3959,6 +4170,149 @@ function parseCallSignal(body = {}) {
   return signal;
 }
 
+function pushSubscriptionCacheKey(tenantId, conversationId) {
+  return `${tenantId}:${conversationId}`;
+}
+
+function invalidatePushSubscriptionCache(tenantId, conversationId) {
+  pushSubscriptionCache.delete(
+    pushSubscriptionCacheKey(tenantId, conversationId),
+  );
+}
+
+async function getPushSubscriptions(tenantId, conversationId) {
+  const key = pushSubscriptionCacheKey(tenantId, conversationId);
+  const cached = cacheGet(pushSubscriptionCache, key);
+  if (cached) return cached;
+  const result = await pool.query(
+    `SELECT endpoint,p256dh,auth
+     FROM push_subscriptions
+     WHERE tenant_id=$1 AND conversation_id=$2`,
+    [tenantId, conversationId],
+  );
+  makeRoomInExpiringMap(
+    pushSubscriptionCache,
+    MAX_PUSH_SUBSCRIPTION_CACHE,
+    Date.now(),
+    (item) => item.expiresAt,
+  );
+  return cacheSet(
+    pushSubscriptionCache,
+    key,
+    result.rows,
+    PUSH_SUBSCRIPTION_CACHE_MS,
+  );
+}
+
+async function sendConversationCallNotification(
+  tenantId,
+  conversationId,
+  { callId, mode = 'audio' } = {},
+) {
+  if (!WEB_PUSH_ENABLED || !isUuid(callId)) return;
+  const [subscriptions, config] = await Promise.all([
+    getPushSubscriptions(tenantId, conversationId),
+    getConfig(tenantId),
+  ]);
+  if (!subscriptions.length) return;
+  const serviceName = cleanText(config?.settings?.siteName, 80) || '客服';
+  const callLabel = mode === 'video' ? '视频' : '语音';
+  const payload = JSON.stringify({
+    type: 'incoming-call',
+    title: `${serviceName}邀请你进行${callLabel}通话`,
+    body: '点击打开客服并接听。摄像头和麦克风只会在你接听后请求授权。',
+    tag: `incoming-call-${callId}`,
+    icon: './icons/icon-192.png',
+    badge: './icons/icon-192.png',
+    data: { callId, mode, url: `./?call=${encodeURIComponent(callId)}` },
+  });
+  const staleEndpoints = [];
+  for (let index = 0; index < subscriptions.length; index += 20) {
+    const batch = subscriptions.slice(index, index + 20);
+    const results = await Promise.allSettled(
+      batch.map((subscription) =>
+        webpush.sendNotification(
+          {
+            endpoint: subscription.endpoint,
+            keys: { p256dh: subscription.p256dh, auth: subscription.auth },
+          },
+          payload,
+          { TTL: 90, urgency: 'high' },
+        ),
+      ),
+    );
+    results.forEach((result, resultIndex) => {
+      const statusCode = Number(result.reason?.statusCode || 0);
+      if (result.status === 'rejected' && [404, 410].includes(statusCode)) {
+        staleEndpoints.push(batch[resultIndex].endpoint);
+      }
+    });
+  }
+  if (staleEndpoints.length) {
+    await pool.query(
+      `DELETE FROM push_subscriptions WHERE endpoint = ANY($1::text[])`,
+      [staleEndpoints],
+    );
+    invalidatePushSubscriptionCache(tenantId, conversationId);
+  }
+}
+
+async function savePendingCallOffer(tenantId, conversationId, signal) {
+  const result = await pool.query(
+    `INSERT INTO call_sessions (
+       id,tenant_id,conversation_id,mode,offer,status,expires_at
+     ) VALUES ($1,$2,$3,$4,$5::jsonb,'ringing',NOW() + INTERVAL '2 minutes')
+     ON CONFLICT (id) DO UPDATE SET
+       mode=EXCLUDED.mode,
+       offer=EXCLUDED.offer,
+       updated_at=NOW(),
+       expires_at=NOW() + INTERVAL '2 minutes'
+     RETURNING (xmax = 0) AS inserted`,
+    [
+      signal.callId,
+      tenantId,
+      conversationId,
+      signal.mode,
+      JSON.stringify(signal.sdp),
+    ],
+  );
+  return result.rows[0]?.inserted === true;
+}
+
+async function finishPendingCall(callId, tenantId, conversationId, status) {
+  if (!isUuid(callId)) return;
+  await pool.query(
+    `UPDATE call_sessions
+     SET status=$4,updated_at=NOW(),expires_at=LEAST(expires_at,NOW())
+     WHERE id=$1 AND tenant_id=$2 AND conversation_id=$3`,
+    [callId, tenantId, conversationId, status === 'answered' ? 'answered' : 'ended'],
+  );
+}
+
+async function getPendingCall(callId, tenantId, conversationId) {
+  if (!isUuid(callId)) return null;
+  const result = await pool.query(
+    `SELECT id,mode,offer,created_at
+     FROM call_sessions
+     WHERE id=$1 AND tenant_id=$2 AND conversation_id=$3
+       AND status='ringing' AND expires_at > NOW()`,
+    [callId, tenantId, conversationId],
+  );
+  const row = result.rows[0];
+  return row
+    ? {
+        type: 'call-signal',
+        action: 'offer',
+        callId: row.id,
+        mode: row.mode,
+        sdp: row.offer,
+        conversationId,
+        from: 'admin',
+        at: new Date(row.created_at).toISOString(),
+      }
+    : null;
+}
+
 async function savePushSubscription(payload, body, req) {
   if (!WEB_PUSH_ENABLED) {
     throw requestError('服务器尚未配置离线推送。', 503, 'PUSH_DISABLED');
@@ -3982,6 +4336,12 @@ async function savePushSubscription(payload, body, req) {
         auth=EXCLUDED.auth,
         user_agent=EXCLUDED.user_agent,
         updated_at=NOW()
+      WHERE push_subscriptions.tenant_id IS DISTINCT FROM EXCLUDED.tenant_id
+         OR push_subscriptions.conversation_id IS DISTINCT FROM EXCLUDED.conversation_id
+         OR push_subscriptions.p256dh IS DISTINCT FROM EXCLUDED.p256dh
+         OR push_subscriptions.auth IS DISTINCT FROM EXCLUDED.auth
+         OR push_subscriptions.user_agent IS DISTINCT FROM EXCLUDED.user_agent
+         OR push_subscriptions.updated_at < NOW() - INTERVAL '7 days'
     `,
     [
       endpoint,
@@ -3992,6 +4352,7 @@ async function savePushSubscription(payload, body, req) {
       cleanText(req.headers['user-agent'], 500),
     ],
   );
+  invalidatePushSubscriptionCache(payload.tenantId, payload.conversationId);
 }
 
 async function removePushSubscription(payload, body) {
@@ -4002,6 +4363,7 @@ async function removePushSubscription(payload, body) {
      WHERE endpoint=$1 AND tenant_id=$2 AND conversation_id=$3`,
     [endpoint, payload.tenantId, payload.conversationId],
   );
+  invalidatePushSubscriptionCache(payload.tenantId, payload.conversationId);
 }
 
 function conversationBase(row) {
@@ -6890,6 +7252,7 @@ function telegramOperatorAllowed(chat, userId) {
     ['group', 'supergroup'].includes(chat?.type) &&
       TELEGRAM_ALLOWED_GROUP_IDS.has(String(chat.id)),
   );
+  invalidatePushSubscriptionCache(payload.tenantId, payload.conversationId);
 }
 
 async function telegramOperatorAllowedAsync(chat, userId) {
@@ -8685,6 +9048,7 @@ function sampleCpuPercent() {
       (usedMicros / elapsedMicros / INSTANCE_CPU_CORES) * 100,
     ).toFixed(2),
   );
+  invalidatePushSubscriptionCache(payload.tenantId, payload.conversationId);
 }
 
 async function collectMonitorSnapshot({ persist = true } = {}) {
@@ -13732,9 +14096,25 @@ async function router(req, res, parsedRequestUrl = null) {
     const approvedTemplateOrigin = normalizeOrigin(
       config.settings.frontendOrigin,
     );
+    if (STRICT_CLIENT_ORIGIN && !approvedTemplateOrigin) {
+      return sendError(
+        res,
+        503,
+        '租户尚未配置有效的用户端来源，请联系管理员。',
+        'CLIENT_ORIGIN_CONFIG',
+      );
+    }
+    if (STRICT_CLIENT_ORIGIN && !requestOrigin) {
+      return sendError(
+        res,
+        403,
+        '浏览器没有提供可验证的页面来源，请从商家客服入口重新打开。',
+        'CLIENT_ORIGIN_MISSING',
+      );
+    }
     if (
       STRICT_CLIENT_ORIGIN &&
-      (!requestOrigin || requestOrigin !== approvedTemplateOrigin)
+      !timingSafeTextEqual(requestOrigin, approvedTemplateOrigin)
     ) {
       scheduleSecurityAnomaly({
         kind: 'template-origin-mismatch',
@@ -13743,7 +14123,7 @@ async function router(req, res, parsedRequestUrl = null) {
         tenantId: tenant.id,
         details: {
           path: pathname,
-          requestOrigin: requestOrigin || '(missing)',
+          requestOrigin,
           approvedOrigin: approvedTemplateOrigin,
         },
       });
@@ -14000,22 +14380,10 @@ async function router(req, res, parsedRequestUrl = null) {
     ) {
       return sendError(res, 401, '登录已失效。', 'AUTH');
     }
-    if (payload.kind === 'user' && !userTokenOriginAllowed(req, payload)) {
-      scheduleSecurityAnomaly({
-        kind: 'user-token-origin-mismatch',
-        req,
-        severity: 'critical',
-        tenantId: payload.tenantId,
-        conversationId: payload.conversationId,
-        details: { path: pathname },
-      });
-      return sendError(
-        res,
-        403,
-        '访客会话不能在其他站点使用。',
-        'CLIENT_ORIGIN',
-      );
-    }
+    if (
+      payload.kind === 'user' &&
+      rejectInvalidUserTokenOrigin(req, res, payload, pathname)
+    ) return;
 
     let tenant = null;
     if (!['super_admin', 'distributor'].includes(payload.kind)) {
@@ -14238,22 +14606,7 @@ async function router(req, res, parsedRequestUrl = null) {
         'AUTH',
       );
     }
-    if (!userTokenOriginAllowed(req, payload)) {
-      scheduleSecurityAnomaly({
-        kind: 'user-token-origin-mismatch',
-        req,
-        severity: 'critical',
-        tenantId: payload.tenantId,
-        conversationId: payload.conversationId,
-        details: { path: pathname },
-      });
-      return sendError(
-        res,
-        403,
-        '访客会话不能在其他站点使用。',
-        'CLIENT_ORIGIN',
-      );
-    }
+    if (rejectInvalidUserTokenOrigin(req, res, payload, pathname)) return;
 
     const tenant = await getTenantById(payload.tenantId);
     if (tenantAccessIssue(tenant)) return sendTenantAccessError(res,tenant,'user');
@@ -14335,8 +14688,32 @@ async function router(req, res, parsedRequestUrl = null) {
       return sendJson(res, 200, { ok: true });
     }
 
+    if (req.method === 'GET' && pathname === '/api/user/pending-call') {
+      const call = await getPendingCall(
+        url.searchParams.get('callId'),
+        payload.tenantId,
+        conversation.id,
+      );
+      return sendJson(res, 200, { ok: true, call });
+    }
+
     if (req.method === 'POST' && pathname === '/api/user/call-signal') {
       const signal = parseCallSignal(await readJson(req, 256 * 1024));
+      if (signal.action === 'answer') {
+        await finishPendingCall(
+          signal.callId,
+          payload.tenantId,
+          conversation.id,
+          'answered',
+        );
+      } else if (['hangup','reject','busy'].includes(signal.action)) {
+        await finishPendingCall(
+          signal.callId,
+          payload.tenantId,
+          conversation.id,
+          'ended',
+        );
+      }
       publishEvent(
         {
           type: 'call-signal',
@@ -15559,6 +15936,21 @@ async function router(req, res, parsedRequestUrl = null) {
 
       if (req.method === 'POST' && action === 'call') {
         const signal = parseCallSignal(await readJson(req, 256 * 1024));
+        let newCallOffer = false;
+        if (signal.action === 'offer') {
+          newCallOffer = await savePendingCallOffer(
+            payload.tenantId,
+            conversationId,
+            signal,
+          );
+        } else if (['hangup','reject','busy'].includes(signal.action)) {
+          await finishPendingCall(
+            signal.callId,
+            payload.tenantId,
+            conversationId,
+            'ended',
+          );
+        }
         publishEvent(
           {
             type: 'call-signal',
@@ -15573,6 +15965,17 @@ async function router(req, res, parsedRequestUrl = null) {
             targetKind: 'user',
           },
         );
+        if (newCallOffer) {
+          queueMicrotask(() => {
+            sendConversationCallNotification(
+              payload.tenantId,
+              conversationId,
+              signal,
+            ).catch((error) =>
+              console.error('视频/语音来电推送失败：', error.message),
+            );
+          });
+        }
         return sendJson(res, 200, { ok: true });
       }
 
@@ -15620,14 +16023,10 @@ async function router(req, res, parsedRequestUrl = null) {
     if (!payload) {
       return sendError(res, 401, '没有权限读取媒体。', 'AUTH');
     }
-    if (payload.kind === 'user' && !userTokenOriginAllowed(req, payload)) {
-      return sendError(
-        res,
-        403,
-        '访客会话不能在其他站点使用。',
-        'CLIENT_ORIGIN',
-      );
-    }
+    if (
+      payload.kind === 'user' &&
+      rejectInvalidUserTokenOrigin(req, res, payload, pathname)
+    ) return;
 
     const attachmentId = safeDecodeURIComponent(
       pathname.slice('/api/media/'.length),
