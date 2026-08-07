@@ -36,7 +36,7 @@ const PUBLIC_API_BASE = String(
 const QR_ENTRY_BASE = String(
   process.env.QR_ENTRY_BASE || PUBLIC_API_BASE,
 ).replace(/\/+$/, '');
-const APP_VERSION = String(process.env.APP_VERSION || '2.4.2').trim();
+const APP_VERSION = String(process.env.APP_VERSION || '2.4.4').trim();
 const SUPPORT_TELEGRAM = String(
   process.env.SUPPORT_TELEGRAM || '@YingYingUu',
 ).trim();
@@ -205,6 +205,11 @@ const ANOMALY_MESSAGE_CONVERSATION_LIMIT = Math.trunc(
 const ANOMALY_MESSAGE_TENANT_LIMIT = Math.trunc(
   envNumber('ANOMALY_MESSAGES_TENANT_10M', 600, 50, 1_000_000),
 );
+// 来源不一致仍会立即拒绝，但必须连续出现才通知管理员。这样可以挡住
+// 令牌跨站复用，同时避免移动端 WebView/PWA 换域名时的一次性旧会话误报。
+const ANOMALY_ORIGIN_MISMATCH_LIMIT = Math.trunc(
+  envNumber('ANOMALY_ORIGIN_MISMATCH_10M', 3, 2, 1000),
+);
 const QR_INCIDENT_WINDOW_MINUTES = Math.trunc(
   envNumber('QR_INCIDENT_WINDOW_MINUTES', 10, 1, 1440),
 );
@@ -252,6 +257,24 @@ const WEB_PUSH_VAPID_PRIVATE_KEY = String(
 const WEB_PUSH_SUBJECT = String(
   process.env.WEB_PUSH_SUBJECT || 'mailto:security@example.com',
 ).trim();
+const DEFAULT_WEB_PUSH_HOSTS = [
+  'fcm.googleapis.com',
+  'updates.push.services.mozilla.com',
+  'push.services.mozilla.com',
+  'web.push.apple.com',
+  '.notify.windows.com',
+];
+const WEB_PUSH_ALLOWED_HOSTS = new Set(
+  [
+    ...DEFAULT_WEB_PUSH_HOSTS,
+    ...String(process.env.WEB_PUSH_ALLOWED_HOSTS || '').split(','),
+  ]
+    .map((item) => item.trim().toLowerCase())
+    .filter((item) =>
+      /^\.?[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/.test(item) &&
+      (!item.startsWith('.') || item.slice(1).includes('.')),
+    ),
+);
 const WEB_PUSH_ENABLED = Boolean(
   WEB_PUSH_VAPID_PUBLIC_KEY && WEB_PUSH_VAPID_PRIVATE_KEY,
 );
@@ -506,11 +529,15 @@ const tenantFeatureCache = new Map();
 const tenantAccessCache = new Map();
 const tenantCodeAccessCache = new Map();
 const tenantAdminAccessCache = new Map();
+const tenantQrImageCache = new Map();
 const superAuthCache = new Map();
 const distributorAuthCache = new Map();
 const pushSubscriptionCache = new Map();
 const PUSH_SUBSCRIPTION_CACHE_MS = 60_000;
 const MAX_PUSH_SUBSCRIPTION_CACHE = 2_000;
+const MAX_PUSH_SUBSCRIPTIONS_PER_CONVERSATION = 8;
+const TENANT_QR_CACHE_MS = 5 * 60_000;
+const MAX_TENANT_QR_CACHE = 100;
 let approvedOriginCache = new Set(STATIC_ALLOWED_ORIGINS);
 let approvedOriginCacheExpiresAt = 0;
 let nextEventId = 1;
@@ -649,10 +676,14 @@ function invalidateTenantCaches(tenantId = '') {
   if (tenantId) {
     tenantConfigCache.delete(tenantId);
     tenantFeatureCache.delete(tenantId);
+    for (const key of tenantQrImageCache.keys()) {
+      if (key.startsWith(`${tenantId}:`)) tenantQrImageCache.delete(key);
+    }
     return;
   }
   tenantConfigCache.clear();
   tenantFeatureCache.clear();
+  tenantQrImageCache.clear();
 }
 
 function invalidateTenantAccessCaches(tenantId = '') {
@@ -1348,6 +1379,7 @@ async function initDatabase() {
         caller_kind TEXT NOT NULL DEFAULT 'admin'
           CHECK (caller_kind IN ('user','admin')),
         caller_name TEXT NOT NULL DEFAULT '',
+        caller_device_id TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT 'ringing'
           CHECK (status IN (
             'ringing','answered','connected','completed','rejected',
@@ -1367,6 +1399,7 @@ async function initDatabase() {
     `);
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS caller_kind TEXT NOT NULL DEFAULT 'admin'`);
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS caller_name TEXT NOT NULL DEFAULT ''`);
+    await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS caller_device_id TEXT NOT NULL DEFAULT ''`);
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS claimed_by TEXT`);
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ`);
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS answered_at TIMESTAMPTZ`);
@@ -2384,9 +2417,15 @@ function rejectInvalidUserTokenOrigin(req, res, payload, pathname) {
   const check = inspectUserTokenOrigin(req, payload);
   if (check.allowed) return false;
   if (check.reason === 'mismatch') {
-    scheduleSecurityAnomaly({
+    observeBehaviorCounter(req, {
       kind: 'user-token-origin-mismatch',
-      req,
+      key: securityFingerprint([
+        payload.tenantId,
+        payload.conversationId,
+        check.requestOrigin,
+        check.tokenOrigin,
+      ]),
+      limit: ANOMALY_ORIGIN_MISMATCH_LIMIT,
       severity: 'critical',
       tenantId: payload.tenantId,
       conversationId: payload.conversationId,
@@ -3278,8 +3317,8 @@ function securityKindLabel(kind) {
   if (kind === 'message-tenant') return '租户消息量异常';
   if (kind === 'suspicious-path') return '敏感路径扫描';
   if (kind === 'suspicious-agent') return '自动化扫描工具';
-  if (kind === 'template-origin-mismatch') return '用户端来源不匹配';
-  if (kind === 'user-token-origin-mismatch') return '访客令牌明确跨站复用';
+  if (kind === 'template-origin-mismatch') return '用户端部署来源连续不匹配';
+  if (kind === 'user-token-origin-mismatch') return '访客令牌连续跨站复用';
   if (kind.startsWith('rate-limit:')) {
     return `接口频率异常（${kind.slice('rate-limit:'.length)}）`;
   }
@@ -3288,7 +3327,9 @@ function securityKindLabel(kind) {
 
 function securityEventKeyboard(event) {
   const rows = [];
-  if (event.license_id) {
+  // 访客异常不等于租户卡密被盗，禁止把普通来源/频率告警直接变成
+  // “封禁租户”按钮。只有将来由服务端明确标记凭据滥用的事件才开放。
+  if (event.license_id && event.details?.allowLicenseBlock === true) {
     rows.push([{
       text: '⛔ 封禁租户卡密',
       callback_data: `sec:license:${event.id}`,
@@ -3463,7 +3504,7 @@ async function reportSecurityAnomaly({
           : '',
         `<b>时间</b>：${escapeTelegramHtml(formatTelegramDate(event.last_seen_at))}`,
         '',
-        '系统只做告警，不会自动误封；请由管理员点击下方按钮处理。',
+        '异常请求已按规则拒绝或限流；系统不会自动封禁租户，请由管理员核实。',
       ].filter(Boolean).join('\n'),
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
@@ -3502,6 +3543,7 @@ function observeBehaviorCounter(req, {
   tenantId = '',
   licenseId = '',
   conversationId = '',
+  severity = 'warning',
   details = {},
   increment = 1,
 }) {
@@ -3529,6 +3571,7 @@ function observeBehaviorCounter(req, {
     tenantId,
     licenseId,
     conversationId,
+    severity,
     count: bucket.count,
     threshold: limit,
     details,
@@ -4374,7 +4417,7 @@ function parseCallSignal(body = {}) {
   };
   if (action === 'offer' || action === 'answer') {
     const sdp = body.sdp;
-    if (!sdp || typeof sdp !== 'object' || !['offer','answer'].includes(sdp.type)) {
+    if (!sdp || typeof sdp !== 'object' || sdp.type !== action) {
       throw requestError('通话描述无效。', 400, 'CALL_SDP');
     }
     const value = cleanSdpText(sdp.sdp, 200_000);
@@ -4553,6 +4596,44 @@ function pushSubscriptionCacheKey(tenantId, conversationId) {
   return `${tenantId}:${conversationId}`;
 }
 
+function webPushHostnameAllowed(value) {
+  const hostname = String(value || '').trim().toLowerCase();
+  if (!hostname || isIP(hostname)) return false;
+  return [...WEB_PUSH_ALLOWED_HOSTS].some((rule) =>
+    rule.startsWith('.')
+      ? hostname.length > rule.length && hostname.endsWith(rule)
+      : hostname === rule,
+  );
+}
+
+function normalizeWebPushEndpoint(value) {
+  const raw = cleanText(value, 2048);
+  let endpoint;
+  try {
+    endpoint = new URL(raw);
+  } catch {
+    return '';
+  }
+  if (
+    endpoint.protocol !== 'https:' ||
+    endpoint.username ||
+    endpoint.password ||
+    endpoint.port && endpoint.port !== '443' ||
+    endpoint.hash ||
+    !webPushHostnameAllowed(endpoint.hostname)
+  ) return '';
+  return endpoint.toString();
+}
+
+function validWebPushKey(value, min, max) {
+  const key = cleanText(value, max);
+  return key.length >= min &&
+    key.length <= max &&
+    /^[A-Za-z0-9_-]+$/.test(key)
+    ? key
+    : '';
+}
+
 function invalidatePushSubscriptionCache(tenantId, conversationId) {
   pushSubscriptionCache.delete(
     pushSubscriptionCacheKey(tenantId, conversationId),
@@ -4566,9 +4647,28 @@ async function getPushSubscriptions(tenantId, conversationId) {
   const result = await pool.query(
     `SELECT endpoint,p256dh,auth
      FROM push_subscriptions
-     WHERE tenant_id=$1 AND conversation_id=$2`,
+     WHERE tenant_id=$1 AND conversation_id=$2
+     ORDER BY updated_at DESC,endpoint`,
     [tenantId, conversationId],
   );
+  const subscriptions = result.rows
+    .filter((subscription) =>
+      normalizeWebPushEndpoint(subscription.endpoint) &&
+      validWebPushKey(subscription.p256dh, 80, 120) &&
+      validWebPushKey(subscription.auth, 16, 64),
+    )
+    .slice(0, MAX_PUSH_SUBSCRIPTIONS_PER_CONVERSATION);
+  if (subscriptions.length !== result.rows.length) {
+    const invalidEndpoints = result.rows
+      .filter((subscription) => !subscriptions.includes(subscription))
+      .map((subscription) => subscription.endpoint);
+    await pool.query(
+      `DELETE FROM push_subscriptions
+       WHERE tenant_id=$1 AND conversation_id=$2
+         AND endpoint=ANY($3::text[])`,
+      [tenantId, conversationId, invalidEndpoints],
+    );
+  }
   makeRoomInExpiringMap(
     pushSubscriptionCache,
     MAX_PUSH_SUBSCRIPTION_CACHE,
@@ -4578,7 +4678,7 @@ async function getPushSubscriptions(tenantId, conversationId) {
   return cacheSet(
     pushSubscriptionCache,
     key,
-    result.rows,
+    subscriptions,
     PUSH_SUBSCRIPTION_CACHE_MS,
   );
 }
@@ -4679,6 +4779,7 @@ async function savePendingCallOffer(
   callerKind,
 ) {
   const normalizedCallerKind = callerKind === 'user' ? 'user' : 'admin';
+  const callerDeviceId = cleanText(signal.deviceId, 120) || 'legacy';
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -4693,7 +4794,10 @@ async function savePendingCallOffer(
     );
     const existing = existingResult.rows[0];
     if (existing) {
-      if (existing.caller_kind !== normalizedCallerKind) {
+      if (
+        existing.caller_kind !== normalizedCallerKind ||
+        existing.caller_device_id && existing.caller_device_id !== callerDeviceId
+      ) {
         throw requestError('通话编号已被使用。', 409, 'CALL_ID_CONFLICT');
       }
       if (!ACTIVE_CALL_STATUSES.has(existing.status)) {
@@ -4704,6 +4808,10 @@ async function savePendingCallOffer(
           UPDATE call_sessions
           SET mode=$4,
               offer=$5::jsonb,
+              caller_device_id=CASE
+                WHEN caller_device_id='' THEN $8
+                ELSE caller_device_id
+              END,
               updated_at=NOW(),
               expires_at=NOW() + (
                 CASE WHEN status='ringing' THEN $6::int ELSE $7::int END::text || ' seconds'
@@ -4719,6 +4827,7 @@ async function savePendingCallOffer(
           JSON.stringify(signal.sdp),
           CALL_RING_TIMEOUT_SECONDS,
           CALL_ACTIVE_TIMEOUT_SECONDS,
+          callerDeviceId,
         ],
       );
       await client.query('COMMIT');
@@ -4749,10 +4858,10 @@ async function savePendingCallOffer(
         `
           INSERT INTO call_sessions (
             id,tenant_id,conversation_id,mode,offer,caller_kind,caller_name,
-            status,ended_at,end_reason,expires_at
+            caller_device_id,status,ended_at,end_reason,expires_at
           ) VALUES (
             $1,$2,$3,$4,$5::jsonb,$6,$7,
-            'busy',NOW(),'busy',NOW() + ($8::int::text || ' hours')::interval
+            $8,'busy',NOW(),'busy',NOW() + ($9::int::text || ' hours')::interval
           )
           RETURNING *
         `,
@@ -4764,6 +4873,7 @@ async function savePendingCallOffer(
           JSON.stringify(signal.sdp),
           normalizedCallerKind,
           identity.callerName,
+          callerDeviceId,
           identity.retentionHours,
         ],
       );
@@ -4775,10 +4885,10 @@ async function savePendingCallOffer(
       `
         INSERT INTO call_sessions (
           id,tenant_id,conversation_id,mode,offer,caller_kind,caller_name,
-          status,expires_at
+          caller_device_id,status,expires_at
         ) VALUES (
           $1,$2,$3,$4,$5::jsonb,$6,$7,
-          'ringing',NOW() + ($8::int::text || ' seconds')::interval
+          $8,'ringing',NOW() + ($9::int::text || ' seconds')::interval
         )
         RETURNING *
       `,
@@ -4790,6 +4900,7 @@ async function savePendingCallOffer(
         JSON.stringify(signal.sdp),
         normalizedCallerKind,
         identity.callerName,
+        callerDeviceId,
         CALL_RING_TIMEOUT_SECONDS,
       ],
     );
@@ -4878,23 +4989,38 @@ async function answerPendingCall(
   return { accepted: false, call: current.rows[0] || null };
 }
 
-async function markPendingCallConnected(callId, tenantId, conversationId) {
+async function markPendingCallConnected(
+  callId,
+  tenantId,
+  conversationId,
+  actorKind,
+  deviceId,
+) {
   if (!isUuid(callId)) return null;
+  const actorDeviceId = cleanText(deviceId, 120) || 'legacy';
+  const actorKey = callActorKey(actorKind, actorDeviceId);
   const result = await pool.query(
     `
       UPDATE call_sessions
       SET status='connected',
           connected_at=COALESCE(connected_at,NOW()),
           updated_at=NOW(),
-          expires_at=NOW() + ($4::int::text || ' seconds')::interval
+          expires_at=NOW() + ($7::int::text || ' seconds')::interval
       WHERE id=$1 AND tenant_id=$2 AND conversation_id=$3
-        AND status=ANY($5::text[])
+        AND status=ANY($8::text[])
+        AND (
+          (caller_kind=$4 AND (caller_device_id='' OR caller_device_id=$5))
+          OR (caller_kind <> $4 AND claimed_by=$6)
+        )
       RETURNING *
     `,
     [
       callId,
       tenantId,
       conversationId,
+      actorKind,
+      actorDeviceId,
+      actorKey,
       CALL_ACTIVE_TIMEOUT_SECONDS,
       ['answered', 'connected'],
     ],
@@ -4912,6 +5038,7 @@ async function finishPendingCall(
   reason = '',
 ) {
   if (!isUuid(callId)) return { accepted: false, call: null };
+  const actorDeviceId = cleanText(deviceId, 120) || 'legacy';
   const actorKey = callActorKey(actorKind, deviceId);
   const client = await pool.connect();
   try {
@@ -4931,17 +5058,24 @@ async function finishPendingCall(
       await client.query('COMMIT');
       return { accepted: false, call: current || null };
     }
-    if (
+    const wrongCallerDevice =
+      current.caller_kind === actorKind &&
+      current.caller_device_id &&
+      current.caller_device_id !== actorDeviceId;
+    const wrongClaimedDevice =
       current.caller_kind !== actorKind &&
       current.claimed_by &&
-      current.claimed_by !== actorKey
-    ) {
+      current.claimed_by !== actorKey;
+    if (wrongCallerDevice || wrongClaimedDevice) {
       await client.query('COMMIT');
       return { accepted: false, call: current };
     }
     let finalStatus;
-    if (action === 'reject') finalStatus = 'rejected';
-    else if (action === 'busy') finalStatus = 'busy';
+    if (action === 'reject') {
+      finalStatus = current.caller_kind === actorKind ? 'cancelled' : 'rejected';
+    } else if (action === 'busy') {
+      finalStatus = current.caller_kind === actorKind ? 'cancelled' : 'busy';
+    }
     else if (action === 'timeout') finalStatus = 'missed';
     else if (action === 'failed') finalStatus = 'failed';
     else if (current.status === 'ringing') {
@@ -4976,7 +5110,7 @@ async function finishPendingCall(
         conversationId,
         finalStatus,
         durationSeconds,
-        cleanText(reason, 120) || finalStatus,
+        finalStatus,
         retentionHours,
       ],
     );
@@ -5045,13 +5179,13 @@ async function savePushSubscription(payload, body, req) {
     throw requestError('服务器尚未配置离线推送。', 503, 'PUSH_DISABLED');
   }
   const subscription = body?.subscription || body;
-  const endpoint = cleanText(subscription?.endpoint, 4000);
-  const p256dh = cleanText(subscription?.keys?.p256dh, 1000);
-  const auth = cleanText(subscription?.keys?.auth, 1000);
-  if (!/^https:\/\//i.test(endpoint) || !p256dh || !auth) {
+  const endpoint = normalizeWebPushEndpoint(subscription?.endpoint);
+  const p256dh = validWebPushKey(subscription?.keys?.p256dh, 80, 120);
+  const auth = validWebPushKey(subscription?.keys?.auth, 16, 64);
+  if (!endpoint || !p256dh || !auth) {
     throw requestError('推送订阅信息无效。', 400, 'PUSH_SUBSCRIPTION');
   }
-  await pool.query(
+  const saved = await pool.query(
     `
       INSERT INTO push_subscriptions (
         endpoint,tenant_id,conversation_id,p256dh,auth,user_agent
@@ -5069,6 +5203,7 @@ async function savePushSubscription(payload, body, req) {
          OR push_subscriptions.auth IS DISTINCT FROM EXCLUDED.auth
          OR push_subscriptions.user_agent IS DISTINCT FROM EXCLUDED.user_agent
          OR push_subscriptions.updated_at < NOW() - INTERVAL '7 days'
+      RETURNING endpoint
     `,
     [
       endpoint,
@@ -5079,11 +5214,28 @@ async function savePushSubscription(payload, body, req) {
       cleanText(req.headers['user-agent'], 500),
     ],
   );
+  if (!saved.rows[0]) return;
+  await pool.query(
+    `DELETE FROM push_subscriptions
+     WHERE tenant_id=$1 AND conversation_id=$2
+       AND endpoint NOT IN (
+         SELECT endpoint
+         FROM push_subscriptions
+         WHERE tenant_id=$1 AND conversation_id=$2
+         ORDER BY updated_at DESC,endpoint
+         LIMIT $3
+       )`,
+    [
+      payload.tenantId,
+      payload.conversationId,
+      MAX_PUSH_SUBSCRIPTIONS_PER_CONVERSATION,
+    ],
+  );
   invalidatePushSubscriptionCache(payload.tenantId, payload.conversationId);
 }
 
 async function removePushSubscription(payload, body) {
-  const endpoint = cleanText(body?.endpoint, 4000);
+  const endpoint = cleanText(body?.endpoint, 2048);
   if (!endpoint) return;
   await pool.query(
     `DELETE FROM push_subscriptions
@@ -5278,31 +5430,43 @@ async function getTemplateCatalog(
     `,
     [isSuper, isUuid(tenantId) ? tenantId : null],
   );
-  return result.rows.map((row) => ({
-    id: row.id,
-    name: row.name,
-    baseUrl: row.base_url,
-    displayUrl: row.base_url.replace(/^https:\/\//i, '').replace(/\/$/, ''),
-    origin: row.origin,
-    ...(isSuper
-      ? { netlifySiteId: row.netlify_site_id || '' }
-      : { netlifyReady: Boolean(row.netlify_site_id && NETLIFY_AUTH_TOKEN) }),
-    coverUrl: row.cover_asset_id
-      ? `${PUBLIC_API_BASE}/api/public/assets/${row.cover_asset_id}`
-      : '',
-    clientVersion: row.client_version,
-    minBackendVersion: row.min_backend_version,
-    status: row.status,
-    selectionClosed: Boolean(row.selection_closed),
-    sortOrder: Number(row.sort_order || 0),
-    recommended: Boolean(row.recommended),
-    isDefault: Boolean(row.is_default),
-    testTenantIds: Array.isArray(row.test_tenant_ids)
-      ? row.test_tenant_ids
-      : [],
-    usageCount: Number(row.usage_count || 0),
-    activeIncidentCount: Number(row.active_incident_count || 0),
-  }));
+  return result.rows.flatMap((row) => {
+    let baseUrl;
+    try {
+      const parsed = parseTemplateFetchTarget(row.base_url);
+      parsed.hash = '';
+      baseUrl = parsed.toString();
+    } catch {
+      // 兼容旧版本数据库：历史非法地址既不能进入租户选择，也不能成为
+      // 超级后台可点击链接。管理员修正数据库记录后会自动重新出现。
+      return [];
+    }
+    return [{
+      id: row.id,
+      name: row.name,
+      baseUrl,
+      displayUrl: baseUrl.replace(/^https:\/\//i, '').replace(/\/$/, ''),
+      origin: new URL(baseUrl).origin,
+      ...(isSuper
+        ? { netlifySiteId: row.netlify_site_id || '' }
+        : { netlifyReady: Boolean(row.netlify_site_id && NETLIFY_AUTH_TOKEN) }),
+      coverUrl: row.cover_asset_id
+        ? `${PUBLIC_API_BASE}/api/public/assets/${row.cover_asset_id}`
+        : '',
+      clientVersion: row.client_version,
+      minBackendVersion: row.min_backend_version,
+      status: row.status,
+      selectionClosed: Boolean(row.selection_closed),
+      sortOrder: Number(row.sort_order || 0),
+      recommended: Boolean(row.recommended),
+      isDefault: Boolean(row.is_default),
+      testTenantIds: Array.isArray(row.test_tenant_ids)
+        ? row.test_tenant_ids
+        : [],
+      usageCount: Number(row.usage_count || 0),
+      activeIncidentCount: Number(row.active_incident_count || 0),
+    }];
+  });
 }
 
 function tenantEntryUrl(settings, publicCode) {
@@ -9188,7 +9352,7 @@ async function handleTelegramPrivateInbound(message) {
   if (await telegramUserIsBlocked(userId)) {
     await telegramApi('sendMessage', {
       chat_id: message.chat.id,
-      text: '你已被管理员禁止访问机器人。你的 Telegram 用户 ID 和相关记录已被保留；Telegram 机器人无法获取你的 IP。',
+      text: '你已被管理员禁止访问机器人。你的 Telegram 用户 ID 和相关记录已被保存；',
     }).catch(() => {});
     return true;
   }
@@ -9230,7 +9394,7 @@ async function handleTelegramPrivateInbound(message) {
   }
   await telegramApi('sendMessage', {
     chat_id: message.chat.id,
-    text: '✅ 你的消息已转发给管理员。',
+    text: '你没有权限访问此机器人。',
   }).catch(() => {});
   return true;
 }
@@ -13966,8 +14130,7 @@ return sendJson(res, 200, { ok: true });
     const body = await readJson(req, 64 * 1024);
     let parsed;
     try {
-      parsed = new URL(cleanText(body.baseUrl, 500));
-      if (parsed.protocol !== 'https:') throw new Error();
+      parsed = parseTemplateFetchTarget(cleanText(body.baseUrl, 500));
     } catch {
       return sendError(res, 400, '模板必须使用有效 HTTPS 地址。', 'TEMPLATE_URL');
     }
@@ -14206,8 +14369,9 @@ return sendJson(res, 200, { ok: true });
       let netlifySiteId = null;
       if (body.baseUrl !== undefined) {
         try {
-          const parsed = new URL(cleanText(body.baseUrl, 500));
-          if (parsed.protocol !== 'https:') throw new Error();
+          const parsed = parseTemplateFetchTarget(
+            cleanText(body.baseUrl, 500),
+          );
           parsed.hash = '';
           baseUrl = parsed.toString();
           origin = parsed.origin;
@@ -14847,10 +15011,15 @@ async function router(req, res, parsedRequestUrl = null) {
       STRICT_CLIENT_ORIGIN &&
       !timingSafeTextEqual(requestOrigin, approvedTemplateOrigin)
     ) {
-      scheduleSecurityAnomaly({
+      observeBehaviorCounter(req, {
         kind: 'template-origin-mismatch',
-        req,
-        severity: 'critical',
+        key: securityFingerprint([
+          tenant.id,
+          requestOrigin,
+          approvedTemplateOrigin,
+        ]),
+        limit: ANOMALY_ORIGIN_MISMATCH_LIMIT,
+        severity: 'warning',
         tenantId: tenant.id,
         details: {
           path: pathname,
@@ -15411,6 +15580,18 @@ async function router(req, res, parsedRequestUrl = null) {
     }
 
     if (req.method === 'POST' && pathname === '/api/user/push/subscribe') {
+      if (!rateLimit(
+        req,
+        res,
+        'push-subscribe',
+        12,
+        10 * 60_000,
+        `${payload.tenantId}:${conversation.id}`,
+        {
+          tenantId: payload.tenantId,
+          conversationId: conversation.id,
+        },
+      )) return;
       const body = await readJson(req, 32 * 1024);
       await savePushSubscription(payload, body, req);
       return sendJson(res, 201, { ok: true });
@@ -15432,6 +15613,18 @@ async function router(req, res, parsedRequestUrl = null) {
     }
 
     if (req.method === 'POST' && pathname === '/api/user/call-signal') {
+      if (!rateLimit(
+        req,
+        res,
+        'user-call-signal',
+        240,
+        60_000,
+        `${payload.tenantId}:${conversation.id}`,
+        {
+          tenantId: payload.tenantId,
+          conversationId: conversation.id,
+        },
+      )) return;
       const signal = parseCallSignal(await readJson(req, 256 * 1024));
       if (signal.action === 'offer') {
         const saved = await savePendingCallOffer(
@@ -15529,6 +15722,8 @@ async function router(req, res, parsedRequestUrl = null) {
           signal.callId,
           payload.tenantId,
           conversation.id,
+          'user',
+          signal.deviceId,
         );
         if (connectedCall) publishCallLogUpdate(connectedCall);
         return sendJson(res, 200, { ok: true });
@@ -16343,60 +16538,49 @@ async function router(req, res, parsedRequestUrl = null) {
         )
       ) return;
       const config = await getConfig(payload.tenantId);
-      const previewTemplateId = cleanText(
-        url.searchParams.get('templateId'),
-        80,
-      );
-      let entrySettings = config.settings;
-      if (previewTemplateId) {
-        if (!isUuid(previewTemplateId)) {
-          return sendError(res, 400, '用户端模板无效。', 'FRONTEND_TEMPLATE');
-        }
-        const template = await pool.query(
-          `
-            SELECT id,base_url
-            FROM frontend_templates
-            WHERE id=$1
-              AND (
-                status='enabled'
-                OR (
-                  status='testing'
-                  AND EXISTS (
-                    SELECT 1
-                    FROM jsonb_array_elements_text(test_tenant_ids) allowed(id)
-                    WHERE allowed.id=$2::text
-                  )
-                )
-              )
-          `,
-          [previewTemplateId, payload.tenantId],
-        );
-        if (!template.rows[0]) {
-          return sendError(res, 404, '用户端模板不可用。', 'FRONTEND_TEMPLATE');
-        }
-        entrySettings = {
-          ...entrySettings,
-          frontendBaseUrl: template.rows[0].base_url,
-        };
-      }
       // 活码只保存稳定跳转入口；模板预览与后续换域名不会改变二维码内容。
       const entryUrl = tenantQrEntryUrl(activeTenant.public_code);
-      const logoData = await readTenantQrLogo(
-        payload.tenantId,
-        config.settings.qrLogoAssetId,
-      ).catch(() => null);
       // plain=1 只返回二维码主体（仍保留租户上传的中心图片）。
       // 新版租户后台会在浏览器 Canvas 中绘制中文文字，避免服务器缺少中文字体时出现方框乱码。
       const plainQr = url.searchParams.get('plain') === '1';
-      const image = await buildTenantQrImage(entryUrl, {
-        topText: plainQr ? '' : config.settings.qrTopText || '',
-        bottomText: plainQr
-          ? ''
-          : config.settings.qrBottomText !== undefined
-            ? config.settings.qrBottomText
-            : DEFAULT_QR_BOTTOM_TEXT,
-        logoData,
-      });
+      const topText = plainQr ? '' : config.settings.qrTopText || '';
+      const bottomText = plainQr
+        ? ''
+        : config.settings.qrBottomText !== undefined
+          ? config.settings.qrBottomText
+          : DEFAULT_QR_BOTTOM_TEXT;
+      const cacheHash = createHash('sha256').update(JSON.stringify([
+        entryUrl,
+        plainQr,
+        topText,
+        bottomText,
+        config.settings.qrLogoAssetId || '',
+      ])).digest('base64url');
+      const qrCacheKey = `${payload.tenantId}:${cacheHash}`;
+      let image = cacheGet(tenantQrImageCache, qrCacheKey);
+      if (!image) {
+        const logoData = await readTenantQrLogo(
+          payload.tenantId,
+          config.settings.qrLogoAssetId,
+        ).catch(() => null);
+        image = await buildTenantQrImage(entryUrl, {
+          topText,
+          bottomText,
+          logoData,
+        });
+        makeRoomInExpiringMap(
+          tenantQrImageCache,
+          MAX_TENANT_QR_CACHE,
+          Date.now(),
+          (item) => item.expiresAt,
+        );
+        cacheSet(
+          tenantQrImageCache,
+          qrCacheKey,
+          image,
+          TENANT_QR_CACHE_MS,
+        );
+      }
       res.statusCode = 200;
       res.setHeader('Content-Type', 'image/png');
       res.setHeader('Content-Length', String(image.length));
@@ -16787,6 +16971,18 @@ async function router(req, res, parsedRequestUrl = null) {
       }
 
       if (req.method === 'POST' && action === 'call') {
+        if (!rateLimit(
+          req,
+          res,
+          'admin-call-signal',
+          240,
+          60_000,
+          `${payload.tenantId}:${conversationId}`,
+          {
+            tenantId: payload.tenantId,
+            conversationId,
+          },
+        )) return;
         const signal = parseCallSignal(await readJson(req, 256 * 1024));
         if (signal.action === 'offer') {
           const saved = await savePendingCallOffer(
@@ -16895,6 +17091,8 @@ async function router(req, res, parsedRequestUrl = null) {
             signal.callId,
             payload.tenantId,
             conversationId,
+            'admin',
+            signal.deviceId,
           );
           if (connectedCall) publishCallLogUpdate(connectedCall);
           return sendJson(res, 200, { ok: true });
