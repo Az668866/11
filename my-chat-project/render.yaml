@@ -20,7 +20,7 @@ services:
       - key: QR_ENTRY_BASE
         value: https://api.ykf000.com
       - key: APP_VERSION
-        value: 2.3.1
+        value: 2.4.0
       - key: SUPPORT_TELEGRAM
         value: "@YingYingUu"
       - key: COOKIE_DOMAIN
@@ -84,6 +84,12 @@ services:
       - key: WEBRTC_TURN_USERNAME
         sync: false
       - key: WEBRTC_TURN_CREDENTIAL
+        sync: false
+      - key: WEB_PUSH_VAPID_PUBLIC_KEY
+        sync: false
+      - key: WEB_PUSH_VAPID_PRIVATE_KEY
+        sync: false
+      - key: WEB_PUSH_SUBJECT
         sync: false
       - key: R2_ACCOUNT_ID
         sync: false
