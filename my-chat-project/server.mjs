@@ -36,7 +36,7 @@ const PUBLIC_API_BASE = String(
 const QR_ENTRY_BASE = String(
   process.env.QR_ENTRY_BASE || PUBLIC_API_BASE,
 ).replace(/\/+$/, '');
-const APP_VERSION = String(process.env.APP_VERSION || '2.4.0').trim();
+const APP_VERSION = String(process.env.APP_VERSION || '2.4.1').trim();
 const SUPPORT_TELEGRAM = String(
   process.env.SUPPORT_TELEGRAM || '@YingYingUu',
 ).trim();
@@ -263,7 +263,7 @@ if (WEB_PUSH_ENABLED) {
   );
 }
 const WEBRTC_STUN_URLS = String(
-  process.env.WEBRTC_STUN_URLS || 'stun:stun.l.google.com:19302',
+  process.env.WEBRTC_STUN_URLS || 'stun:stun.cloudflare.com:3478',
 )
   .split(',')
   .map((item) => item.trim())
@@ -278,6 +278,22 @@ const WEBRTC_TURN_USERNAME = String(
 const WEBRTC_TURN_CREDENTIAL = String(
   process.env.WEBRTC_TURN_CREDENTIAL || '',
 );
+const CLOUDFLARE_TURN_KEY_ID = String(
+  process.env.CLOUDFLARE_TURN_KEY_ID || '',
+).trim();
+const CLOUDFLARE_TURN_KEY_API_TOKEN = String(
+  process.env.CLOUDFLARE_TURN_KEY_API_TOKEN || '',
+).trim();
+const CLOUDFLARE_TURN_TTL_SECONDS = Math.trunc(
+  envNumber('CLOUDFLARE_TURN_TTL_SECONDS', 86_400, 3_600, 172_800),
+);
+const CLOUDFLARE_TURN_ENABLED = Boolean(
+  CLOUDFLARE_TURN_KEY_ID && CLOUDFLARE_TURN_KEY_API_TOKEN,
+);
+const cloudflareTurnCredentialCache = new Map();
+const cloudflareTurnCredentialRequests = new Map();
+let lastCloudflareTurnErrorAt = 0;
+let cloudflareTurnFailureUntil = 0;
 
 const STATIC_ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
@@ -4109,7 +4125,7 @@ function conversationHasLiveVisitor(conversationId, tenantId) {
   );
 }
 
-function realtimeConfig() {
+function staticRealtimeConfig() {
   const iceServers = [];
   if (WEBRTC_STUN_URLS.length) iceServers.push({ urls: WEBRTC_STUN_URLS });
   if (
@@ -4126,9 +4142,140 @@ function realtimeConfig() {
   return {
     iceServers,
     turnConfigured: Boolean(WEBRTC_TURN_URLS.length && WEBRTC_TURN_USERNAME && WEBRTC_TURN_CREDENTIAL),
+    turnProvider: WEBRTC_TURN_URLS.length && WEBRTC_TURN_USERNAME && WEBRTC_TURN_CREDENTIAL
+      ? 'static'
+      : 'none',
+    turnExpiresAt: '',
     pushEnabled: WEB_PUSH_ENABLED,
     vapidPublicKey: WEB_PUSH_ENABLED ? WEB_PUSH_VAPID_PUBLIC_KEY : '',
   };
+}
+
+function cleanCloudflareIceServers(value) {
+  if (!Array.isArray(value)) return [];
+  const result = [];
+  for (const item of value.slice(0, 8)) {
+    const rawUrls = Array.isArray(item?.urls) ? item.urls : [item?.urls];
+    const urls = rawUrls
+      .map((url) => String(url || '').trim())
+      .filter((url) => /^(?:stun|stuns|turn|turns):/i.test(url))
+      .filter((url) => !/:53(?:\?|$)/i.test(url))
+      .slice(0, 12);
+    if (!urls.length) continue;
+    const server = { urls };
+    if (urls.some((url) => /^turns?:/i.test(url))) {
+      const username = String(item?.username || '').trim();
+      const credential = String(item?.credential || '').trim();
+      if (!username || !credential || username.length > 512 || credential.length > 512) {
+        continue;
+      }
+      server.username = username;
+      server.credential = credential;
+    }
+    result.push(server);
+  }
+  return result;
+}
+
+function pruneCloudflareTurnCredentialCache() {
+  const now = Date.now();
+  for (const [key, entry] of cloudflareTurnCredentialCache) {
+    if (entry.expiresAt <= now) cloudflareTurnCredentialCache.delete(key);
+  }
+  while (cloudflareTurnCredentialCache.size > 2_000) {
+    const oldestKey = cloudflareTurnCredentialCache.keys().next().value;
+    if (!oldestKey) break;
+    cloudflareTurnCredentialCache.delete(oldestKey);
+  }
+}
+
+async function requestCloudflareTurnCredentials(scopeKey) {
+  const now = Date.now();
+  const cached = cloudflareTurnCredentialCache.get(scopeKey);
+  if (cached && cached.refreshAt > now) return cached;
+  if (cloudflareTurnCredentialRequests.has(scopeKey)) {
+    return cloudflareTurnCredentialRequests.get(scopeKey);
+  }
+
+  const request = (async () => {
+    const endpoint = `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(CLOUDFLARE_TURN_KEY_ID)}/credentials/generate-ice-servers`;
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${CLOUDFLARE_TURN_KEY_API_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ ttl: CLOUDFLARE_TURN_TTL_SECONDS }),
+      signal: AbortSignal.timeout(8_000),
+    });
+    const responseText = await response.text();
+    if (!response.ok || responseText.length > 64 * 1024) {
+      throw new Error(`Cloudflare TURN 凭证接口返回 ${response.status}`);
+    }
+    const payload = JSON.parse(responseText);
+    const iceServers = cleanCloudflareIceServers(payload?.iceServers);
+    if (!iceServers.some((server) =>
+      server.urls.some((url) => /^turns?:/i.test(url)))) {
+      throw new Error('Cloudflare TURN 凭证响应缺少可用中继地址');
+    }
+    const issuedAt = Date.now();
+    const expiresAt = issuedAt + CLOUDFLARE_TURN_TTL_SECONDS * 1_000;
+    const refreshMargin = Math.min(
+      10 * 60_000,
+      Math.max(5 * 60_000, CLOUDFLARE_TURN_TTL_SECONDS * 100),
+    );
+    const entry = {
+      iceServers,
+      expiresAt,
+      refreshAt: expiresAt - refreshMargin,
+    };
+    cloudflareTurnCredentialCache.delete(scopeKey);
+    cloudflareTurnCredentialCache.set(scopeKey, entry);
+    pruneCloudflareTurnCredentialCache();
+    return entry;
+  })();
+
+  cloudflareTurnCredentialRequests.set(scopeKey, request);
+  try {
+    return await request;
+  } finally {
+    cloudflareTurnCredentialRequests.delete(scopeKey);
+  }
+}
+
+async function realtimeConfig(scopeKey = 'shared') {
+  const fallback = staticRealtimeConfig();
+  if (!CLOUDFLARE_TURN_ENABLED) return fallback;
+  if (cloudflareTurnFailureUntil > Date.now()) {
+    return {
+      ...fallback,
+      turnProvider: fallback.turnConfigured ? 'static-fallback' : 'stun-fallback',
+      turnExpiresAt: new Date(cloudflareTurnFailureUntil).toISOString(),
+    };
+  }
+  try {
+    const cloudflare = await requestCloudflareTurnCredentials(scopeKey);
+    cloudflareTurnFailureUntil = 0;
+    return {
+      ...fallback,
+      iceServers: cloudflare.iceServers,
+      turnConfigured: true,
+      turnProvider: 'cloudflare',
+      turnExpiresAt: new Date(cloudflare.expiresAt).toISOString(),
+    };
+  } catch (error) {
+    const now = Date.now();
+    cloudflareTurnFailureUntil = now + 30_000;
+    if (now - lastCloudflareTurnErrorAt > 60_000) {
+      lastCloudflareTurnErrorAt = now;
+      console.error('Cloudflare TURN 临时凭证获取失败，已使用备用 ICE 配置：', error.message);
+    }
+    return {
+      ...fallback,
+      turnProvider: fallback.turnConfigured ? 'static-fallback' : 'stun-fallback',
+      turnExpiresAt: new Date(cloudflareTurnFailureUntil).toISOString(),
+    };
+  }
 }
 
 function parseCallSignal(body = {}) {
@@ -14673,7 +14820,10 @@ async function router(req, res, parsedRequestUrl = null) {
     }
 
     if (req.method === 'GET' && pathname === '/api/user/realtime-config') {
-      return sendJson(res, 200, { ok: true, ...realtimeConfig() });
+      return sendJson(res, 200, {
+        ok: true,
+        ...(await realtimeConfig(`user:${payload.tenantId}:${conversation.id}`)),
+      });
     }
 
     if (req.method === 'POST' && pathname === '/api/user/push/subscribe') {
@@ -15114,7 +15264,10 @@ async function router(req, res, parsedRequestUrl = null) {
     }
 
     if (req.method === 'GET' && pathname === '/api/admin/realtime-config') {
-      return sendJson(res, 200, { ok: true, ...realtimeConfig() });
+      return sendJson(res, 200, {
+        ok: true,
+        ...(await realtimeConfig(`admin:${payload.tenantId}:${payload.adminId}`)),
+      });
     }
 
     if (req.method === 'PUT' && pathname === '/api/admin/settings') {
