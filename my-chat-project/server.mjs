@@ -36,7 +36,7 @@ const PUBLIC_API_BASE = String(
 const QR_ENTRY_BASE = String(
   process.env.QR_ENTRY_BASE || PUBLIC_API_BASE,
 ).replace(/\/+$/, '');
-const APP_VERSION = String(process.env.APP_VERSION || '2.4.1').trim();
+const APP_VERSION = String(process.env.APP_VERSION || '2.4.2').trim();
 const SUPPORT_TELEGRAM = String(
   process.env.SUPPORT_TELEGRAM || '@YingYingUu',
 ).trim();
@@ -289,6 +289,12 @@ const CLOUDFLARE_TURN_TTL_SECONDS = Math.trunc(
 );
 const CLOUDFLARE_TURN_ENABLED = Boolean(
   CLOUDFLARE_TURN_KEY_ID && CLOUDFLARE_TURN_KEY_API_TOKEN,
+);
+const CALL_RING_TIMEOUT_SECONDS = Math.trunc(
+  envNumber('CALL_RING_TIMEOUT_SECONDS', 45, 20, 120),
+);
+const CALL_ACTIVE_TIMEOUT_SECONDS = Math.trunc(
+  envNumber('CALL_ACTIVE_TIMEOUT_SECONDS', 43_200, 300, 86_400),
 );
 const cloudflareTurnCredentialCache = new Map();
 const cloudflareTurnCredentialRequests = new Map();
@@ -1339,17 +1345,58 @@ async function initDatabase() {
         conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
         mode TEXT NOT NULL DEFAULT 'audio' CHECK (mode IN ('audio','video')),
         offer JSONB NOT NULL,
+        caller_kind TEXT NOT NULL DEFAULT 'admin'
+          CHECK (caller_kind IN ('user','admin')),
+        caller_name TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT 'ringing'
-          CHECK (status IN ('ringing','answered','ended')),
+          CHECK (status IN (
+            'ringing','answered','connected','completed','rejected',
+            'busy','missed','cancelled','failed'
+          )),
+        claimed_by TEXT,
+        claimed_at TIMESTAMPTZ,
+        answered_at TIMESTAMPTZ,
+        connected_at TIMESTAMPTZ,
+        ended_at TIMESTAMPTZ,
+        duration_seconds INTEGER NOT NULL DEFAULT 0 CHECK (duration_seconds >= 0),
+        end_reason TEXT NOT NULL DEFAULT '',
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '2 minutes'
+        expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '45 seconds'
       )
+    `);
+    await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS caller_kind TEXT NOT NULL DEFAULT 'admin'`);
+    await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS caller_name TEXT NOT NULL DEFAULT ''`);
+    await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS claimed_by TEXT`);
+    await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ`);
+    await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS answered_at TIMESTAMPTZ`);
+    await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS connected_at TIMESTAMPTZ`);
+    await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS ended_at TIMESTAMPTZ`);
+    await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS duration_seconds INTEGER NOT NULL DEFAULT 0`);
+    await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS end_reason TEXT NOT NULL DEFAULT ''`);
+    await client.query(`ALTER TABLE call_sessions DROP CONSTRAINT IF EXISTS call_sessions_status_check`);
+    await client.query(`UPDATE call_sessions SET status='completed',end_reason=COALESCE(NULLIF(end_reason,''),'completed'),ended_at=COALESCE(ended_at,updated_at) WHERE status='ended'`);
+    await client.query(`
+      ALTER TABLE call_sessions
+      ADD CONSTRAINT call_sessions_status_check CHECK (status IN (
+        'ringing','answered','connected','completed','rejected',
+        'busy','missed','cancelled','failed'
+      ))
+    `);
+    await client.query(`ALTER TABLE call_sessions DROP CONSTRAINT IF EXISTS call_sessions_caller_kind_check`);
+    await client.query(`
+      ALTER TABLE call_sessions
+      ADD CONSTRAINT call_sessions_caller_kind_check
+      CHECK (caller_kind IN ('user','admin'))
     `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS call_sessions_conversation_active_idx
       ON call_sessions (tenant_id, conversation_id, expires_at DESC)
       WHERE status='ringing'
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS call_sessions_conversation_history_idx
+      ON call_sessions (tenant_id, conversation_id, created_at DESC)
     `);
 
     await client.query(`
@@ -1926,9 +1973,35 @@ async function cleanupExpiredData() {
       `DELETE FROM push_subscriptions
        WHERE updated_at < NOW() - INTERVAL '30 days'`,
     );
+    await client.query(`
+      UPDATE call_sessions cs
+      SET status='missed',
+          ended_at=COALESCE(cs.ended_at,cs.expires_at),
+          end_reason='missed',
+          updated_at=NOW(),
+          expires_at=NOW() + (COALESCE(tc.retention_hours,24)::text || ' hours')::interval
+      FROM tenant_config tc
+      WHERE cs.tenant_id=tc.tenant_id
+        AND cs.status='ringing'
+        AND cs.expires_at <= NOW()
+    `);
+    await client.query(`
+      UPDATE call_sessions cs
+      SET status='failed',
+          ended_at=COALESCE(cs.ended_at,cs.expires_at),
+          end_reason='network_timeout',
+          duration_seconds=0,
+          updated_at=NOW(),
+          expires_at=NOW() + (COALESCE(tc.retention_hours,24)::text || ' hours')::interval
+      FROM tenant_config tc
+      WHERE cs.tenant_id=tc.tenant_id
+        AND cs.status=ANY(ARRAY['answered','connected']::text[])
+        AND cs.expires_at <= NOW()
+    `);
     await client.query(
       `DELETE FROM call_sessions
-       WHERE expires_at <= NOW() OR status='ended'`,
+       WHERE expires_at <= NOW()
+         AND status NOT IN ('ringing','answered','connected')`,
     );
     await client.query(`
       DELETE FROM qr_incidents
@@ -4148,6 +4221,7 @@ function staticRealtimeConfig() {
     turnExpiresAt: '',
     pushEnabled: WEB_PUSH_ENABLED,
     vapidPublicKey: WEB_PUSH_ENABLED ? WEB_PUSH_VAPID_PUBLIC_KEY : '',
+    callRingTimeoutSeconds: CALL_RING_TIMEOUT_SECONDS,
   };
 }
 
@@ -4281,14 +4355,23 @@ async function realtimeConfig(scopeKey = 'shared') {
 function parseCallSignal(body = {}) {
   const action = cleanText(body.action, 20);
   const callId = cleanText(body.callId, 80);
-  if (!['offer','answer','ice','hangup','reject','busy'].includes(action)) {
+  if (![
+    'offer','claim','answer','ice','connected',
+    'hangup','reject','busy','timeout','failed',
+  ].includes(action)) {
     throw requestError('通话信令类型无效。', 400, 'CALL_ACTION');
   }
   if (!isUuid(callId)) {
     throw requestError('通话编号无效。', 400, 'CALL_ID');
   }
   const mode = cleanText(body.mode, 10) === 'video' ? 'video' : 'audio';
-  const signal = { action, callId, mode };
+  const signal = {
+    action,
+    callId,
+    mode,
+    deviceId: cleanText(body.deviceId, 120),
+    reason: cleanText(body.reason, 120),
+  };
   if (action === 'offer' || action === 'answer') {
     const sdp = body.sdp;
     if (!sdp || typeof sdp !== 'object' || !['offer','answer'].includes(sdp.type)) {
@@ -4315,6 +4398,155 @@ function parseCallSignal(body = {}) {
     };
   }
   return signal;
+}
+
+const ACTIVE_CALL_STATUSES = new Set(['ringing', 'answered', 'connected']);
+
+function callActorKey(kind, deviceId) {
+  const normalizedKind = kind === 'admin' ? 'admin' : 'user';
+  const normalizedDevice = cleanText(deviceId, 120) || 'legacy';
+  return `${normalizedKind}:${normalizedDevice}`;
+}
+
+function publicCallSession(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    conversationId: row.conversation_id,
+    mode: row.mode === 'video' ? 'video' : 'audio',
+    callerKind: row.caller_kind === 'user' ? 'user' : 'admin',
+    callerName: cleanText(row.caller_name, 80) ||
+      (row.caller_kind === 'user' ? '访客' : '客服'),
+    status: cleanText(row.status, 20) || 'ringing',
+    createdAt: new Date(row.created_at).toISOString(),
+    answeredAt: row.answered_at
+      ? new Date(row.answered_at).toISOString()
+      : null,
+    connectedAt: row.connected_at
+      ? new Date(row.connected_at).toISOString()
+      : null,
+    endedAt: row.ended_at ? new Date(row.ended_at).toISOString() : null,
+    durationSeconds: Math.max(0, Number(row.duration_seconds || 0)),
+    endReason: cleanText(row.end_reason, 120),
+  };
+}
+
+function publishCallLogUpdate(row) {
+  if (!row || !isUuid(row.tenant_id) || !isUuid(row.conversation_id)) return;
+  const payload = {
+    type: 'call-log-updated',
+    conversationId: row.conversation_id,
+    call: publicCallSession(row),
+    at: nowIso(),
+  };
+  publishEvent(payload, {
+    tenantId: row.tenant_id,
+    conversationId: row.conversation_id,
+    targetKind: 'user',
+  });
+  publishEvent(payload, {
+    tenantId: row.tenant_id,
+    conversationId: row.conversation_id,
+    targetKind: 'tenant_admin',
+  });
+}
+
+function publishCallControl(row, {
+  action,
+  handledByDeviceId = '',
+  handledByKind = '',
+} = {}) {
+  if (!row || !action) return;
+  const payload = {
+    type: 'call-control',
+    action,
+    callId: row.id,
+    conversationId: row.conversation_id,
+    status: row.status,
+    handledByDeviceId,
+    handledByKind,
+    at: nowIso(),
+  };
+  publishEvent(payload, {
+    tenantId: row.tenant_id,
+    conversationId: row.conversation_id,
+    targetKind: 'user',
+  });
+  publishEvent(payload, {
+    tenantId: row.tenant_id,
+    conversationId: row.conversation_id,
+    targetKind: 'tenant_admin',
+  });
+}
+
+async function finalizeExpiredCallSessions(
+  tenantId,
+  conversationId = null,
+  client = pool,
+) {
+  const ringingResult = await client.query(
+    `
+      UPDATE call_sessions cs
+      SET status='missed',
+          ended_at=COALESCE(cs.ended_at,cs.expires_at),
+          end_reason='missed',
+          updated_at=NOW(),
+          expires_at=NOW() + (COALESCE(tc.retention_hours,24)::text || ' hours')::interval
+      FROM tenant_config tc
+      WHERE cs.tenant_id=$1
+        AND cs.tenant_id=tc.tenant_id
+        AND ($2::uuid IS NULL OR cs.conversation_id=$2)
+        AND cs.status='ringing'
+        AND cs.expires_at <= NOW()
+      RETURNING cs.*
+    `,
+    [tenantId, isUuid(conversationId) ? conversationId : null],
+  );
+  const activeResult = await client.query(
+    `
+      UPDATE call_sessions cs
+      SET status='failed',
+          ended_at=COALESCE(cs.ended_at,cs.expires_at),
+          end_reason='network_timeout',
+          duration_seconds=0,
+          updated_at=NOW(),
+          expires_at=NOW() + (COALESCE(tc.retention_hours,24)::text || ' hours')::interval
+      FROM tenant_config tc
+      WHERE cs.tenant_id=$1
+        AND cs.tenant_id=tc.tenant_id
+        AND ($2::uuid IS NULL OR cs.conversation_id=$2)
+        AND cs.status=ANY($3::text[])
+        AND cs.expires_at <= NOW()
+      RETURNING cs.*
+    `,
+    [
+      tenantId,
+      isUuid(conversationId) ? conversationId : null,
+      ['answered', 'connected'],
+    ],
+  );
+  return [...ringingResult.rows, ...activeResult.rows];
+}
+
+async function getCallHistory(
+  tenantId,
+  conversationId,
+  client = pool,
+  limit = 50,
+) {
+  if (!isUuid(tenantId) || !isUuid(conversationId)) return [];
+  await finalizeExpiredCallSessions(tenantId, conversationId, client);
+  const result = await client.query(
+    `
+      SELECT *
+      FROM call_sessions
+      WHERE tenant_id=$1 AND conversation_id=$2
+      ORDER BY created_at DESC,id DESC
+      LIMIT $3
+    `,
+    [tenantId, conversationId, Math.max(1, Math.min(100, Number(limit) || 50))],
+  );
+  return result.rows.reverse().map(publicCallSession);
 }
 
 function pushSubscriptionCacheKey(tenantId, conversationId) {
@@ -4357,9 +4589,10 @@ async function sendConversationCallNotification(
   { callId, mode = 'audio' } = {},
 ) {
   if (!WEB_PUSH_ENABLED || !isUuid(callId)) return;
-  const [subscriptions, config] = await Promise.all([
+  const [subscriptions, config, tenant] = await Promise.all([
     getPushSubscriptions(tenantId, conversationId),
     getConfig(tenantId),
+    getTenantById(tenantId),
   ]);
   if (!subscriptions.length) return;
   const serviceName = cleanText(config?.settings?.siteName, 80) || '客服';
@@ -4371,7 +4604,14 @@ async function sendConversationCallNotification(
     tag: `incoming-call-${callId}`,
     icon: './icons/icon-192.png',
     badge: './icons/icon-192.png',
-    data: { callId, mode, url: `./?call=${encodeURIComponent(callId)}` },
+    data: {
+      callId,
+      mode,
+      url: `./?${new URLSearchParams({
+        tenant: tenant?.public_code || '',
+        call: callId,
+      })}`,
+    },
   });
   const staleEndpoints = [];
   for (let index = 0; index < subscriptions.length; index += 20) {
@@ -4404,48 +4644,353 @@ async function sendConversationCallNotification(
   }
 }
 
-async function savePendingCallOffer(tenantId, conversationId, signal) {
-  const result = await pool.query(
-    `INSERT INTO call_sessions (
-       id,tenant_id,conversation_id,mode,offer,status,expires_at
-     ) VALUES ($1,$2,$3,$4,$5::jsonb,'ringing',NOW() + INTERVAL '2 minutes')
-     ON CONFLICT (id) DO UPDATE SET
-       mode=EXCLUDED.mode,
-       offer=EXCLUDED.offer,
-       updated_at=NOW(),
-       expires_at=NOW() + INTERVAL '2 minutes'
-     RETURNING (xmax = 0) AS inserted`,
-    [
-      signal.callId,
-      tenantId,
-      conversationId,
-      signal.mode,
-      JSON.stringify(signal.sdp),
-    ],
-  );
-  return result.rows[0]?.inserted === true;
-}
-
-async function finishPendingCall(callId, tenantId, conversationId, status) {
-  if (!isUuid(callId)) return;
-  await pool.query(
-    `UPDATE call_sessions
-     SET status=$4,updated_at=NOW(),expires_at=LEAST(expires_at,NOW())
-     WHERE id=$1 AND tenant_id=$2 AND conversation_id=$3`,
-    [callId, tenantId, conversationId, status === 'answered' ? 'answered' : 'ended'],
-  );
-}
-
-async function getPendingCall(callId, tenantId, conversationId) {
-  if (!isUuid(callId)) return null;
-  const result = await pool.query(
-    `SELECT id,mode,offer,created_at
-     FROM call_sessions
-     WHERE id=$1 AND tenant_id=$2 AND conversation_id=$3
-       AND status='ringing' AND expires_at > NOW()`,
-    [callId, tenantId, conversationId],
+async function callIdentitySnapshot(client, tenantId, conversationId, callerKind) {
+  const result = await client.query(
+    `
+      SELECT
+        c.visitor_name,
+        COALESCE(
+          NULLIF(tc.settings->>'siteName',''),
+          NULLIF(t.name,''),
+          '客服'
+        ) AS service_name,
+        COALESCE(tc.retention_hours,24)::int AS retention_hours
+      FROM conversations c
+      JOIN tenants t ON t.id=c.tenant_id
+      LEFT JOIN tenant_config tc ON tc.tenant_id=c.tenant_id
+      WHERE c.id=$1 AND c.tenant_id=$2
+    `,
+    [conversationId, tenantId],
   );
   const row = result.rows[0];
+  if (!row) throw requestError('会话不存在。', 404, 'NOT_FOUND');
+  return {
+    callerName: callerKind === 'user'
+      ? cleanText(row.visitor_name, 80) || '访客'
+      : cleanText(row.service_name, 80) || '客服',
+    retentionHours: Math.max(1, Math.min(360, Number(row.retention_hours) || 24)),
+  };
+}
+
+async function savePendingCallOffer(
+  tenantId,
+  conversationId,
+  signal,
+  callerKind,
+) {
+  const normalizedCallerKind = callerKind === 'user' ? 'user' : 'admin';
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtext($1))`,
+      [`call:${tenantId}`],
+    );
+    await finalizeExpiredCallSessions(tenantId, null, client);
+    const existingResult = await client.query(
+      `SELECT * FROM call_sessions WHERE id=$1 AND tenant_id=$2 AND conversation_id=$3 FOR UPDATE`,
+      [signal.callId, tenantId, conversationId],
+    );
+    const existing = existingResult.rows[0];
+    if (existing) {
+      if (existing.caller_kind !== normalizedCallerKind) {
+        throw requestError('通话编号已被使用。', 409, 'CALL_ID_CONFLICT');
+      }
+      if (!ACTIVE_CALL_STATUSES.has(existing.status)) {
+        throw requestError('这次通话已经结束。', 409, 'CALL_ENDED');
+      }
+      const updated = await client.query(
+        `
+          UPDATE call_sessions
+          SET mode=$4,
+              offer=$5::jsonb,
+              updated_at=NOW(),
+              expires_at=NOW() + (
+                CASE WHEN status='ringing' THEN $6::int ELSE $7::int END::text || ' seconds'
+              )::interval
+          WHERE id=$1 AND tenant_id=$2 AND conversation_id=$3
+          RETURNING *
+        `,
+        [
+          signal.callId,
+          tenantId,
+          conversationId,
+          signal.mode,
+          JSON.stringify(signal.sdp),
+          CALL_RING_TIMEOUT_SECONDS,
+          CALL_ACTIVE_TIMEOUT_SECONDS,
+        ],
+      );
+      await client.query('COMMIT');
+      return { isNew: false, busy: false, call: updated.rows[0] };
+    }
+
+    const identity = await callIdentitySnapshot(
+      client,
+      tenantId,
+      conversationId,
+      normalizedCallerKind,
+    );
+    const activeResult = await client.query(
+      `
+        SELECT id
+        FROM call_sessions
+        WHERE tenant_id=$1
+          AND status=ANY($2::text[])
+          AND expires_at > NOW()
+        ORDER BY created_at DESC
+        LIMIT 1
+        FOR UPDATE
+      `,
+      [tenantId, [...ACTIVE_CALL_STATUSES]],
+    );
+    if (activeResult.rows[0]) {
+      const busyResult = await client.query(
+        `
+          INSERT INTO call_sessions (
+            id,tenant_id,conversation_id,mode,offer,caller_kind,caller_name,
+            status,ended_at,end_reason,expires_at
+          ) VALUES (
+            $1,$2,$3,$4,$5::jsonb,$6,$7,
+            'busy',NOW(),'busy',NOW() + ($8::int::text || ' hours')::interval
+          )
+          RETURNING *
+        `,
+        [
+          signal.callId,
+          tenantId,
+          conversationId,
+          signal.mode,
+          JSON.stringify(signal.sdp),
+          normalizedCallerKind,
+          identity.callerName,
+          identity.retentionHours,
+        ],
+      );
+      await client.query('COMMIT');
+      return { isNew: true, busy: true, call: busyResult.rows[0] };
+    }
+
+    const inserted = await client.query(
+      `
+        INSERT INTO call_sessions (
+          id,tenant_id,conversation_id,mode,offer,caller_kind,caller_name,
+          status,expires_at
+        ) VALUES (
+          $1,$2,$3,$4,$5::jsonb,$6,$7,
+          'ringing',NOW() + ($8::int::text || ' seconds')::interval
+        )
+        RETURNING *
+      `,
+      [
+        signal.callId,
+        tenantId,
+        conversationId,
+        signal.mode,
+        JSON.stringify(signal.sdp),
+        normalizedCallerKind,
+        identity.callerName,
+        CALL_RING_TIMEOUT_SECONDS,
+      ],
+    );
+    await client.query('COMMIT');
+    return { isNew: true, busy: false, call: inserted.rows[0] };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function claimPendingCall(
+  callId,
+  tenantId,
+  conversationId,
+  actorKind,
+  deviceId,
+) {
+  if (!isUuid(callId)) return { accepted: false, call: null };
+  const actorKey = callActorKey(actorKind, deviceId);
+  const result = await pool.query(
+    `
+      UPDATE call_sessions
+      SET claimed_by=COALESCE(claimed_by,$5),
+          claimed_at=COALESCE(claimed_at,NOW()),
+          updated_at=NOW()
+      WHERE id=$1 AND tenant_id=$2 AND conversation_id=$3
+        AND caller_kind <> $4
+        AND status='ringing'
+        AND expires_at > NOW()
+        AND (claimed_by IS NULL OR claimed_by=$5)
+      RETURNING *
+    `,
+    [callId, tenantId, conversationId, actorKind, actorKey],
+  );
+  if (result.rows[0]) return { accepted: true, call: result.rows[0] };
+  const current = await pool.query(
+    `SELECT * FROM call_sessions WHERE id=$1 AND tenant_id=$2 AND conversation_id=$3`,
+    [callId, tenantId, conversationId],
+  );
+  return { accepted: false, call: current.rows[0] || null };
+}
+
+async function answerPendingCall(
+  callId,
+  tenantId,
+  conversationId,
+  actorKind,
+  deviceId,
+) {
+  if (!isUuid(callId)) return { accepted: false, call: null };
+  const actorKey = callActorKey(actorKind, deviceId);
+  const result = await pool.query(
+    `
+      UPDATE call_sessions
+      SET status=CASE WHEN status='ringing' THEN 'answered' ELSE status END,
+          claimed_by=COALESCE(claimed_by,$5),
+          claimed_at=COALESCE(claimed_at,NOW()),
+          answered_at=COALESCE(answered_at,NOW()),
+          updated_at=NOW(),
+          expires_at=NOW() + ($6::int::text || ' seconds')::interval
+      WHERE id=$1 AND tenant_id=$2 AND conversation_id=$3
+        AND caller_kind <> $4
+        AND status=ANY($7::text[])
+        AND expires_at > NOW()
+        AND (claimed_by IS NULL OR claimed_by=$5)
+      RETURNING *
+    `,
+    [
+      callId,
+      tenantId,
+      conversationId,
+      actorKind,
+      actorKey,
+      CALL_ACTIVE_TIMEOUT_SECONDS,
+      ['ringing', 'answered', 'connected'],
+    ],
+  );
+  if (result.rows[0]) return { accepted: true, call: result.rows[0] };
+  const current = await pool.query(
+    `SELECT * FROM call_sessions WHERE id=$1 AND tenant_id=$2 AND conversation_id=$3`,
+    [callId, tenantId, conversationId],
+  );
+  return { accepted: false, call: current.rows[0] || null };
+}
+
+async function markPendingCallConnected(callId, tenantId, conversationId) {
+  if (!isUuid(callId)) return null;
+  const result = await pool.query(
+    `
+      UPDATE call_sessions
+      SET status='connected',
+          connected_at=COALESCE(connected_at,NOW()),
+          updated_at=NOW(),
+          expires_at=NOW() + ($4::int::text || ' seconds')::interval
+      WHERE id=$1 AND tenant_id=$2 AND conversation_id=$3
+        AND status=ANY($5::text[])
+      RETURNING *
+    `,
+    [
+      callId,
+      tenantId,
+      conversationId,
+      CALL_ACTIVE_TIMEOUT_SECONDS,
+      ['answered', 'connected'],
+    ],
+  );
+  return result.rows[0] || null;
+}
+
+async function finishPendingCall(
+  callId,
+  tenantId,
+  conversationId,
+  action,
+  actorKind,
+  deviceId,
+  reason = '',
+) {
+  if (!isUuid(callId)) return { accepted: false, call: null };
+  const actorKey = callActorKey(actorKind, deviceId);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const currentResult = await client.query(
+      `
+        SELECT cs.*,COALESCE(tc.retention_hours,24)::int AS retention_hours
+        FROM call_sessions cs
+        LEFT JOIN tenant_config tc ON tc.tenant_id=cs.tenant_id
+        WHERE cs.id=$1 AND cs.tenant_id=$2 AND cs.conversation_id=$3
+        FOR UPDATE OF cs
+      `,
+      [callId, tenantId, conversationId],
+    );
+    const current = currentResult.rows[0];
+    if (!current || !ACTIVE_CALL_STATUSES.has(current.status)) {
+      await client.query('COMMIT');
+      return { accepted: false, call: current || null };
+    }
+    if (
+      current.caller_kind !== actorKind &&
+      current.claimed_by &&
+      current.claimed_by !== actorKey
+    ) {
+      await client.query('COMMIT');
+      return { accepted: false, call: current };
+    }
+    let finalStatus;
+    if (action === 'reject') finalStatus = 'rejected';
+    else if (action === 'busy') finalStatus = 'busy';
+    else if (action === 'timeout') finalStatus = 'missed';
+    else if (action === 'failed') finalStatus = 'failed';
+    else if (current.status === 'ringing') {
+      finalStatus = current.caller_kind === actorKind ? 'cancelled' : 'rejected';
+    } else if (!current.connected_at) finalStatus = 'failed';
+    else finalStatus = 'completed';
+    const retentionHours = Math.max(
+      1,
+      Math.min(360, Number(current.retention_hours) || 24),
+    );
+    const durationSeconds = current.connected_at
+      ? Math.max(
+          0,
+          Math.floor((Date.now() - new Date(current.connected_at).getTime()) / 1000),
+        )
+      : 0;
+    const updated = await client.query(
+      `
+        UPDATE call_sessions
+        SET status=$4,
+            ended_at=NOW(),
+            duration_seconds=$5,
+            end_reason=$6,
+            updated_at=NOW(),
+            expires_at=NOW() + ($7::int::text || ' hours')::interval
+        WHERE id=$1 AND tenant_id=$2 AND conversation_id=$3
+        RETURNING *
+      `,
+      [
+        callId,
+        tenantId,
+        conversationId,
+        finalStatus,
+        durationSeconds,
+        cleanText(reason, 120) || finalStatus,
+        retentionHours,
+      ],
+    );
+    await client.query('COMMIT');
+    return { accepted: true, call: updated.rows[0] };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function pendingCallEvent(row) {
   return row
     ? {
         type: 'call-signal',
@@ -4453,11 +4998,46 @@ async function getPendingCall(callId, tenantId, conversationId) {
         callId: row.id,
         mode: row.mode,
         sdp: row.offer,
-        conversationId,
-        from: 'admin',
+        conversationId: row.conversation_id,
+        from: row.caller_kind,
+        callerName: row.caller_name,
         at: new Date(row.created_at).toISOString(),
       }
     : null;
+}
+
+async function getPendingCall(callId, tenantId, conversationId) {
+  if (!isUuid(callId)) return null;
+  await finalizeExpiredCallSessions(tenantId, conversationId);
+  const result = await pool.query(
+    `
+      SELECT * FROM call_sessions
+      WHERE id=$1 AND tenant_id=$2 AND conversation_id=$3
+        AND caller_kind='admin'
+        AND status='ringing' AND expires_at > NOW()
+        AND claimed_by IS NULL
+    `,
+    [callId, tenantId, conversationId],
+  );
+  return pendingCallEvent(result.rows[0]);
+}
+
+async function getPendingAdminCall(tenantId) {
+  if (!isUuid(tenantId)) return null;
+  await finalizeExpiredCallSessions(tenantId);
+  const result = await pool.query(
+    `
+      SELECT * FROM call_sessions
+      WHERE tenant_id=$1
+        AND caller_kind='user'
+        AND status='ringing' AND expires_at > NOW()
+        AND claimed_by IS NULL
+      ORDER BY created_at DESC
+      LIMIT 1
+    `,
+    [tenantId],
+  );
+  return pendingCallEvent(result.rows[0]);
 }
 
 async function savePushSubscription(payload, body, req) {
@@ -5089,10 +5669,12 @@ async function getPublicConversation(id, client = pool, tenantId) {
 
   minuteCounters.fullHistoryReads += 1;
   minuteCounters.fullHistoryMessages += messagesResult.rowCount;
+  const calls = await getCallHistory(tenantId, id, client);
 
   return {
     ...conversationBase(conversation),
     messages: messagesResult.rows.map(publicMessage),
+    calls,
   };
 }
 
@@ -5163,9 +5745,11 @@ async function getConversationMessagePage(
     return current;
   }, null);
   const hasMore = Boolean(rows[0]?._has_more);
+  const calls = decoded ? null : await getCallHistory(tenantId, id, client);
   return {
     ...conversationBase(conversation),
     messages: rows.map(publicMessage),
+    ...(calls ? { calls } : {}),
     messagePage: {
       limit,
       hasMore,
@@ -14849,20 +15433,128 @@ async function router(req, res, parsedRequestUrl = null) {
 
     if (req.method === 'POST' && pathname === '/api/user/call-signal') {
       const signal = parseCallSignal(await readJson(req, 256 * 1024));
+      if (signal.action === 'offer') {
+        const saved = await savePendingCallOffer(
+          payload.tenantId,
+          conversation.id,
+          signal,
+          'user',
+        );
+        publishCallLogUpdate(saved.call);
+        if (saved.busy) {
+          publishEvent(
+            {
+              type: 'call-signal',
+              conversationId: conversation.id,
+              from: 'system',
+              action: 'busy',
+              callId: signal.callId,
+              mode: signal.mode,
+              at: nowIso(),
+            },
+            {
+              tenantId: payload.tenantId,
+              conversationId: conversation.id,
+              targetKind: 'user',
+            },
+          );
+          return sendJson(res, 200, {
+            ok: true,
+            busy: true,
+            call: publicCallSession(saved.call),
+          });
+        }
+        publishEvent(
+          {
+            type: 'call-signal',
+            conversationId: conversation.id,
+            from: 'user',
+            ...signal,
+            at: nowIso(),
+          },
+          {
+            tenantId: payload.tenantId,
+            conversationId: conversation.id,
+            targetKind: 'tenant_admin',
+          },
+        );
+        return sendJson(res, 200, {
+          ok: true,
+          busy: false,
+          call: publicCallSession(saved.call),
+        });
+      }
+      if (signal.action === 'claim') {
+        const claimed = await claimPendingCall(
+          signal.callId,
+          payload.tenantId,
+          conversation.id,
+          'user',
+          signal.deviceId,
+        );
+        if (!claimed.accepted) {
+          return sendError(
+            res,
+            409,
+            '这次来电已由其他设备处理。',
+            'CALL_ALREADY_HANDLED',
+          );
+        }
+        publishCallControl(claimed.call, {
+          action: 'claimed',
+          handledByDeviceId: signal.deviceId,
+          handledByKind: 'user',
+        });
+        return sendJson(res, 200, { ok: true, accepted: true });
+      }
       if (signal.action === 'answer') {
-        await finishPendingCall(
+        const answered = await answerPendingCall(
           signal.callId,
           payload.tenantId,
           conversation.id,
-          'answered',
+          'user',
+          signal.deviceId,
         );
-      } else if (['hangup','reject','busy'].includes(signal.action)) {
-        await finishPendingCall(
+        if (!answered.accepted) {
+          return sendError(
+            res,
+            409,
+            '这次来电已由其他设备处理。',
+            'CALL_ALREADY_HANDLED',
+          );
+        }
+        publishCallLogUpdate(answered.call);
+      } else if (signal.action === 'connected') {
+        const connectedCall = await markPendingCallConnected(
           signal.callId,
           payload.tenantId,
           conversation.id,
-          'ended',
         );
+        if (connectedCall) publishCallLogUpdate(connectedCall);
+        return sendJson(res, 200, { ok: true });
+      } else if (['hangup','reject','busy','timeout','failed'].includes(signal.action)) {
+        const finished = await finishPendingCall(
+          signal.callId,
+          payload.tenantId,
+          conversation.id,
+          signal.action,
+          'user',
+          signal.deviceId,
+          signal.reason,
+        );
+        if (!finished.accepted) {
+          return sendJson(res, 200, {
+            ok: true,
+            alreadyHandled: true,
+            call: publicCallSession(finished.call),
+          });
+        }
+        publishCallLogUpdate(finished.call);
+        publishCallControl(finished.call, {
+          action: 'resolved',
+          handledByDeviceId: signal.deviceId,
+          handledByKind: 'user',
+        });
       }
       publishEvent(
         {
@@ -15267,6 +15959,13 @@ async function router(req, res, parsedRequestUrl = null) {
       return sendJson(res, 200, {
         ok: true,
         ...(await realtimeConfig(`admin:${payload.tenantId}:${payload.adminId}`)),
+      });
+    }
+
+    if (req.method === 'GET' && pathname === '/api/admin/pending-call') {
+      return sendJson(res, 200, {
+        ok: true,
+        call: await getPendingAdminCall(payload.tenantId),
       });
     }
 
@@ -16089,20 +16788,139 @@ async function router(req, res, parsedRequestUrl = null) {
 
       if (req.method === 'POST' && action === 'call') {
         const signal = parseCallSignal(await readJson(req, 256 * 1024));
-        let newCallOffer = false;
         if (signal.action === 'offer') {
-          newCallOffer = await savePendingCallOffer(
+          const saved = await savePendingCallOffer(
             payload.tenantId,
             conversationId,
             signal,
+            'admin',
           );
-        } else if (['hangup','reject','busy'].includes(signal.action)) {
-          await finishPendingCall(
+          publishCallLogUpdate(saved.call);
+          if (saved.busy) {
+            publishEvent(
+              {
+                type: 'call-signal',
+                conversationId,
+                from: 'system',
+                action: 'busy',
+                callId: signal.callId,
+                mode: signal.mode,
+                at: nowIso(),
+              },
+              {
+                tenantId: payload.tenantId,
+                conversationId,
+                targetKind: 'tenant_admin',
+              },
+            );
+            return sendJson(res, 200, {
+              ok: true,
+              busy: true,
+              call: publicCallSession(saved.call),
+            });
+          }
+          publishEvent(
+            {
+              type: 'call-signal',
+              conversationId,
+              from: 'admin',
+              ...signal,
+              at: nowIso(),
+            },
+            {
+              tenantId: payload.tenantId,
+              conversationId,
+              targetKind: 'user',
+            },
+          );
+          if (saved.isNew) {
+            queueMicrotask(() => {
+              sendConversationCallNotification(
+                payload.tenantId,
+                conversationId,
+                signal,
+              ).catch((error) =>
+                console.error('视频/语音来电推送失败：', error.message),
+              );
+            });
+          }
+          return sendJson(res, 200, {
+            ok: true,
+            busy: false,
+            call: publicCallSession(saved.call),
+          });
+        }
+        if (signal.action === 'claim') {
+          const claimed = await claimPendingCall(
             signal.callId,
             payload.tenantId,
             conversationId,
-            'ended',
+            'admin',
+            signal.deviceId,
           );
+          if (!claimed.accepted) {
+            return sendError(
+              res,
+              409,
+              '这次来电已由其他设备处理。',
+              'CALL_ALREADY_HANDLED',
+            );
+          }
+          publishCallControl(claimed.call, {
+            action: 'claimed',
+            handledByDeviceId: signal.deviceId,
+            handledByKind: 'admin',
+          });
+          return sendJson(res, 200, { ok: true, accepted: true });
+        }
+        if (signal.action === 'answer') {
+          const answered = await answerPendingCall(
+            signal.callId,
+            payload.tenantId,
+            conversationId,
+            'admin',
+            signal.deviceId,
+          );
+          if (!answered.accepted) {
+            return sendError(
+              res,
+              409,
+              '这次来电已由其他设备处理。',
+              'CALL_ALREADY_HANDLED',
+            );
+          }
+          publishCallLogUpdate(answered.call);
+        } else if (signal.action === 'connected') {
+          const connectedCall = await markPendingCallConnected(
+            signal.callId,
+            payload.tenantId,
+            conversationId,
+          );
+          if (connectedCall) publishCallLogUpdate(connectedCall);
+          return sendJson(res, 200, { ok: true });
+        } else if (['hangup','reject','busy','timeout','failed'].includes(signal.action)) {
+          const finished = await finishPendingCall(
+            signal.callId,
+            payload.tenantId,
+            conversationId,
+            signal.action,
+            'admin',
+            signal.deviceId,
+            signal.reason,
+          );
+          if (!finished.accepted) {
+            return sendJson(res, 200, {
+              ok: true,
+              alreadyHandled: true,
+              call: publicCallSession(finished.call),
+            });
+          }
+          publishCallLogUpdate(finished.call);
+          publishCallControl(finished.call, {
+            action: 'resolved',
+            handledByDeviceId: signal.deviceId,
+            handledByKind: 'admin',
+          });
         }
         publishEvent(
           {
@@ -16118,17 +16936,6 @@ async function router(req, res, parsedRequestUrl = null) {
             targetKind: 'user',
           },
         );
-        if (newCallOffer) {
-          queueMicrotask(() => {
-            sendConversationCallNotification(
-              payload.tenantId,
-              conversationId,
-              signal,
-            ).catch((error) =>
-              console.error('视频/语音来电推送失败：', error.message),
-            );
-          });
-        }
         return sendJson(res, 200, { ok: true });
       }
 
