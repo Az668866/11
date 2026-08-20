@@ -1,6 +1,6 @@
 {
   "name": "tuojie-cloud-service",
-  "version": "2.4.0",
+  "version": "2.4.8",
   "private": true,
   "type": "module",
   "engines": {
@@ -11,9 +11,13 @@
     "dev:frontend": "vite",
     "build": "vite build",
     "build:deployments": "node tools/build-deployments.mjs",
+    "optimize:assets": "node tools/extract-inline-assets.mjs",
     "preview": "vite preview",
     "check": "node --check server.mjs && node tools/verify-frontends.mjs",
     "test": "node --test tests/*.test.mjs",
+    "test:integration": "node tests/integration/final-audit-db.mjs",
+    "load:prepare": "node load/prepare-audit-data.mjs",
+    "load:sse": "node load/sse-load.mjs",
     "verify": "npm run check && npm test && npm run build"
   },
   "dependencies": {
@@ -29,5 +33,8 @@
     "postcss": "^8.5.26",
     "terser": "^5.49.2",
     "vite": "^7.3.6"
+  },
+  "overrides": {
+    "nanoid": "^3.3.18"
   }
 }

@@ -15,12 +15,14 @@ services:
         sync: false
       - key: TOKEN_SECRET
         generateValue: true
+      - key: DATA_PROTECTION_SECRET
+        sync: false
       - key: PUBLIC_API_BASE
         value: https://api.ykf000.com
       - key: QR_ENTRY_BASE
-        value: https://api.ykf000.com
+        value: https://go.ykf000.com
       - key: APP_VERSION
-        value: 2.4.0
+        value: 2.4.8
       - key: SUPPORT_TELEGRAM
         value: "@YingYingUu"
       - key: COOKIE_DOMAIN

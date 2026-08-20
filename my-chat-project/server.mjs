@@ -434,11 +434,11 @@ if (Boolean(SUPER_ADMIN_USERNAME_2) !== Boolean(SUPER_ADMIN_PASSWORD_2)) {
     'SUPER_ADMIN_USERNAME_2 和 SUPER_ADMIN_PASSWORD_2 必须同时设置。',
   );
 }
-if (SUPER_ADMIN_PASSWORD && SUPER_ADMIN_PASSWORD.length < 8) {
-  throw new Error('SUPER_ADMIN_PASSWORD 必须至少8位。');
+if (SUPER_ADMIN_PASSWORD && SUPER_ADMIN_PASSWORD.length < 12) {
+  throw new Error('SUPER_ADMIN_PASSWORD 必须至少12位。');
 }
-if (SUPER_ADMIN_PASSWORD_2 && SUPER_ADMIN_PASSWORD_2.length < 8) {
-  throw new Error('SUPER_ADMIN_PASSWORD_2 必须至少8位。');
+if (SUPER_ADMIN_PASSWORD_2 && SUPER_ADMIN_PASSWORD_2.length < 12) {
+  throw new Error('SUPER_ADMIN_PASSWORD_2 必须至少12位。');
 }
 if (
   SUPER_ADMIN_USERNAME_2 &&
@@ -810,6 +810,7 @@ function defaultConfig() {
       autoReplyEnabled: true,
       defaultAutoReplyEnabled: true,
       defaultAutoReply: '消息已收到，客服看到后会尽快回复。',
+      defaultAutoReplyImageAssetId: '',
       autoReplyCooldownSeconds: 20,
       frontendTemplateId: DEFAULT_TEMPLATE_ID,
       retentionHours: 24,
@@ -967,7 +968,7 @@ async function initDatabase() {
       CREATE TABLE IF NOT EXISTS assets (
         id UUID PRIMARY KEY,
         tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
-        kind TEXT NOT NULL CHECK (kind IN ('brand_avatar','template_cover','qr_logo')),
+        kind TEXT NOT NULL CHECK (kind IN ('brand_avatar','template_cover','qr_logo','reply_image')),
         filename TEXT NOT NULL,
         mime TEXT NOT NULL,
         size INTEGER NOT NULL CHECK (size > 0),
@@ -987,7 +988,7 @@ async function initDatabase() {
     await client.query(`
       ALTER TABLE assets
       ADD CONSTRAINT assets_kind_check
-      CHECK (kind IN ('brand_avatar','template_cover','qr_logo'))
+      CHECK (kind IN ('brand_avatar','template_cover','qr_logo','reply_image'))
     `);
 
     await client.query(`
@@ -1732,13 +1733,17 @@ async function initDatabase() {
         type TEXT NOT NULL CHECK (type IN ('text','image','video','audio')),
         text TEXT NOT NULL DEFAULT '',
         attachment_id UUID UNIQUE REFERENCES attachments(id) ON DELETE CASCADE,
+        asset_id UUID REFERENCES assets(id) ON DELETE RESTRICT,
         album_id UUID,
         album_position SMALLINT NOT NULL DEFAULT 0 CHECK (album_position BETWEEN 0 AND 9),
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         CHECK (
-          (type = 'text' AND attachment_id IS NULL AND length(text) > 0)
+          (type = 'text' AND attachment_id IS NULL AND asset_id IS NULL AND length(text) > 0)
           OR
-          (type IN ('image','video','audio') AND attachment_id IS NOT NULL)
+          (
+            type IN ('image','video','audio')
+            AND ((attachment_id IS NOT NULL)::int + (asset_id IS NOT NULL)::int) = 1
+          )
         )
       )
     `);
@@ -1748,6 +1753,7 @@ async function initDatabase() {
     await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ`);
     await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS recalled_at TIMESTAMPTZ`);
     await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`);
+    await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS asset_id UUID REFERENCES assets(id) ON DELETE RESTRICT`);
     await client.query(`ALTER TABLE attachments DROP CONSTRAINT IF EXISTS attachments_mime_check`);
     await client.query(`
       ALTER TABLE attachments
@@ -1766,9 +1772,12 @@ async function initDatabase() {
     await client.query(`
       ALTER TABLE messages
       ADD CONSTRAINT messages_check CHECK (
-        (type = 'text' AND attachment_id IS NULL AND length(text) > 0)
+        (type = 'text' AND attachment_id IS NULL AND asset_id IS NULL AND length(text) > 0)
         OR
-        (type IN ('image','video','audio') AND attachment_id IS NOT NULL)
+        (
+          type IN ('image','video','audio')
+          AND ((attachment_id IS NOT NULL)::int + (asset_id IS NOT NULL)::int) = 1
+        )
       )
     `);
     await client.query(`
@@ -1892,29 +1901,16 @@ async function initDatabase() {
           FROM pg_constraint
           WHERE conrelid = 'messages'::regclass
             AND conname = 'messages_check'
-            AND pg_get_constraintdef(oid) LIKE '%recalled_at%'
+            AND pg_get_constraintdef(oid) LIKE '%asset_id%'
         ) THEN
           ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_check;
           ALTER TABLE messages
             ADD CONSTRAINT messages_check CHECK (
-              (
-                recalled_at IS NOT NULL
-                AND type = 'text'
-                AND attachment_id IS NULL
-                AND length(text) > 0
-              )
+              (type = 'text' AND attachment_id IS NULL AND asset_id IS NULL AND length(text) > 0)
               OR
               (
-                recalled_at IS NULL
-                AND type = 'text'
-                AND attachment_id IS NULL
-                AND length(text) > 0
-              )
-              OR
-              (
-                recalled_at IS NULL
-                AND type IN ('image','video','audio')
-                AND attachment_id IS NOT NULL
+                type IN ('image','video','audio')
+                AND ((attachment_id IS NOT NULL)::int + (asset_id IS NOT NULL)::int) = 1
               )
             );
         END IF;
@@ -2400,6 +2396,31 @@ async function cleanupExpiredData() {
       `,
     );
 
+    // 上传后未保存、已从快捷语移除且从未发送的回复图，保留七天后清理，
+    // 防止反复更换预览图造成数据库或 R2 存储持续增长。
+    const replyImages = await client.query(`
+      DELETE FROM assets a
+      WHERE a.kind = 'reply_image'
+        AND a.created_at < NOW() - INTERVAL '7 days'
+        AND NOT EXISTS (
+          SELECT 1 FROM messages m WHERE m.asset_id = a.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM tenant_config tc
+          WHERE tc.tenant_id = a.tenant_id
+            AND (
+              tc.canned_replies::text LIKE '%' || a.id::text || '%'
+              OR tc.auto_replies::text LIKE '%' || a.id::text || '%'
+              OR tc.settings::text LIKE '%' || a.id::text || '%'
+            )
+        )
+      RETURNING object_key
+    `);
+    objectKeys.push(
+      ...replyImages.rows.map((row) => row.object_key).filter(Boolean),
+    );
+
     const conversations = await client.query(
       `
         DELETE FROM conversations c
@@ -2499,6 +2520,7 @@ async function cleanupExpiredData() {
     return {
       messages: messages.rowCount,
       attachments: attachments.rowCount,
+      replyImages: replyImages.rowCount,
       conversations: conversations.rowCount,
       purgedTenants: purgedTenantIds.length,
     };
@@ -5365,7 +5387,10 @@ async function withImageTransformSlot(task) {
   }
 }
 
-async function prepareImageUpload(req, { maxBytes, width, height }) {
+async function prepareImageUpload(
+  req,
+  { maxBytes, width, height, fit = 'cover' },
+) {
   const mime = String(req.headers['content-type'] || '')
     .split(';')[0]
     .trim()
@@ -5389,8 +5414,9 @@ async function prepareImageUpload(req, { maxBytes, width, height }) {
       })
         .rotate()
         .resize(width, height, {
-          fit: 'cover',
+          fit,
           position: 'attention',
+          withoutEnlargement: fit === 'inside',
         })
         .webp({ quality: 84, effort: 4 })
         .toBuffer();
@@ -5628,7 +5654,8 @@ function publicMessage(row) {
     source: row.source || 'manual',
     type: row.type,
     text: row.text || '',
-    attachmentId: row.attachment_id || null,
+    attachmentId: row.attachment_id || row.asset_id || null,
+    assetId: row.asset_id || null,
     albumId: row.album_id || null,
     albumPosition: Number(row.album_position || 0),
     createdAt: new Date(row.created_at).toISOString(),
@@ -5794,11 +5821,20 @@ async function realtimeConfig(scopeKey = 'shared') {
   try {
     const cloudflare = await requestCloudflareTurnCredentials(scopeKey);
     cloudflareTurnFailureUntil = 0;
+    const fallbackSignatures = new Set(
+      cloudflare.iceServers.flatMap((server) => server.urls || []),
+    );
+    const combinedIceServers = [
+      ...cloudflare.iceServers,
+      ...fallback.iceServers.filter((server) =>
+        (server.urls || []).some((url) => !fallbackSignatures.has(url)),
+      ),
+    ];
     return {
       ...fallback,
-      iceServers: cloudflare.iceServers,
+      iceServers: combinedIceServers,
       turnConfigured: true,
-      turnProvider: 'cloudflare',
+      turnProvider: fallback.turnConfigured ? 'cloudflare+static' : 'cloudflare',
       turnExpiresAt: new Date(cloudflare.expiresAt).toISOString(),
     };
   } catch (error) {
@@ -7718,26 +7754,36 @@ function timingSafeTextEqual(a, b) {
 }
 
 function matchAutoReply(config, text) {
-  if (!config.settings?.autoReplyEnabled) return '';
+  if (!config.settings?.autoReplyEnabled) return null;
   const normalized = String(text || '').toLowerCase();
 
   for (const rule of Array.isArray(config.autoReplies) ? config.autoReplies : []) {
-    if (!rule?.enabled || !rule.replyText) continue;
+    if (!rule?.enabled || (!rule.replyText && !rule.imageAssetId)) continue;
     const keywords = Array.isArray(rule.keywords) ? rule.keywords : [];
     if (
       keywords.some((keyword) =>
         normalized.includes(String(keyword || '').toLowerCase()),
       )
     ) {
-      return cleanText(rule.replyText, 4000);
+      return {
+        text: cleanText(rule.replyText, 4000),
+        imageAssetId: cleanText(rule.imageAssetId, 80),
+      };
     }
   }
 
   if (config.settings?.defaultAutoReplyEnabled) {
-    return cleanText(config.settings.defaultAutoReply, 4000);
+    const reply = {
+      text: cleanText(config.settings.defaultAutoReply, 4000),
+      imageAssetId: cleanText(
+        config.settings.defaultAutoReplyImageAssetId,
+        80,
+      ),
+    };
+    if (reply.text || reply.imageAssetId) return reply;
   }
 
-  return '';
+  return null;
 }
 
 async function validateAdminSettings(body, current, tenantId) {
@@ -7748,8 +7794,9 @@ async function validateAdminSettings(body, current, tenantId) {
           id: cleanText(item?.id, 80) || randomUUID(),
           title: cleanText(item?.title, 40) || '快捷语',
           text: cleanText(item?.text, 2000),
+          imageAssetId: cleanText(item?.imageAssetId, 80),
         }))
-        .filter((item) => item.text)
+        .filter((item) => item.text || item.imageAssetId)
     : current.cannedReplies;
 
   const autoReplies = Array.isArray(body.autoReplies)
@@ -7766,12 +7813,48 @@ async function validateAdminSettings(body, current, tenantId) {
                 .slice(0, 30)
             : [],
           replyText: cleanText(item?.replyText, 2000),
+          imageAssetId: cleanText(item?.imageAssetId, 80),
         }))
-        .filter((item) => item.replyText)
+        .filter((item) => item.replyText || item.imageAssetId)
     : current.autoReplies;
 
   const input =
     body.settings && typeof body.settings === 'object' ? body.settings : {};
+  const defaultAutoReplyImageAssetId = cleanText(
+    input.defaultAutoReplyImageAssetId !== undefined
+      ? input.defaultAutoReplyImageAssetId
+      : current.settings.defaultAutoReplyImageAssetId,
+    80,
+  );
+  const replyImageAssetIds = [
+    ...cannedReplies.map((item) => item.imageAssetId),
+    ...autoReplies.map((item) => item.imageAssetId),
+    defaultAutoReplyImageAssetId,
+  ].filter(Boolean);
+  if (replyImageAssetIds.some((assetId) => !isUuid(assetId))) {
+    throw requestError('快捷语或自动回复图片无效。', 400, 'INVALID_REPLY_IMAGE');
+  }
+  const uniqueReplyImageAssetIds = [...new Set(replyImageAssetIds)];
+  if (uniqueReplyImageAssetIds.length) {
+    const assetResult = await pool.query(
+      `
+        SELECT id
+        FROM assets
+        WHERE id = ANY($1::uuid[])
+          AND tenant_id = $2
+          AND kind = 'reply_image'
+          AND mime = 'image/webp'
+      `,
+      [uniqueReplyImageAssetIds, tenantId],
+    );
+    if (assetResult.rows.length !== uniqueReplyImageAssetIds.length) {
+      throw requestError(
+        '快捷语或自动回复图片不存在，或不属于当前租户。',
+        400,
+        'INVALID_REPLY_IMAGE',
+      );
+    }
+  }
   const brandFields = [
     'siteName',
     'welcomeText',
@@ -7902,6 +7985,7 @@ async function validateAdminSettings(body, current, tenantId) {
       input.defaultAutoReply !== undefined
         ? cleanText(input.defaultAutoReply, 2000)
         : current.settings.defaultAutoReply,
+    defaultAutoReplyImageAssetId,
     autoReplyCooldownSeconds: Number.isFinite(cooldownRaw)
       ? Math.min(3600, Math.max(0, cooldownRaw))
       : 20,
@@ -8394,7 +8478,7 @@ function parseMessageInput(body = {}) {
   const text = cleanText(body.text, 4000);
   if (requestedType === 'text') {
     if (!text) throw requestError('消息不能为空。', 400, 'EMPTY_MESSAGE');
-    return { type: 'text', text, attachmentIds: [] };
+    return { type: 'text', text, attachmentIds: [], assetIds: [] };
   }
 
   const inputIds = Array.isArray(body.attachmentIds)
@@ -8403,29 +8487,116 @@ function parseMessageInput(body = {}) {
   const attachmentIds = inputIds
     .map((value) => cleanText(value, 80))
     .filter(Boolean);
+  const inputAssetIds = Array.isArray(body.assetIds)
+    ? body.assetIds
+    : [body.assetId];
+  const assetIds = inputAssetIds
+    .map((value) => cleanText(value, 80))
+    .filter(Boolean);
 
   if (
-    !attachmentIds.length ||
+    (!attachmentIds.length && !assetIds.length) ||
+    (attachmentIds.length && assetIds.length) ||
     attachmentIds.some((id) => !isUuid(id)) ||
-    new Set(attachmentIds).size !== attachmentIds.length
+    assetIds.some((id) => !isUuid(id)) ||
+    new Set(attachmentIds).size !== attachmentIds.length ||
+    new Set(assetIds).size !== assetIds.length
   ) {
     throw requestError('媒体附件无效。', 400, 'INVALID_ATTACHMENT');
   }
-  if (requestedType === 'image' && attachmentIds.length > MAX_ALBUM_IMAGES) {
+  const mediaCount = attachmentIds.length || assetIds.length;
+  if (assetIds.length && requestedType !== 'image') {
+    throw requestError('预设素材只能作为图片发送。', 400, 'INVALID_ASSET_TYPE');
+  }
+  if (requestedType === 'image' && mediaCount > MAX_ALBUM_IMAGES) {
     throw requestError(
       `一次最多发送 ${MAX_ALBUM_IMAGES} 张图片。`,
       400,
       'ALBUM_LIMIT',
     );
   }
-  if (requestedType === 'video' && attachmentIds.length !== 1) {
+  if (requestedType === 'video' && mediaCount !== 1) {
     throw requestError('一次只能发送一个视频。', 400, 'VIDEO_LIMIT');
   }
-  if (requestedType === 'audio' && attachmentIds.length !== 1) {
+  if (requestedType === 'audio' && mediaCount !== 1) {
     throw requestError('一次只能发送一条语音。', 400, 'AUDIO_LIMIT');
   }
 
-  return { type: requestedType, text, attachmentIds };
+  return { type: requestedType, text, attachmentIds, assetIds };
+}
+
+async function lockReplyImageAssets(client, tenantId, assetIds) {
+  const result = await client.query(
+    `
+      SELECT id
+      FROM assets
+      WHERE id = ANY($1::uuid[])
+        AND tenant_id = $2
+        AND kind = 'reply_image'
+        AND mime = 'image/webp'
+      FOR SHARE
+    `,
+    [assetIds, tenantId],
+  );
+  if (result.rows.length !== assetIds.length) {
+    throw requestError(
+      '快捷语或自动回复图片无效，或不属于当前租户。',
+      400,
+      'INVALID_REPLY_IMAGE',
+    );
+  }
+}
+
+async function insertAssetImageMessages(
+  client,
+  conversationId,
+  assetIds,
+  {
+    source = 'manual',
+    text = '',
+    retentionHours = 24,
+    createdAfter = null,
+  } = {},
+) {
+  const albumId = assetIds.length > 1 ? randomUUID() : null;
+  const result = await client.query(
+    `
+      INSERT INTO messages (
+        id, conversation_id, role, source, type, text, asset_id,
+        album_id, album_position, created_at, expires_at
+      )
+      SELECT
+        input.id,$4,'admin',$5,'image',input.body_text,input.asset_id,
+        $6,input.position,
+        COALESCE(
+          $9::timestamptz + ((input.position + 2)::text || ' milliseconds')::interval,
+          NOW()
+        ),
+        COALESCE(
+          $9::timestamptz + ((input.position + 2)::text || ' milliseconds')::interval,
+          NOW()
+        ) + ($7::text || ' hours')::interval
+      FROM unnest(
+        $1::uuid[],$2::uuid[],$3::text[],$8::int[]
+      ) AS input(id,asset_id,body_text,position)
+      RETURNING *
+    `,
+    [
+      assetIds.map(() => randomUUID()),
+      assetIds,
+      assetIds.map((_, index) => index === 0 ? text : ''),
+      conversationId,
+      source,
+      albumId,
+      retentionHours,
+      assetIds.map((_, index) => index),
+      createdAfter,
+    ],
+  );
+  return result.rows.sort(
+    (left, right) =>
+      Number(left.album_position || 0) - Number(right.album_position || 0),
+  );
 }
 
 async function lockPendingAttachments(
@@ -8530,6 +8701,9 @@ async function createUserMessage(
   { includeConversation = true } = {},
 ) {
   const input = parseMessageInput(body);
+  if (input.assetIds.length) {
+    throw requestError('访客不能发送后台预设素材。', 403, 'FORBIDDEN_ASSET');
+  }
   const [config, featureStates] = await Promise.all([
     getConfig(tenantId),
     getTenantFeatureStates(tenantId),
@@ -8606,7 +8780,7 @@ async function createUserMessage(
       )
     ).rows[0];
 
-    let autoReplyRow = null;
+    let autoReplyRows = [];
     if (input.type === 'text') {
       const cooldownSeconds = Math.min(
         3600,
@@ -8618,56 +8792,77 @@ async function createUserMessage(
       const cooldownPassed =
         !lastAutoReplyAt ||
         Date.now() - lastAutoReplyAt >= cooldownSeconds * 1000;
-      const replyText =
+      const autoReply =
         cooldownPassed &&
         featureStates.auto_reply
         ? matchAutoReply(config, input.text)
-        : '';
+        : null;
 
-      if (replyText) {
-        const autoResult = await client.query(
-          `
-            INSERT INTO messages (
-              id, conversation_id, role, source, type, text, created_at, expires_at
-            )
-            VALUES (
-              $1,$2,'admin','auto','text',$3,
-              $5::timestamptz + INTERVAL '1 millisecond',
-              $5::timestamptz + INTERVAL '1 millisecond'
-                + ($4::text || ' hours')::interval
-            )
-            RETURNING *
-          `,
-          [
-            randomUUID(),
+      if (autoReply) {
+        if (autoReply.text) {
+          const autoResult = await client.query(
+            `
+              INSERT INTO messages (
+                id, conversation_id, role, source, type, text, created_at, expires_at
+              )
+              VALUES (
+                $1,$2,'admin','auto','text',$3,
+                $5::timestamptz + INTERVAL '1 millisecond',
+                $5::timestamptz + INTERVAL '1 millisecond'
+                  + ($4::text || ' hours')::interval
+              )
+              RETURNING *
+            `,
+            [
+              randomUUID(),
+              conversationId,
+              autoReply.text,
+              retentionHours,
+              messageRows.at(-1).created_at,
+            ],
+          );
+          autoReplyRows.push(autoResult.rows[0]);
+        }
+        if (autoReply.imageAssetId) {
+          await lockReplyImageAssets(
+            client,
+            tenantId,
+            [autoReply.imageAssetId],
+          );
+          autoReplyRows.push(...await insertAssetImageMessages(
+            client,
             conversationId,
-            replyText,
-            retentionHours,
-            messageRows.at(-1).created_at,
-          ],
-        );
-        autoReplyRow = autoResult.rows[0];
+            [autoReply.imageAssetId],
+            {
+              source: 'auto',
+              retentionHours,
+              createdAfter: messageRows.at(-1).created_at,
+            },
+          ));
+        }
+        if (autoReplyRows.length) {
         updatedConversation = (
           await client.query(
           `
             UPDATE conversations
-            SET unread_user = unread_user + 1,
+            SET unread_user = unread_user + $3::int,
                 last_auto_reply_at = NOW(),
                 updated_at = NOW()
             WHERE id = $1 AND tenant_id = $2
             RETURNING *
           `,
-          [conversationId, tenantId],
+          [conversationId, tenantId, autoReplyRows.length],
           )
         ).rows[0];
+        }
       }
     }
 
     await client.query('COMMIT');
     minuteCounters.messages +=
-      messageRows.length + (autoReplyRow ? 1 : 0);
+      messageRows.length + autoReplyRows.length;
     const messages = messageRows.map(publicMessage);
-    const latestRow = autoReplyRow || messageRows.at(-1);
+    const latestRow = autoReplyRows.at(-1) || messageRows.at(-1);
     const summary = conversationSummary({
       ...updatedConversation,
       latest_id: latestRow?.id,
@@ -8683,10 +8878,12 @@ async function createUserMessage(
           conversation.tenant_id,
         )
       : summary;
+    const publicAutoReplies = autoReplyRows.map(publicMessage);
     return {
       message: messages[0],
       messages,
-      autoReply: autoReplyRow ? publicMessage(autoReplyRow) : null,
+      autoReply: publicAutoReplies.at(-1) || null,
+      autoReplies: publicAutoReplies,
       conversation: publicConversation,
       summary,
     };
@@ -8750,6 +8947,14 @@ async function createAdminMessage(
         [randomUUID(), conversationId, input.text, retentionHours],
       );
       messageRows = [result.rows[0]];
+    } else if (input.assetIds.length) {
+      await lockReplyImageAssets(client, tenantId, input.assetIds);
+      messageRows = await insertAssetImageMessages(
+        client,
+        conversationId,
+        input.assetIds,
+        { text: input.text, retentionHours },
+      );
     } else {
       await lockPendingAttachments(
         client,
@@ -8823,7 +9028,7 @@ async function broadcastMessageResult(
 ) {
   const appended = [
     ...(result.messages || []),
-    ...(result.autoReply ? [result.autoReply] : []),
+    ...(result.autoReplies || (result.autoReply ? [result.autoReply] : [])),
   ];
   for (const message of appended) {
     if (
@@ -9125,6 +9330,7 @@ async function recallAdminMessage(
         SET type = 'text',
             text = '客服已撤回了一条消息',
             attachment_id = NULL,
+            asset_id = NULL,
             album_id = NULL,
             album_position = 0,
             recalled_at = NOW()
@@ -10092,7 +10298,7 @@ function claimTelegramGeneration(callback) {
 
 function telegramGeneratedLicenseText(created) {
   return [
-    '<b>普通卡密和管理员超级卡密已生成</b>',
+    '<b>卡密已生成</b>',
     '你的后台网站是 <b>YKF000.com</b>',
     '为了你的隐私和客户安全',
     '请保护好你的卡密 不要泄露！',
@@ -10100,17 +10306,12 @@ function telegramGeneratedLicenseText(created) {
     `卡密类型：${created.duration.label}`,
     `有效时长：首次登录后台后 ${licenseUnusedDurationLabel(created.row)}`,
     '',
-    '<b>普通卡密（发给租户）</b>',
+    '<b>你的卡密是</b>',
     `<code>${created.licenseKey}</code>`,
-    '',
-    '<b>管理员超级卡密（禁止发给租户）</b>',
-    `<code>${created.superLicenseKey || '历史卡密未生成'}</code>`,
-    '',
-    `普通卡密设备上限：电脑 ${Number(created.row.max_desktop_devices || LICENSE_DESKTOP_DEVICE_DEFAULT)} 台｜手机/平板 ${Number(created.row.max_mobile_devices || LICENSE_MOBILE_DEVICE_DEFAULT)} 台`,
   ].join('\n');
 }
 
-function telegramGeneratedLicenseKeyboard(licenseKey, superLicenseKey = '') {
+function telegramGeneratedLicenseKeyboard(licenseKey) {
   return {
     inline_keyboard: [
       [
@@ -10119,12 +10320,6 @@ function telegramGeneratedLicenseKeyboard(licenseKey, superLicenseKey = '') {
           copy_text: { text: licenseKey },
         },
       ],
-      ...(superLicenseKey
-        ? [[{
-            text: '🔐 复制管理员超级卡密',
-            copy_text: { text: superLicenseKey },
-          }]]
-        : []),
     ],
   };
 }
@@ -10136,10 +10331,7 @@ async function showTelegramGeneratedLicense(callback, created) {
     text: telegramGeneratedLicenseText(created),
     parse_mode: 'HTML',
     link_preview_options: { is_disabled: true },
-    reply_markup: telegramGeneratedLicenseKeyboard(
-      created.licenseKey,
-      created.superLicenseKey,
-    ),
+    reply_markup: telegramGeneratedLicenseKeyboard(created.licenseKey),
   };
   if (chatId != null && messageId != null) {
     await telegramApi('editMessageText', {
@@ -14667,7 +14859,7 @@ if (req.method === 'GET' && pathname === '/api/distributor/quota-logs') {
     const logCursor = apiVersion >= 2 && Number.isSafeInteger(rawCursor) && rawCursor > 0
       ? rawCursor
       : null;
-    const result = await pool.query(
+    let result = await pool.query(
       `
         SELECT id,duration_code,action,change_amount,balance_before,
                balance_after,reason,created_at
@@ -15055,11 +15247,11 @@ async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
         'DISTRIBUTOR_USERNAME',
       );
     }
-    if (password.length < 8 || password.length > 128) {
+    if (password.length < 12 || password.length > 128) {
       return sendError(
         res,
         400,
-        '代理密码必须为8-128位。',
+        '代理密码必须为12-128位。',
         'DISTRIBUTOR_PASSWORD',
       );
     }
@@ -15276,11 +15468,11 @@ async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
       const password = body.password === undefined
         ? ''
         : String(body.password || '');
-      if (password && (password.length < 8 || password.length > 128)) {
+      if (password && (password.length < 12 || password.length > 128)) {
         return sendError(
           res,
           400,
-          '新密码必须为8-128位。',
+          '新密码必须为12-128位。',
           'DISTRIBUTOR_PASSWORD',
         );
       }
@@ -17547,7 +17739,12 @@ async function router(req, res, parsedRequestUrl = null) {
     !rateLimit(req, res, 'api-request', 360, 60_000)
   ) return;
 
-  const qrEntryMatch = rawPathname.match(/^\/q\/([A-Za-z0-9_-]{8,80})$/);
+  // v2.4.8 uses /q for new QR codes. Keep /a as a backwards-compatible
+  // alias for QR codes printed by older releases, so an upgrade does not
+  // invalidate already distributed codes.
+  const qrEntryMatch = rawPathname.match(
+    /^\/(?:q|a)\/([A-Za-z0-9_-]{8,80})$/,
+  );
   if (['GET', 'HEAD'].includes(req.method) && qrEntryMatch) {
     if (!rateLimit(req, res, 'qr-entry', 120, 60_000)) return;
     const publicCode = cleanText(qrEntryMatch[1], 80);
@@ -17624,7 +17821,7 @@ async function router(req, res, parsedRequestUrl = null) {
       return sendError(res, 404, '资源不存在。', 'NOT_FOUND');
     }
     const result = await pool.query(
-      `SELECT * FROM assets WHERE id=$1`,
+      `SELECT * FROM assets WHERE id=$1 AND kind <> 'reply_image'`,
       [assetId],
     );
     const row = result.rows[0];
@@ -18565,6 +18762,7 @@ async function router(req, res, parsedRequestUrl = null) {
         message: result.message,
         messages: result.messages,
         autoReply: result.autoReply,
+        autoReplies: result.autoReplies,
         conversation: result.conversation,
       });
     }
@@ -19167,6 +19365,75 @@ async function router(req, res, parsedRequestUrl = null) {
         targetId: payload.tenantId,
       }).catch(() => {});
       return sendJson(res, 200, { ok: true, settings });
+    }
+
+    if (
+      req.method === 'GET' &&
+      pathname.startsWith('/api/admin/reply-images/')
+    ) {
+      await requireTenantFeature('media_album', payload.tenantId);
+      const assetId = safeDecodeURIComponent(
+        pathname.slice('/api/admin/reply-images/'.length),
+      );
+      if (!isUuid(assetId)) {
+        return sendError(res, 404, '回复图片不存在。', 'NOT_FOUND');
+      }
+      const result = await pool.query(
+        `
+          SELECT *
+          FROM assets
+          WHERE id=$1 AND tenant_id=$2 AND kind='reply_image'
+        `,
+        [assetId, payload.tenantId],
+      );
+      const row = result.rows[0];
+      if (!row) return sendError(res, 404, '回复图片不存在。', 'NOT_FOUND');
+      const data = await readStoredRow(row);
+      if (!Buffer.isBuffer(data)) {
+        return sendError(res, 404, '回复图片不存在。', 'NOT_FOUND');
+      }
+      res.statusCode = 200;
+      res.setHeader('Content-Type', row.mime);
+      res.setHeader('Content-Length', String(data.length));
+      res.setHeader('Cache-Control', 'private, max-age=300');
+      res.setHeader('Content-Disposition', 'inline; filename="reply-image.webp"');
+      return res.end(data);
+    }
+
+    if (req.method === 'POST' && pathname === '/api/admin/reply-images') {
+      await requireTenantFeature('media_album', payload.tenantId);
+      if (
+        !rateLimit(
+          req,
+          res,
+          'tenant-reply-image-upload',
+          30,
+          10 * 60_000,
+          payload.tenantId,
+          { tenantId: payload.tenantId, licenseId: payload.licenseId },
+        )
+      ) return;
+      const data = await prepareImageUpload(req, {
+        maxBytes: MAX_IMAGE_BYTES,
+        width: 1600,
+        height: 1600,
+        fit: 'inside',
+      });
+      const asset = await saveAsset({
+        tenantId: payload.tenantId,
+        kind: 'reply_image',
+        filename: 'reply-image.webp',
+        mime: 'image/webp',
+        data,
+      });
+      await writeTenantAudit(req, payload, 'tenant.reply-image.upload', {
+        targetType: 'asset',
+        targetId: asset.id,
+      }).catch(() => {});
+      return sendJson(res, 201, {
+        ok: true,
+        assetId: asset.id,
+      });
     }
 
     if (req.method === 'POST' && pathname === '/api/admin/qr-incident') {
@@ -19920,7 +20187,7 @@ async function router(req, res, parsedRequestUrl = null) {
     if (!isUuid(attachmentId)) {
       return sendError(res, 404, '媒体不存在。', 'NOT_FOUND');
     }
-    const result = await pool.query(
+    let result = await pool.query(
       `
         SELECT
           a.*,
@@ -19938,7 +20205,43 @@ async function router(req, res, parsedRequestUrl = null) {
       `,
       [attachmentId],
     );
-    const row = result.rows[0];
+    let row = result.rows[0];
+    if (!row && ['user', 'tenant_admin'].includes(payload.kind)) {
+      const scopeId = payload.kind === 'user'
+        ? payload.conversationId
+        : payload.tenantId;
+      if (isUuid(scopeId)) {
+        result = await pool.query(
+          `
+            SELECT
+              a.*,
+              m.conversation_id,
+              c.visitor_key_hash,
+              c.tenant_id,
+              c.visitor_name,
+              c.status,
+              c.unread_admin,
+              c.unread_user,
+              c.created_at AS conversation_created_at,
+              c.updated_at AS conversation_updated_at
+            FROM assets a
+            JOIN messages m ON m.asset_id = a.id
+            JOIN conversations c ON c.id = m.conversation_id
+            WHERE a.id = $1
+              AND a.kind = 'reply_image'
+              AND m.recalled_at IS NULL
+              AND (
+                ($2 = 'user' AND m.conversation_id = $3)
+                OR ($2 = 'tenant_admin' AND c.tenant_id = $3)
+              )
+            ORDER BY m.created_at DESC
+            LIMIT 1
+          `,
+          [attachmentId, payload.kind, scopeId],
+        );
+        row = result.rows[0];
+      }
+    }
     if (!row) return sendError(res, 404, '媒体不存在。', 'NOT_FOUND');
 
     const conversationForAuth = {
