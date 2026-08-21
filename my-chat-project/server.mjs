@@ -1,8 +1,11 @@
 import http from 'node:http';
 import https from 'node:https';
+import fs from 'node:fs';
+import path from 'node:path';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { lookup as dnsLookup } from 'node:dns';
 import { BlockList, isIP } from 'node:net';
+import { fileURLToPath } from 'node:url';
 import {
   createCipheriv,
   createDecipheriv,
@@ -22,6 +25,7 @@ import {
 } from '@aws-sdk/client-s3';
 import pg from 'pg';
 import QRCode from 'qrcode';
+import archiver from 'archiver';
 import sharp from 'sharp';
 import webpush from 'web-push';
 
@@ -46,14 +50,29 @@ const PUBLIC_API_BASE = String(
 const QR_ENTRY_BASE = String(
   process.env.QR_ENTRY_BASE || PUBLIC_API_BASE,
 ).replace(/\/+$/, '');
-const TENANT_ENTRY_ENABLED = process.env.TENANT_ENTRY_ENABLED === 'true';
-const TENANT_ENTRY_DOMAIN_SUFFIXES = [...new Set(
-  String(process.env.TENANT_ENTRY_DOMAIN_SUFFIXES || '')
+const TENANT_NETLIFY_ENABLED = process.env.TENANT_NETLIFY_ENABLED === 'true';
+const TENANT_NETLIFY_TEAM_SLUG = String(
+  process.env.TENANT_NETLIFY_TEAM_SLUG || '',
+).trim();
+const TENANT_NETLIFY_BUNDLE_ROOT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  String(process.env.TENANT_NETLIFY_BUNDLE_ROOT || 'tenant-site-bundles'),
+);
+const TENANT_NETLIFY_NAME_LENGTH = Math.trunc(
+  envNumber('TENANT_NETLIFY_NAME_LENGTH', 4, 4, 8),
+);
+// Netlify 站点本身就是租户入口时，不再需要 Cloudflare Worker；仍保留
+// TENANT_ENTRY_ENABLED 作为旧版 ykf000.com 入口的兼容开关。
+const TENANT_ENTRY_ENABLED =
+  process.env.TENANT_ENTRY_ENABLED === 'true' || TENANT_NETLIFY_ENABLED;
+const TENANT_ENTRY_DOMAIN_SUFFIXES = [...new Set([
+  ...String(process.env.TENANT_ENTRY_DOMAIN_SUFFIXES || '')
     .split(',')
     .map((value) => value.trim().toLowerCase().replace(/^\.+|\.+$/g, ''))
     .filter((value) =>
       /^(?=.{3,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(value)),
-)];
+  ...(TENANT_NETLIFY_ENABLED ? ['netlify.app'] : []),
+])];
 const TENANT_ENTRY_GATEWAY_SECRET = String(
   process.env.TENANT_ENTRY_GATEWAY_SECRET || '',
 ).trim();
@@ -431,11 +450,17 @@ if (TENANT_ENTRY_ENABLED) {
       'TENANT_ENTRY_ENABLED=true 时必须配置 TENANT_ENTRY_DOMAIN_SUFFIXES。',
     );
   }
-  if (TENANT_ENTRY_GATEWAY_SECRET.length < 32) {
+  if (!TENANT_NETLIFY_ENABLED && TENANT_ENTRY_GATEWAY_SECRET.length < 32) {
     throw new Error(
       'TENANT_ENTRY_GATEWAY_SECRET 必须至少32位，并与 Cloudflare Worker Secret 保持一致。',
     );
   }
+}
+
+if (TENANT_NETLIFY_ENABLED && !NETLIFY_AUTH_TOKEN) {
+  throw new Error(
+    'TENANT_NETLIFY_ENABLED=true 时必须配置 NETLIFY_AUTH_TOKEN。',
+  );
 }
 
 if (TOKEN_SECRET_TEXT.length < 32) {
@@ -1133,6 +1158,23 @@ async function initDatabase() {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE (tenant_id, slot)
       )
+    `);
+    await client.query(`
+      ALTER TABLE tenant_endpoints
+      ADD COLUMN IF NOT EXISTS netlify_site_id TEXT NOT NULL DEFAULT ''
+    `);
+    await client.query(`
+      ALTER TABLE tenant_endpoints
+      ADD COLUMN IF NOT EXISTS netlify_status TEXT NOT NULL DEFAULT 'ready'
+    `);
+    await client.query(`
+      ALTER TABLE tenant_endpoints
+      ADD COLUMN IF NOT EXISTS netlify_error TEXT NOT NULL DEFAULT ''
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS tenant_endpoints_netlify_site_idx
+      ON tenant_endpoints (netlify_site_id)
+      WHERE netlify_site_id <> ''
     `);
     await client.query(`
       ALTER TABLE tenant_endpoints
@@ -6963,6 +7005,30 @@ function newTenantEndpointIdentity(slot = 1, suffixOffset = 0) {
   };
 }
 
+const NETLIFY_SITE_NAME_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
+
+function randomNetlifySiteName() {
+  const bytes = randomBytes(TENANT_NETLIFY_NAME_LENGTH);
+  return Array.from(bytes, (value) =>
+    NETLIFY_SITE_NAME_ALPHABET[value % NETLIFY_SITE_NAME_ALPHABET.length]
+  ).join('');
+}
+
+function newNetlifyEndpointIdentity() {
+  const label = randomNetlifySiteName();
+  return {
+    label,
+    hostname: `${label}.netlify.app`,
+    entryToken: randomBytes(24).toString('base64url'),
+  };
+}
+
+function isNetlifyEndpointHostname(value) {
+  const hostname = cleanText(value, 253).toLowerCase().replace(/\.+$/, '');
+  return Boolean(hostname) && hostname.endsWith('.netlify.app') &&
+    /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.netlify\.app$/.test(hostname);
+}
+
 function isLegacyTenantEndpointHostname(value) {
   const hostname = cleanText(value, 253).toLowerCase().replace(/\.+$/, '');
   const suffix = tenantEntrySuffixForHostname(hostname);
@@ -6980,35 +7046,45 @@ async function ensureTenantEndpoints(tenantId, client = pool) {
   if (!TENANT_ENTRY_ENABLED || !isUuid(tenantId)) return;
   let created = false;
   const templates = await client.query(
-    `
-      SELECT template.id
-      FROM frontend_templates template
-      WHERE (
-        template.status='enabled'
-        AND (
-          template.selection_closed=FALSE
-          OR EXISTS (
-            SELECT 1
-            FROM tenant_frontend_templates selected
-            WHERE selected.tenant_id=$1
-              AND selected.template_id=template.id
+    TENANT_NETLIFY_ENABLED
+      ? `
+          SELECT template.id
+          FROM tenant_config config
+          JOIN frontend_templates template
+            ON template.id=config.frontend_template_id
+          WHERE config.tenant_id=$1
+            AND template.status IN ('enabled','testing')
+          LIMIT 1
+        `
+      : `
+          SELECT template.id
+          FROM frontend_templates template
+          WHERE (
+            template.status='enabled'
+            AND (
+              template.selection_closed=FALSE
+              OR EXISTS (
+                SELECT 1
+                FROM tenant_frontend_templates selected
+                WHERE selected.tenant_id=$1
+                  AND selected.template_id=template.id
+              )
+            )
+          ) OR (
+            template.status='testing'
+            AND EXISTS (
+              SELECT 1
+              FROM jsonb_array_elements_text(template.test_tenant_ids) allowed(id)
+              WHERE allowed.id=$1::text
+            )
           )
-        )
-      ) OR (
-        template.status='testing'
-        AND EXISTS (
-          SELECT 1
-          FROM jsonb_array_elements_text(template.test_tenant_ids) allowed(id)
-          WHERE allowed.id=$1::text
-        )
-      )
-      ORDER BY
-        template.is_default DESC,
-        template.recommended DESC,
-        template.sort_order,
-        template.created_at,
-        template.id
-    `,
+          ORDER BY
+            template.is_default DESC,
+            template.recommended DESC,
+            template.sort_order,
+            template.created_at,
+            template.id
+        `,
     [tenantId],
   );
   const existingResult = await client.query(
@@ -7025,20 +7101,65 @@ async function ensureTenantEndpoints(tenantId, client = pool) {
   for (let templateIndex = 0; templateIndex < templates.rows.length; templateIndex += 1) {
     const templateId = templates.rows[templateIndex].id;
     let endpoint = endpointsByTemplate.get(templateId);
+    if (
+      TENANT_NETLIFY_ENABLED &&
+      endpoint &&
+      !isNetlifyEndpointHostname(endpoint.hostname)
+    ) {
+      let identity = null;
+      for (let attempt = 0; attempt < 16 && !identity; attempt += 1) {
+        const candidate = newNetlifyEndpointIdentity();
+        const collision = await client.query(
+          `
+            SELECT 1
+            FROM tenant_endpoint_domains
+            WHERE hostname=$1 OR entry_token=$2
+            LIMIT 1
+          `,
+          [candidate.hostname, candidate.entryToken],
+        );
+        if (!collision.rows[0]) identity = candidate;
+      }
+      if (!identity) throw new Error('无法为租户分配短的 Netlify 域名。');
+      await client.query(
+        `
+          UPDATE tenant_endpoint_domains
+          SET status='legacy',replaced_at=NOW(),
+              expires_at=CASE
+                WHEN $3::int=0 THEN NULL
+                ELSE NOW()+($3::int*INTERVAL '1 day')
+              END
+          WHERE endpoint_id=$1 AND hostname=$2 AND status='active'
+        `,
+        [endpoint.id, endpoint.hostname, TENANT_ENTRY_LEGACY_DAYS],
+      );
+      const migrated = await client.query(
+        `
+          UPDATE tenant_endpoints
+          SET hostname=$2,entry_token=$3,netlify_site_id='',
+              netlify_status='pending',netlify_error='',updated_at=NOW()
+          WHERE id=$1
+          RETURNING *
+        `,
+        [endpoint.id, identity.hostname, identity.entryToken],
+      );
+      endpoint = migrated.rows[0] || endpoint;
+      created = true;
+    }
     if (!endpoint) {
       let lastError = null;
       for (let attempt = 0; attempt < 8 && !endpoint; attempt += 1) {
         const slot = nextSlot + attempt;
-        const identity = newTenantEndpointIdentity(
-          slot,
-          templateIndex + attempt,
-        );
+        const identity = TENANT_NETLIFY_ENABLED
+          ? newNetlifyEndpointIdentity()
+          : newTenantEndpointIdentity(slot, templateIndex + attempt);
         try {
           const inserted = await client.query(
             `
               INSERT INTO tenant_endpoints (
-                id,tenant_id,slot,frontend_template_id,hostname,entry_token
-              ) VALUES ($1,$2,$3,$4,$5,$6)
+                id,tenant_id,slot,frontend_template_id,hostname,entry_token,
+                netlify_status
+              ) VALUES ($1,$2,$3,$4,$5,$6,$7)
               ON CONFLICT (tenant_id,slot) DO NOTHING
               RETURNING *
             `,
@@ -7049,6 +7170,7 @@ async function ensureTenantEndpoints(tenantId, client = pool) {
               templateId,
               identity.hostname,
               identity.entryToken,
+              TENANT_NETLIFY_ENABLED ? 'pending' : 'ready',
             ],
           );
           endpoint = inserted.rows[0] || (await client.query(
@@ -7216,6 +7338,14 @@ async function getTenantEndpoints(tenantId, client = pool) {
       ) history ON TRUE
       WHERE endpoint.tenant_id=$1
         AND (
+          NOT $2::boolean
+          OR endpoint.frontend_template_id = (
+            SELECT frontend_template_id
+            FROM tenant_config
+            WHERE tenant_id=$1
+          )
+        )
+        AND (
           template.status='enabled'
           OR (
             template.status='testing'
@@ -7232,8 +7362,15 @@ async function getTenantEndpoints(tenantId, client = pool) {
         template.sort_order,
         endpoint.slot
     `,
-    [tenantId],
+    [tenantId, TENANT_NETLIFY_ENABLED],
   );
+  if (TENANT_NETLIFY_ENABLED) {
+    for (const row of result.rows) {
+      if (row.netlify_status !== 'ready' || !row.netlify_site_id) {
+        scheduleTenantNetlifyProvisioning(row.id);
+      }
+    }
+  }
   return result.rows.map((row) => ({
     id: row.id,
     slot: Number(row.slot),
@@ -7244,11 +7381,16 @@ async function getTenantEndpoints(tenantId, client = pool) {
     frontendTemplateName: row.template_name,
     frontendBaseUrl: row.template_base_url,
     templateStatus: row.template_status,
+    netlifySiteId: row.netlify_site_id || '',
+    netlifyStatus: row.netlify_status || 'ready',
+    netlifyError: row.netlify_error || '',
     rotationCount: Number(row.rotation_count || 0),
     lastRotatedAt: row.last_rotated_at
       ? new Date(row.last_rotated_at).toISOString()
       : null,
-    url: tenantEndpointUrl(row),
+    url: TENANT_NETLIFY_ENABLED && row.netlify_status !== 'ready'
+      ? ''
+      : tenantEndpointUrl(row),
     domains: Array.isArray(row.domains) ? row.domains : [],
   }));
 }
@@ -7305,7 +7447,102 @@ async function findTenantEndpointDomain({
   return result.rows[0] || null;
 }
 
+async function rotateTenantNetlifyEndpoint(tenantId, endpointId) {
+  const currentResult = await pool.query(
+    `
+      SELECT endpoint.*,tenant.public_code,
+             template.name AS template_name,
+             template.base_url AS template_base_url,
+             template.client_version
+      FROM tenant_endpoints endpoint
+      JOIN tenants tenant ON tenant.id=endpoint.tenant_id
+      JOIN frontend_templates template
+        ON template.id=endpoint.frontend_template_id
+      WHERE endpoint.id=$1 AND endpoint.tenant_id=$2
+        AND endpoint.status='active'
+      LIMIT 1
+    `,
+    [endpointId, tenantId],
+  );
+  const current = currentResult.rows[0];
+  if (!current) {
+    throw requestError('租户用户端入口不存在。', 404, 'TENANT_ENDPOINT');
+  }
+  const nextEntryToken = randomBytes(24).toString('base64url');
+  const created = await createAndDeployTenantNetlifySite(
+    {
+      id: current.frontend_template_id,
+      name: current.template_name,
+      base_url: current.template_base_url,
+      client_version: current.client_version,
+    },
+    {
+      public_code: current.public_code,
+      entry_token: nextEntryToken,
+    },
+  );
+  // 站点已经部署完毕后再切换数据库指针；这样不会出现“二维码已经换了，
+  // 但新域名还没有页面”的空窗期。旧站点保留在 Netlify，旧二维码在保留期内
+  // 仍会通过旧 entryToken 找回同一个租户。
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const locked = await client.query(
+      `SELECT * FROM tenant_endpoints WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,
+      [endpointId, tenantId],
+    );
+    const endpoint = locked.rows[0];
+    if (!endpoint) throw new Error('租户用户端入口在更换过程中已被删除。');
+    await client.query(
+      `
+        UPDATE tenant_endpoint_domains
+        SET status='legacy',replaced_at=NOW(),
+            expires_at=CASE
+              WHEN $3::int=0 THEN NULL
+              ELSE NOW()+($3::int*INTERVAL '1 day')
+            END
+        WHERE endpoint_id=$1 AND hostname=$2 AND status='active'
+      `,
+      [endpoint.id, endpoint.hostname, TENANT_ENTRY_LEGACY_DAYS],
+    );
+    await client.query(
+      `
+        UPDATE tenant_endpoints
+        SET hostname=$3,entry_token=$4,netlify_site_id=$5,
+            netlify_status='ready',netlify_error='',
+            rotation_count=rotation_count+1,last_rotated_at=NOW(),updated_at=NOW()
+        WHERE id=$1 AND tenant_id=$2
+      `,
+      [endpoint.id, tenantId, created.hostname, nextEntryToken, created.siteId],
+    );
+    await client.query(
+      `
+        INSERT INTO tenant_endpoint_domains (
+          id,endpoint_id,tenant_id,hostname,entry_token,status
+        ) VALUES ($1,$2,$3,$4,$5,'active')
+      `,
+      [randomUUID(), endpoint.id, tenantId, created.hostname, nextEntryToken],
+    );
+    await client.query('COMMIT');
+    invalidateTenantCaches(tenantId);
+    invalidateApprovedOrigins();
+    return {
+      oldDomain: endpoint.hostname,
+      newDomain: created.hostname,
+      endpoints: await getTenantEndpoints(tenantId),
+    };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function rotateTenantEndpoint(tenantId, endpointId, client = pool) {
+  if (TENANT_NETLIFY_ENABLED && client === pool) {
+    return rotateTenantNetlifyEndpoint(tenantId, endpointId);
+  }
   const databaseClient = client === pool ? await pool.connect() : client;
   const ownsClient = client === pool;
   try {
@@ -11242,6 +11479,297 @@ function normalizeNetlifyDomain(value) {
   return /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.netlify\.app$/i.test(domain)
     ? domain
     : '';
+}
+
+const TENANT_NETLIFY_TEMPLATE_KEYS = new Map([
+  // 兼容升级前数据库里的默认“拓界经典版”模板。
+  ['zxkf.netlify.app', 'wechat'],
+  ['wxmb5.netlify.app', 'wechat'],
+  ['xhsmb.netlify.app', 'xiaohongshu'],
+  ['dymb1.netlify.app', 'douyin'],
+  ['ksmb.netlify.app', 'kuaishou'],
+  ['xymb.netlify.app', 'xianyu'],
+  ['zfbmb.netlify.app', 'alipay'],
+]);
+const tenantNetlifyProvisioningJobs = new Map();
+
+function frontendTemplateBundleKey(template) {
+  const hostname = displayTemplateDomain(template?.base_url).toLowerCase();
+  const known = TENANT_NETLIFY_TEMPLATE_KEYS.get(hostname);
+  if (known) return known;
+  const name = cleanText(template?.name, 100).toLowerCase();
+  const candidates = [
+    ['微信', 'wechat'],
+    ['小红书', 'xiaohongshu'],
+    ['抖音', 'douyin'],
+    ['快手', 'kuaishou'],
+    ['闲鱼', 'xianyu'],
+    ['支付宝', 'alipay'],
+  ];
+  return candidates.find(([label]) => name.includes(label))?.[1] || '';
+}
+
+function netlifySiteApiUrl(pathname) {
+  return `https://api.netlify.com/api/v1${pathname}`;
+}
+
+async function readNetlifyResponse(response) {
+  const result = await response.json().catch(() => null);
+  if (!response.ok) {
+    const detail = cleanText(
+      result?.message || result?.error || `Netlify 返回状态 ${response.status}`,
+      400,
+    );
+    const error = new Error(detail);
+    error.status = response.status;
+    error.netlify = result;
+    throw error;
+  }
+  return result || {};
+}
+
+async function waitForNetlifyDeploy(siteId, deployId) {
+  const normalizedSiteId = normalizeNetlifySiteId(siteId);
+  const normalizedDeployId = cleanText(deployId, 120);
+  if (!normalizedSiteId || !normalizedDeployId) return;
+  let delayMs = 500;
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const response = await fetch(
+      netlifySiteApiUrl(
+        `/sites/${encodeURIComponent(normalizedSiteId)}/deploys/${encodeURIComponent(normalizedDeployId)}`,
+      ),
+      {
+        headers: { Authorization: `Bearer ${NETLIFY_AUTH_TOKEN}` },
+        signal: AbortSignal.timeout(20_000),
+      },
+    );
+    const deploy = await readNetlifyResponse(response);
+    const state = cleanText(deploy.state, 40).toLowerCase();
+    if (state === 'ready') return deploy;
+    if (['error', 'failed', 'canceled', 'cancelled'].includes(state)) {
+      throw new Error(
+        cleanText(deploy.error_message || deploy.error || `Netlify 部署状态为 ${state}。`, 400),
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    delayMs = Math.min(2_000, Math.round(delayMs * 1.35));
+  }
+  throw new Error('Netlify 部署超过 60 秒仍未完成，请稍后重试。');
+}
+
+function zipDirectoryForTenant(template, tenant) {
+  const bundleKey = frontendTemplateBundleKey(template);
+  const bundleDirectory = bundleKey
+    ? path.join(TENANT_NETLIFY_BUNDLE_ROOT, bundleKey)
+    : '';
+  const nestedBundleDirectory = bundleKey
+    ? path.join(bundleDirectory, bundleKey)
+    : '';
+  const bundleRoot = nestedBundleDirectory &&
+    fs.existsSync(path.join(nestedBundleDirectory, 'index.html'))
+    ? nestedBundleDirectory
+    : bundleDirectory;
+  if (!bundleKey || !fs.existsSync(bundleRoot)) {
+    throw new Error(
+      `模板“${cleanText(template?.name, 80) || '未命名'}”没有对应的 Netlify 用户端部署包。`,
+    );
+  }
+  const manifest = JSON.stringify({
+    tenantCode: cleanText(tenant?.public_code, 120),
+    entryToken: cleanText(tenant?.entry_token, 200),
+  });
+  return new Promise((resolve, reject) => {
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    const chunks = [];
+    archive.on('data', (chunk) => chunks.push(chunk));
+    archive.on('error', reject);
+    archive.on('end', () => resolve(Buffer.concat(chunks)));
+    archive.directory(bundleRoot, false);
+    archive.append(manifest, { name: 'tenant-entry.json' });
+    archive.finalize().catch(reject);
+  });
+}
+
+async function createAndDeployTenantNetlifySite(template, tenant) {
+  if (!NETLIFY_AUTH_TOKEN) {
+    throw new Error('服务器尚未配置 NETLIFY_AUTH_TOKEN。');
+  }
+  const zip = await zipDirectoryForTenant(template, tenant);
+  const createPath = TENANT_NETLIFY_TEAM_SLUG
+    ? `/${encodeURIComponent(TENANT_NETLIFY_TEAM_SLUG)}/sites/`
+    : '/sites';
+  let lastError = null;
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const siteName = randomNetlifySiteName();
+    let site;
+    try {
+      const createResponse = await fetch(netlifySiteApiUrl(createPath), {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${NETLIFY_AUTH_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ name: siteName, force_ssl: true }),
+        signal: AbortSignal.timeout(20_000),
+      });
+      site = await readNetlifyResponse(createResponse);
+    } catch (error) {
+      lastError = error;
+      if (![409, 422].includes(Number(error?.status))) throw error;
+      continue;
+    }
+    const siteId = normalizeNetlifySiteId(site.id || site.site_id || site.name);
+    if (!siteId) throw new Error('Netlify 创建站点后没有返回有效 Site ID。');
+    try {
+      const deployResponse = await fetch(
+        netlifySiteApiUrl(`/sites/${encodeURIComponent(siteId)}/deploys`),
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${NETLIFY_AUTH_TOKEN}`,
+            'Content-Type': 'application/zip',
+          },
+          body: zip,
+          signal: AbortSignal.timeout(60_000),
+        },
+      );
+      const deploy = await readNetlifyResponse(deployResponse);
+      await waitForNetlifyDeploy(siteId, deploy.id || deploy.deploy_id);
+    } catch (error) {
+      await fetch(netlifySiteApiUrl(`/sites/${encodeURIComponent(siteId)}`), {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${NETLIFY_AUTH_TOKEN}` },
+        signal: AbortSignal.timeout(10_000),
+      }).catch(() => {});
+      throw error;
+    }
+    return {
+      siteId,
+      siteName,
+      hostname: `${siteName}.netlify.app`,
+    };
+  }
+  throw lastError || new Error('Netlify 短域名连续冲突，暂时无法创建站点。');
+}
+
+async function provisionTenantNetlifyEndpoint(endpointId) {
+  if (!TENANT_NETLIFY_ENABLED || !isUuid(endpointId)) return null;
+  const result = await pool.query(
+    `
+      SELECT endpoint.*,tenant.public_code,
+             template.name AS template_name,
+             template.base_url AS template_base_url,
+             template.client_version,
+             template.netlify_site_id AS template_netlify_site_id
+      FROM tenant_endpoints endpoint
+      JOIN tenants tenant ON tenant.id=endpoint.tenant_id
+      JOIN frontend_templates template
+        ON template.id=endpoint.frontend_template_id
+      WHERE endpoint.id=$1 AND endpoint.status='active'
+      LIMIT 1
+    `,
+    [endpointId],
+  );
+  const endpoint = result.rows[0];
+  if (!endpoint) return null;
+  if (endpoint.netlify_status === 'ready' && endpoint.netlify_site_id) {
+    return endpoint;
+  }
+  const tenant = {
+    public_code: endpoint.public_code,
+    entry_token: endpoint.entry_token,
+  };
+  try {
+    const created = await createAndDeployTenantNetlifySite(
+      {
+        id: endpoint.frontend_template_id,
+        name: endpoint.template_name,
+        base_url: endpoint.template_base_url,
+        client_version: endpoint.client_version,
+      },
+      tenant,
+    );
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const locked = await client.query(
+        `SELECT * FROM tenant_endpoints WHERE id=$1 AND status='active' FOR UPDATE`,
+        [endpointId],
+      );
+      if (!locked.rows[0]) throw new Error('租户入口在创建过程中已被停用。');
+      await client.query(
+        `
+          UPDATE tenant_endpoints
+          SET hostname=$2,netlify_site_id=$3,netlify_status='ready',
+              netlify_error='',updated_at=NOW()
+          WHERE id=$1
+        `,
+        [endpointId, created.hostname, created.siteId],
+      );
+      await client.query(
+        `
+          UPDATE tenant_endpoint_domains
+          SET hostname=$2
+          WHERE endpoint_id=$1 AND status='active'
+        `,
+        [endpointId, created.hostname],
+      );
+      await client.query(
+        `
+          INSERT INTO tenant_endpoint_domains (
+            id,endpoint_id,tenant_id,hostname,entry_token,status
+          ) VALUES ($1,$2,$3,$4,$5,'active')
+          ON CONFLICT (hostname) DO NOTHING
+        `,
+        [
+          randomUUID(),
+          endpointId,
+          endpoint.tenant_id,
+          created.hostname,
+          endpoint.entry_token,
+        ],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+    invalidateTenantCaches(endpoint.tenant_id);
+    invalidateApprovedOrigins();
+    publishEvent(
+      {
+        type: 'tenant-netlify-site-ready',
+        endpointId,
+        hostname: created.hostname,
+        at: nowIso(),
+      },
+      { tenantId: endpoint.tenant_id, targetKind: 'tenant_admin' },
+    );
+    return { ...endpoint, ...created, netlify_status: 'ready' };
+  } catch (error) {
+    await pool.query(
+      `
+        UPDATE tenant_endpoints
+        SET netlify_status='failed',netlify_error=$2,updated_at=NOW()
+        WHERE id=$1
+      `,
+      [endpointId, cleanText(error.message, 500)],
+    ).catch(() => {});
+    throw error;
+  }
+}
+
+function scheduleTenantNetlifyProvisioning(endpointId) {
+  if (!TENANT_NETLIFY_ENABLED || !isUuid(endpointId)) return;
+  if (tenantNetlifyProvisioningJobs.has(endpointId)) return;
+  const job = provisionTenantNetlifyEndpoint(endpointId)
+    .catch((error) => {
+      console.error(`租户 Netlify 站点创建失败（${endpointId}）：`, error.message);
+    })
+    .finally(() => tenantNetlifyProvisioningJobs.delete(endpointId));
+  tenantNetlifyProvisioningJobs.set(endpointId, job);
 }
 
 function parseQrIncidentDomainReply(value) {
@@ -20540,6 +21068,14 @@ async function router(req, res, parsedRequestUrl = null) {
       const endpoint = endpoints.find((item) => item.id === endpointId);
       if (!endpoint) {
         return sendError(res, 404, '租户用户端入口不存在。', 'TENANT_ENDPOINT');
+      }
+      if (!endpoint.url) {
+        return sendError(
+          res,
+          409,
+          endpoint.netlifyError || '独占 Netlify 站点正在创建，请稍后刷新。',
+          'TENANT_NETLIFY_PROVISIONING',
+        );
       }
       const config = await getConfig(payload.tenantId);
       const plainQr = url.searchParams.get('plain') === '1';
