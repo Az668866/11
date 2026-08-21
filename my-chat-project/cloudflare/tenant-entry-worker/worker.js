@@ -41,7 +41,14 @@ async function resolveEndpoint(hostname, env, { fresh = false } = {}) {
   const cacheKey = new Request(
     `https://tenant-entry-cache.invalid/${encodeURIComponent(hostname)}`,
   );
-  const cached = fresh ? null : await caches.default.match(cacheKey);
+  let cached = null;
+  if (!fresh) {
+    try {
+      cached = await caches.default.match(cacheKey);
+    } catch (error) {
+      console.warn('tenant-entry-cache-read-failed', String(error?.message || error));
+    }
+  }
   if (cached) return cached.json();
   const response = await fetch(
     `${backend}/api/public/tenant-entry/resolve?hostname=${encodeURIComponent(hostname)}`,
@@ -67,7 +74,11 @@ async function resolveEndpoint(hostname, env, { fresh = false } = {}) {
       'Cache-Control': `public, max-age=${ttl}`,
     },
   });
-  await caches.default.put(cacheKey, cacheResponse);
+  try {
+    await caches.default.put(cacheKey, cacheResponse);
+  } catch (error) {
+    console.warn('tenant-entry-cache-write-failed', String(error?.message || error));
+  }
   return result;
 }
 
@@ -173,6 +184,11 @@ export default {
       });
     } catch (error) {
       const status = Number(error?.status);
+      console.error('tenant-entry-gateway-failed', {
+        hostname,
+        status: Number.isFinite(status) ? status : null,
+        message: String(error?.message || error || 'unknown').slice(0, 500),
+      });
       return htmlError(
         [404, 410].includes(status) ? status : 502,
         [404, 410].includes(status)

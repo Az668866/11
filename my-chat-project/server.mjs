@@ -6940,7 +6940,11 @@ function newTenantEndpointIdentity(slot = 1, suffixOffset = 0) {
   const suffix = TENANT_ENTRY_DOMAIN_SUFFIXES[
     Math.abs(Number(suffixOffset) || 0) % TENANT_ENTRY_DOMAIN_SUFFIXES.length
   ];
-  const label = `u${Number(slot).toString(36)}-${randomBytes(6).toString('hex')}`;
+  const hostnameAlphabet = 'abcdefghjkmnpqrstuvwxyz23456789';
+  const label = Array.from(
+    randomBytes(8),
+    (value) => hostnameAlphabet[value & 31],
+  ).join('');
   return {
     hostname: `${label}.${suffix}`,
     entryToken: randomBytes(24).toString('base64url'),
@@ -6948,13 +6952,8 @@ function newTenantEndpointIdentity(slot = 1, suffixOffset = 0) {
 }
 
 function tenantEndpointUrl(endpoint) {
-  if (!endpoint?.hostname || !endpoint?.public_code || !endpoint?.entry_token) {
-    return '';
-  }
-  const url = new URL(`https://${endpoint.hostname}/`);
-  url.searchParams.set('tenant', endpoint.public_code);
-  url.searchParams.set('entry', endpoint.entry_token);
-  return url.toString();
+  if (!endpoint?.hostname) return '';
+  return `https://${endpoint.hostname}/`;
 }
 
 async function ensureTenantEndpoints(tenantId, client = pool) {
