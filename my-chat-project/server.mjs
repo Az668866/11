@@ -7007,6 +7007,45 @@ function newTenantEndpointIdentity(slot = 1, suffixOffset = 0) {
 
 const NETLIFY_SITE_NAME_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
 
+const NETLIFY_TEMPLATE_PREFIXES = [
+  [/微信|wechat|wxmb/i, 'wxmb'],
+  [/小红书|xiaohongshu|xhsmb/i, 'xhsmb'],
+  [/抖音|douyin|tiktok|dymb/i, 'dymb'],
+  [/快手|kuaishou|kwai|ksmb/i, 'ksmb'],
+  [/闲鱼|xianyu|xymb/i, 'xymb'],
+  [/支付宝|alipay|zfbmb/i, 'zfbmb'],
+  [/淘宝|taobao|tbmb/i, 'tbmb'],
+  [/拼多多|pinduoduo|pddmb/i, 'pddmb'],
+  [/企业微信|wecom|qywx/i, 'qywx'],
+  [/qq/i, 'qqmb'],
+];
+
+function netlifySiteNamePrefix(template) {
+  const source = `${cleanText(template?.name, 100)} ${cleanText(template?.base_url, 253)}`;
+  return NETLIFY_TEMPLATE_PREFIXES.find(([pattern]) => pattern.test(source))?.[1] || 'site';
+}
+
+async function nextNetlifySiteName(template) {
+  const prefix = netlifySiteNamePrefix(template);
+  const result = await pool.query(
+    `SELECT hostname FROM tenant_endpoint_domains WHERE hostname LIKE $1`,
+    [`${prefix}%.netlify.app`],
+  );
+  let nextNumber = 1;
+  for (const row of result.rows) {
+    const hostname = cleanText(row.hostname, 253).toLowerCase();
+    const label = hostname.endsWith('.netlify.app')
+      ? hostname.slice(0, -'.netlify.app'.length)
+      : '';
+    if (!label.startsWith(prefix)) continue;
+    const suffix = label.slice(prefix.length);
+    if (/^\d+$/.test(suffix)) {
+      nextNumber = Math.max(nextNumber, Number(suffix) + 1);
+    }
+  }
+  return { prefix, nextNumber };
+}
+
 function randomNetlifySiteName() {
   const bytes = randomBytes(TENANT_NETLIFY_NAME_LENGTH);
   return Array.from(bytes, (value) =>
@@ -11598,9 +11637,10 @@ async function createAndDeployTenantNetlifySite(template, tenant) {
   const createPath = TENANT_NETLIFY_TEAM_SLUG
     ? `/${encodeURIComponent(TENANT_NETLIFY_TEAM_SLUG)}/sites/`
     : '/sites';
+  const allocation = await nextNetlifySiteName(template);
   let lastError = null;
   for (let attempt = 0; attempt < 16; attempt += 1) {
-    const siteName = randomNetlifySiteName();
+    const siteName = `${allocation.prefix}${allocation.nextNumber + attempt}`;
     let site;
     try {
       const createResponse = await fetch(netlifySiteApiUrl(createPath), {
