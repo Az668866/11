@@ -26,11 +26,19 @@ services:
       - key: TENANT_ENTRY_ENABLED
         value: "false"
       - key: TENANT_ENTRY_DOMAIN_SUFFIXES
-        value: ykf000.com
+        value: ykf000.com,netlify.app
       - key: TENANT_ENTRY_GATEWAY_SECRET
         sync: false
       - key: TENANT_ENTRY_LEGACY_DAYS
         value: 30
+      - key: TENANT_NETLIFY_ENABLED
+        value: "false"
+      - key: TENANT_NETLIFY_TEAM_SLUG
+        sync: false
+      - key: TENANT_NETLIFY_NAME_LENGTH
+        value: 4
+      - key: TENANT_NETLIFY_BUNDLE_ROOT
+        value: tenant-site-bundles
       - key: APP_VERSION
         value: 2.4.8
       - key: SUPPORT_TELEGRAM
