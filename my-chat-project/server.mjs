@@ -46,6 +46,23 @@ const PUBLIC_API_BASE = String(
 const QR_ENTRY_BASE = String(
   process.env.QR_ENTRY_BASE || PUBLIC_API_BASE,
 ).replace(/\/+$/, '');
+const TENANT_ENTRY_ENABLED = process.env.TENANT_ENTRY_ENABLED === 'true';
+const TENANT_ENTRY_DOMAIN_SUFFIXES = [...new Set(
+  String(process.env.TENANT_ENTRY_DOMAIN_SUFFIXES || '')
+    .split(',')
+    .map((value) => value.trim().toLowerCase().replace(/^\.+|\.+$/g, ''))
+    .filter((value) =>
+      /^(?=.{3,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(value)),
+)];
+const TENANT_ENTRY_GATEWAY_SECRET = String(
+  process.env.TENANT_ENTRY_GATEWAY_SECRET || '',
+).trim();
+const TENANT_ENTRY_ROTATE_COOLDOWN_MINUTES = Math.trunc(
+  envNumber('TENANT_ENTRY_ROTATE_COOLDOWN_MINUTES', 10, 1, 1440),
+);
+const TENANT_ENTRY_LEGACY_DAYS = Math.trunc(
+  envNumber('TENANT_ENTRY_LEGACY_DAYS', 30, 0, 3650),
+);
 const APP_VERSION = String(process.env.APP_VERSION || '2.4.8').trim();
 const SUPPORT_TELEGRAM = String(
   process.env.SUPPORT_TELEGRAM || '@YingYingUu',
@@ -233,7 +250,7 @@ const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
 const MAX_QR_LOGO_BYTES = 3 * 1024 * 1024;
 const MAX_COVER_BYTES = 5 * 1024 * 1024;
 const DEFAULT_QR_BOTTOM_TEXT =
-  '支持微信、支付宝、QQ和浏览器进入\n此二维码为活码，模板域名更换后仍可继续使用';
+  '支持微信、支付宝、QQ和浏览器进入\n域名异常更换后，请使用后台生成的新二维码';
 const MAX_ALBUM_IMAGES = 9;
 const MAX_CONCURRENT_UPLOADS = Math.trunc(
   envNumber('MAX_CONCURRENT_UPLOADS', 4, 1, 8),
@@ -409,6 +426,19 @@ if (!STATIC_ALLOWED_ORIGINS.length) {
   throw new Error(
     'ALLOWED_ORIGINS 必须设置，例如：https://user.example.com,https://admin.example.com',
   );
+}
+
+if (TENANT_ENTRY_ENABLED) {
+  if (!TENANT_ENTRY_DOMAIN_SUFFIXES.length) {
+    throw new Error(
+      'TENANT_ENTRY_ENABLED=true 时必须配置 TENANT_ENTRY_DOMAIN_SUFFIXES。',
+    );
+  }
+  if (TENANT_ENTRY_GATEWAY_SECRET.length < 32) {
+    throw new Error(
+      'TENANT_ENTRY_GATEWAY_SECRET 必须至少32位，并与 Cloudflare Worker Secret 保持一致。',
+    );
+  }
 }
 
 if (TOKEN_SECRET_TEXT.length < 32) {
@@ -1088,6 +1118,76 @@ async function initDatabase() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS tenant_frontend_templates_template_idx
       ON tenant_frontend_templates (template_id, tenant_id)
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS tenant_endpoints (
+        id UUID PRIMARY KEY,
+        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        slot INTEGER NOT NULL CHECK (slot > 0),
+        frontend_template_id UUID NOT NULL
+          REFERENCES frontend_templates(id) ON DELETE RESTRICT,
+        hostname TEXT NOT NULL UNIQUE,
+        entry_token TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL DEFAULT 'active'
+          CHECK (status IN ('active','disabled')),
+        rotation_count INTEGER NOT NULL DEFAULT 0,
+        last_rotated_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (tenant_id, slot)
+      )
+    `);
+    await client.query(`
+      ALTER TABLE tenant_endpoints
+      DROP CONSTRAINT IF EXISTS tenant_endpoints_slot_check
+    `);
+    await client.query(`
+      ALTER TABLE tenant_endpoints
+      ADD CONSTRAINT tenant_endpoints_slot_check CHECK (slot > 0)
+    `);
+    // 兼容曾试运行过“固定入口数量”的数据库：同一模板只保留最早的
+    // 一个入口，之后改为一个租户的每个可用模板各有一个独占入口。
+    await client.query(`
+      WITH ranked AS (
+        SELECT id,ROW_NUMBER() OVER (
+          PARTITION BY tenant_id,frontend_template_id
+          ORDER BY created_at,id
+        ) AS position
+        FROM tenant_endpoints
+      )
+      DELETE FROM tenant_endpoints endpoint
+      USING ranked
+      WHERE endpoint.id=ranked.id AND ranked.position>1
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS tenant_endpoints_template_idx
+      ON tenant_endpoints (tenant_id, frontend_template_id)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS tenant_endpoints_tenant_idx
+      ON tenant_endpoints (tenant_id, slot)
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS tenant_endpoint_domains (
+        id UUID PRIMARY KEY,
+        endpoint_id UUID NOT NULL REFERENCES tenant_endpoints(id) ON DELETE CASCADE,
+        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        hostname TEXT NOT NULL UNIQUE,
+        entry_token TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL DEFAULT 'active'
+          CHECK (status IN ('active','legacy','retired')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        replaced_at TIMESTAMPTZ,
+        expires_at TIMESTAMPTZ
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS tenant_endpoint_domains_lookup_idx
+      ON tenant_endpoint_domains (hostname, status, expires_at)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS tenant_endpoint_domains_tenant_idx
+      ON tenant_endpoint_domains (tenant_id, endpoint_id, created_at DESC)
     `);
     // Existing databases only know the currently selected template. Seed that
     // trusted selection first; every later switch is retained automatically.
@@ -2259,6 +2359,7 @@ async function initDatabase() {
   }
 
   await cleanupExpiredData();
+  if (TENANT_ENTRY_ENABLED) await backfillTenantEndpoints();
   await refreshApprovedOrigins(true);
 }
 
@@ -4225,7 +4326,7 @@ function invalidateApprovedOrigins() {
 function originAllowed(origin) {
   if (!origin) return true;
   const normalized = normalizeOrigin(origin);
-  return approvedOriginCache.has(normalized);
+  return approvedOriginCache.has(normalized) || tenantEntryOriginAllowed(normalized);
 }
 
 function setCommonHeaders(req, res) {
@@ -6804,6 +6905,384 @@ async function createTenantConfig(tenantId, client = pool) {
     `,
     [tenantId],
   );
+  if (TENANT_ENTRY_ENABLED) await ensureTenantEndpoints(tenantId, client);
+}
+
+function tenantEntrySuffixForHostname(value) {
+  const hostname = cleanText(value, 253).toLowerCase().replace(/\.+$/, '');
+  if (!hostname) return '';
+  return TENANT_ENTRY_DOMAIN_SUFFIXES.find((suffix) => {
+    if (!hostname.endsWith(`.${suffix}`)) return false;
+    const label = hostname.slice(0, -(suffix.length + 1));
+    return /^(?=.{3,63}$)[a-z0-9](?:[a-z0-9-]*[a-z0-9])$/.test(label) &&
+      !label.includes('.');
+  }) || '';
+}
+
+function tenantEntryOriginAllowed(value) {
+  if (!TENANT_ENTRY_ENABLED) return false;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'https:' &&
+      !parsed.username &&
+      !parsed.password &&
+      !parsed.port &&
+      parsed.pathname === '/' &&
+      !parsed.search &&
+      !parsed.hash &&
+      Boolean(tenantEntrySuffixForHostname(parsed.hostname));
+  } catch {
+    return false;
+  }
+}
+
+function newTenantEndpointIdentity(slot = 1, suffixOffset = 0) {
+  const suffix = TENANT_ENTRY_DOMAIN_SUFFIXES[
+    Math.abs(Number(suffixOffset) || 0) % TENANT_ENTRY_DOMAIN_SUFFIXES.length
+  ];
+  const label = `u${Number(slot).toString(36)}-${randomBytes(6).toString('hex')}`;
+  return {
+    hostname: `${label}.${suffix}`,
+    entryToken: randomBytes(24).toString('base64url'),
+  };
+}
+
+function tenantEndpointUrl(endpoint) {
+  if (!endpoint?.hostname || !endpoint?.public_code || !endpoint?.entry_token) {
+    return '';
+  }
+  const url = new URL(`https://${endpoint.hostname}/`);
+  url.searchParams.set('tenant', endpoint.public_code);
+  url.searchParams.set('entry', endpoint.entry_token);
+  return url.toString();
+}
+
+async function ensureTenantEndpoints(tenantId, client = pool) {
+  if (!TENANT_ENTRY_ENABLED || !isUuid(tenantId)) return;
+  let created = false;
+  const templates = await client.query(
+    `
+      SELECT template.id
+      FROM frontend_templates template
+      WHERE (
+        template.status='enabled'
+        AND (
+          template.selection_closed=FALSE
+          OR EXISTS (
+            SELECT 1
+            FROM tenant_frontend_templates selected
+            WHERE selected.tenant_id=$1
+              AND selected.template_id=template.id
+          )
+        )
+      ) OR (
+        template.status='testing'
+        AND EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements_text(template.test_tenant_ids) allowed(id)
+          WHERE allowed.id=$1::text
+        )
+      )
+      ORDER BY
+        template.is_default DESC,
+        template.recommended DESC,
+        template.sort_order,
+        template.created_at,
+        template.id
+    `,
+    [tenantId],
+  );
+  const existingResult = await client.query(
+    `SELECT * FROM tenant_endpoints WHERE tenant_id=$1 ORDER BY slot`,
+    [tenantId],
+  );
+  const endpointsByTemplate = new Map(
+    existingResult.rows.map((endpoint) => [endpoint.frontend_template_id, endpoint]),
+  );
+  let nextSlot = existingResult.rows.reduce(
+    (maximum, endpoint) => Math.max(maximum, Number(endpoint.slot) || 0),
+    0,
+  ) + 1;
+  for (let templateIndex = 0; templateIndex < templates.rows.length; templateIndex += 1) {
+    const templateId = templates.rows[templateIndex].id;
+    let endpoint = endpointsByTemplate.get(templateId);
+    if (!endpoint) {
+      let lastError = null;
+      for (let attempt = 0; attempt < 8 && !endpoint; attempt += 1) {
+        const slot = nextSlot + attempt;
+        const identity = newTenantEndpointIdentity(
+          slot,
+          templateIndex + attempt,
+        );
+        try {
+          const inserted = await client.query(
+            `
+              INSERT INTO tenant_endpoints (
+                id,tenant_id,slot,frontend_template_id,hostname,entry_token
+              ) VALUES ($1,$2,$3,$4,$5,$6)
+              ON CONFLICT (tenant_id,slot) DO NOTHING
+              RETURNING *
+            `,
+            [
+              randomUUID(),
+              tenantId,
+              slot,
+              templateId,
+              identity.hostname,
+              identity.entryToken,
+            ],
+          );
+          endpoint = inserted.rows[0] || (await client.query(
+            `
+              SELECT * FROM tenant_endpoints
+              WHERE tenant_id=$1 AND frontend_template_id=$2
+              LIMIT 1
+            `,
+            [tenantId, templateId],
+          )).rows[0];
+          if (inserted.rows[0]) created = true;
+        } catch (error) {
+          lastError = error;
+          if (error?.code !== '23505') throw error;
+        }
+      }
+      if (!endpoint) throw lastError || new Error('无法创建租户独占入口。');
+      endpointsByTemplate.set(templateId, endpoint);
+      nextSlot = Math.max(nextSlot, Number(endpoint.slot) + 1);
+    }
+    await client.query(
+      `
+        INSERT INTO tenant_endpoint_domains (
+          id,endpoint_id,tenant_id,hostname,entry_token,status
+        ) VALUES ($1,$2,$3,$4,$5,'active')
+        ON CONFLICT (hostname) DO NOTHING
+      `,
+      [
+        randomUUID(),
+        endpoint.id,
+        tenantId,
+        endpoint.hostname,
+        endpoint.entry_token,
+      ],
+    );
+  }
+  if (created && client === pool) {
+    invalidateTenantCaches(tenantId);
+    invalidateApprovedOrigins();
+  }
+}
+
+async function backfillTenantEndpoints() {
+  const tenants = await pool.query(`SELECT id FROM tenants ORDER BY created_at,id`);
+  for (const tenant of tenants.rows) {
+    await ensureTenantEndpoints(tenant.id);
+  }
+}
+
+async function getTenantEndpoints(tenantId, client = pool) {
+  if (!TENANT_ENTRY_ENABLED) return [];
+  await ensureTenantEndpoints(tenantId, client);
+  const result = await client.query(
+    `
+      SELECT
+        endpoint.*,tenant.public_code,
+        template.name AS template_name,
+        template.base_url AS template_base_url,
+        template.status AS template_status,
+        COALESCE(history.domains,'[]'::jsonb) AS domains
+      FROM tenant_endpoints endpoint
+      JOIN tenants tenant ON tenant.id=endpoint.tenant_id
+      JOIN frontend_templates template ON template.id=endpoint.frontend_template_id
+      LEFT JOIN LATERAL (
+        SELECT jsonb_agg(
+          jsonb_build_object(
+            'hostname',domain.hostname,
+            'status',domain.status,
+            'createdAt',domain.created_at,
+            'replacedAt',domain.replaced_at,
+            'expiresAt',domain.expires_at
+          ) ORDER BY domain.created_at DESC
+        ) AS domains
+        FROM tenant_endpoint_domains domain
+        WHERE domain.endpoint_id=endpoint.id
+      ) history ON TRUE
+      WHERE endpoint.tenant_id=$1
+        AND (
+          template.status='enabled'
+          OR (
+            template.status='testing'
+            AND EXISTS (
+              SELECT 1
+              FROM jsonb_array_elements_text(template.test_tenant_ids) allowed(id)
+              WHERE allowed.id=endpoint.tenant_id::text
+            )
+          )
+        )
+      ORDER BY
+        template.is_default DESC,
+        template.recommended DESC,
+        template.sort_order,
+        endpoint.slot
+    `,
+    [tenantId],
+  );
+  return result.rows.map((row) => ({
+    id: row.id,
+    slot: Number(row.slot),
+    hostname: row.hostname,
+    entryToken: row.entry_token,
+    status: row.status,
+    frontendTemplateId: row.frontend_template_id,
+    frontendTemplateName: row.template_name,
+    frontendBaseUrl: row.template_base_url,
+    templateStatus: row.template_status,
+    rotationCount: Number(row.rotation_count || 0),
+    lastRotatedAt: row.last_rotated_at
+      ? new Date(row.last_rotated_at).toISOString()
+      : null,
+    url: tenantEndpointUrl(row),
+    domains: Array.isArray(row.domains) ? row.domains : [],
+  }));
+}
+
+async function findTenantEndpointDomain({
+  hostname,
+  tenantId = '',
+  entryToken = '',
+} = {}, client = pool) {
+  const normalizedHostname = cleanText(hostname, 253).toLowerCase().replace(/\.+$/, '');
+  if (!tenantEntrySuffixForHostname(normalizedHostname)) return null;
+  const result = await client.query(
+    `
+      SELECT
+        domain.hostname,domain.entry_token,domain.status AS domain_status,
+        domain.expires_at,endpoint.id AS endpoint_id,endpoint.tenant_id,
+        endpoint.slot,endpoint.status AS endpoint_status,
+        endpoint.hostname AS current_hostname,
+        endpoint.entry_token AS current_entry_token,
+        endpoint.frontend_template_id,tenant.public_code,
+        tenant.status AS tenant_status,tenant.access_expires_at,
+        template.name AS template_name,template.base_url AS template_base_url,
+        template.origin AS template_origin,template.status AS template_status,
+        template.netlify_site_id
+      FROM tenant_endpoint_domains domain
+      JOIN tenant_endpoints endpoint ON endpoint.id=domain.endpoint_id
+      JOIN tenants tenant ON tenant.id=endpoint.tenant_id
+      JOIN frontend_templates template ON template.id=endpoint.frontend_template_id
+      WHERE domain.hostname=$1
+        AND domain.status IN ('active','legacy')
+        AND (domain.expires_at IS NULL OR domain.expires_at>NOW())
+        AND endpoint.status='active'
+        AND ($2::uuid IS NULL OR endpoint.tenant_id=$2)
+        AND ($3::text='' OR domain.entry_token=$3)
+        AND (
+          template.status='enabled'
+          OR (
+            template.status='testing'
+            AND EXISTS (
+              SELECT 1
+              FROM jsonb_array_elements_text(template.test_tenant_ids) allowed(id)
+              WHERE allowed.id=endpoint.tenant_id::text
+            )
+          )
+        )
+      LIMIT 1
+    `,
+    [
+      normalizedHostname,
+      isUuid(tenantId) ? tenantId : null,
+      cleanText(entryToken, 200),
+    ],
+  );
+  return result.rows[0] || null;
+}
+
+async function rotateTenantEndpoint(tenantId, endpointId, client = pool) {
+  const databaseClient = client === pool ? await pool.connect() : client;
+  const ownsClient = client === pool;
+  try {
+    if (ownsClient) await databaseClient.query('BEGIN');
+    const locked = await databaseClient.query(
+      `
+        SELECT * FROM tenant_endpoints
+        WHERE id=$1 AND tenant_id=$2
+        FOR UPDATE
+      `,
+      [endpointId, tenantId],
+    );
+    const endpoint = locked.rows[0];
+    if (!endpoint) {
+      throw requestError('租户用户端入口不存在。', 404, 'TENANT_ENDPOINT');
+    }
+    const cooldownMs = TENANT_ENTRY_ROTATE_COOLDOWN_MINUTES * 60_000;
+    if (
+      endpoint.last_rotated_at &&
+      Date.now() - new Date(endpoint.last_rotated_at).getTime() < cooldownMs
+    ) {
+      throw requestError(
+        `该入口刚刚更换过域名，请${TENANT_ENTRY_ROTATE_COOLDOWN_MINUTES}分钟后再试。`,
+        429,
+        'TENANT_ENDPOINT_COOLDOWN',
+      );
+    }
+    const currentSuffix = tenantEntrySuffixForHostname(endpoint.hostname);
+    const currentIndex = Math.max(0, TENANT_ENTRY_DOMAIN_SUFFIXES.indexOf(currentSuffix));
+    let identity = null;
+    for (let attempt = 1; attempt <= 12 && !identity; attempt += 1) {
+      const candidate = newTenantEndpointIdentity(
+        endpoint.slot,
+        currentIndex + attempt,
+      );
+      const collision = await databaseClient.query(
+        `SELECT 1 FROM tenant_endpoint_domains WHERE hostname=$1 OR entry_token=$2 LIMIT 1`,
+        [candidate.hostname, candidate.entryToken],
+      );
+      if (!collision.rows[0]) identity = candidate;
+    }
+    if (!identity) throw new Error('无法分配新的租户入口域名。');
+    await databaseClient.query(
+      `
+        UPDATE tenant_endpoint_domains
+        SET status='legacy',replaced_at=NOW(),
+            expires_at=CASE
+              WHEN $3::int=0 THEN NULL
+              ELSE NOW()+($3::int*INTERVAL '1 day')
+            END
+        WHERE endpoint_id=$1 AND hostname=$2 AND status='active'
+      `,
+      [endpoint.id, endpoint.hostname, TENANT_ENTRY_LEGACY_DAYS],
+    );
+    await databaseClient.query(
+      `
+        UPDATE tenant_endpoints
+        SET hostname=$3,entry_token=$4,rotation_count=rotation_count+1,
+            last_rotated_at=NOW(),updated_at=NOW()
+        WHERE id=$1 AND tenant_id=$2
+      `,
+      [endpoint.id, tenantId, identity.hostname, identity.entryToken],
+    );
+    await databaseClient.query(
+      `
+        INSERT INTO tenant_endpoint_domains (
+          id,endpoint_id,tenant_id,hostname,entry_token,status
+        ) VALUES ($1,$2,$3,$4,$5,'active')
+      `,
+      [randomUUID(), endpoint.id, tenantId, identity.hostname, identity.entryToken],
+    );
+    if (ownsClient) await databaseClient.query('COMMIT');
+    invalidateTenantCaches(tenantId);
+    invalidateApprovedOrigins();
+    return {
+      oldDomain: endpoint.hostname,
+      newDomain: identity.hostname,
+      endpoints: await getTenantEndpoints(tenantId),
+    };
+  } catch (error) {
+    if (ownsClient) await databaseClient.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    if (ownsClient) databaseClient.release();
+  }
 }
 
 async function getConfig(tenantId, client = pool) {
@@ -6825,7 +7304,8 @@ async function getConfig(tenantId, client = pool) {
         ft.origin AS frontend_origin,
         ft.netlify_site_id AS frontend_netlify_site_id,
         ft.status AS frontend_template_status,
-        approved.approved_frontends
+        approved.approved_frontends,
+        endpoint_approved.approved_endpoint_frontends
       FROM tenant_config tc
       LEFT JOIN frontend_templates ft ON ft.id = tc.frontend_template_id
       LEFT JOIN LATERAL (
@@ -6861,6 +7341,43 @@ async function getConfig(tenantId, client = pool) {
             )
           )
       ) approved ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT jsonb_agg(
+          jsonb_build_object(
+            'id', endpoint_template.id,
+            'name', endpoint_template.name,
+            'baseUrl', endpoint_template.base_url,
+            'origin', 'https://' || endpoint_domain.hostname,
+            'netlifySiteId', endpoint_template.netlify_site_id,
+            'status', endpoint_template.status
+          ) ORDER BY endpoint_domain.created_at DESC
+        ) AS approved_endpoint_frontends
+        FROM tenant_endpoint_domains endpoint_domain
+        JOIN tenant_endpoints endpoint
+          ON endpoint.id=endpoint_domain.endpoint_id
+        JOIN frontend_templates endpoint_template
+          ON endpoint_template.id=endpoint.frontend_template_id
+        WHERE endpoint_domain.tenant_id=tc.tenant_id
+          AND endpoint.status='active'
+          AND endpoint_domain.status IN ('active','legacy')
+          AND (
+            endpoint_domain.expires_at IS NULL
+            OR endpoint_domain.expires_at>NOW()
+          )
+          AND (
+            endpoint_template.status='enabled'
+            OR (
+              endpoint_template.status='testing'
+              AND EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements_text(
+                  endpoint_template.test_tenant_ids
+                ) allowed(id)
+                WHERE allowed.id=tc.tenant_id::text
+              )
+            )
+          )
+      ) endpoint_approved ON TRUE
       WHERE tc.tenant_id = $1
     `,
     [tenantId],
@@ -6869,8 +7386,16 @@ async function getConfig(tenantId, client = pool) {
     await createTenantConfig(tenantId, client);
     return getConfig(tenantId, client);
   }
-  const approvedFrontends = Array.isArray(result.rows[0].approved_frontends)
-    ? result.rows[0].approved_frontends
+  const approvedFrontendRows = [
+    ...(Array.isArray(result.rows[0].approved_frontends)
+      ? result.rows[0].approved_frontends
+      : []),
+    ...(Array.isArray(result.rows[0].approved_endpoint_frontends)
+      ? result.rows[0].approved_endpoint_frontends
+      : []),
+  ];
+  const approvedFrontends = approvedFrontendRows.length
+    ? approvedFrontendRows
         .map((item) => ({
           id: cleanText(item?.id, 80),
           name: cleanText(item?.name, 80),
@@ -17764,6 +18289,48 @@ async function router(req, res, parsedRequestUrl = null) {
     return res.end();
   }
 
+  if (
+    req.method === 'GET' &&
+    rawPathname === '/api/public/tenant-entry/resolve'
+  ) {
+    if (!TENANT_ENTRY_ENABLED) {
+      return sendError(res, 404, '租户独占入口尚未启用。', 'TENANT_ENDPOINT_DISABLED');
+    }
+    const gatewaySecret = cleanText(
+      req.headers['x-tenant-entry-gateway'],
+      512,
+    );
+    if (!timingSafeTextEqual(gatewaySecret, TENANT_ENTRY_GATEWAY_SECRET)) {
+      return sendError(res, 403, '入口网关验证失败。', 'TENANT_ENDPOINT_GATEWAY');
+    }
+    if (!rateLimit(req, res, 'tenant-entry-resolve', 600, 60_000)) return;
+    const hostname = cleanText(url.searchParams.get('hostname'), 253)
+      .toLowerCase();
+    const endpoint = await findTenantEndpointDomain({ hostname });
+    if (!endpoint) {
+      return sendError(res, 404, '租户用户端域名不存在。', 'TENANT_ENDPOINT');
+    }
+    if (
+      endpoint.tenant_status !== 'active' ||
+      new Date(endpoint.access_expires_at).getTime() <= Date.now()
+    ) {
+      return sendError(res, 410, '该租户客服服务当前不可用。', 'TENANT_INACTIVE');
+    }
+    return sendJson(res, 200, {
+      ok: true,
+      endpointId: endpoint.endpoint_id,
+      hostname: endpoint.hostname,
+      domainStatus: endpoint.domain_status,
+      tenantCode: endpoint.public_code,
+      entryToken: endpoint.entry_token,
+      currentHostname: endpoint.current_hostname,
+      currentEntryToken: endpoint.current_entry_token,
+      templateId: endpoint.frontend_template_id,
+      templateBaseUrl: endpoint.template_base_url,
+      templateOrigin: endpoint.template_origin,
+    });
+  }
+
   await refreshApprovedOrigins();
 
   const origin = req.headers.origin;
@@ -17894,6 +18461,22 @@ async function router(req, res, parsedRequestUrl = null) {
       getTenantFeatureStates(tenant.id),
     ]);
     const requestOrigin = normalizeOrigin(req.headers.origin);
+    const usesTenantEndpoint = tenantEntryOriginAllowed(requestOrigin);
+    const endpointAccess = usesTenantEndpoint
+      ? await findTenantEndpointDomain({
+          hostname: new URL(requestOrigin).hostname,
+          tenantId: tenant.id,
+          entryToken: body.entryToken,
+        })
+      : null;
+    if (usesTenantEndpoint && !endpointAccess) {
+      return sendError(
+        res,
+        403,
+        '当前独占用户端入口无效、已过期或不属于该租户。',
+        'TENANT_ENDPOINT',
+      );
+    }
     if (body.clientTemplateId && !isUuid(body.clientTemplateId)) {
       return sendError(res, 400, '用户端模板标识无效。', 'CLIENT_TEMPLATE');
     }
@@ -17922,8 +18505,23 @@ async function router(req, res, parsedRequestUrl = null) {
         'CLIENT_ORIGIN_MISSING',
       );
     }
-    const originApproved = findTenantApprovedFrontend(config, requestOrigin);
-    let template = findTenantApprovedFrontend(
+    const endpointTemplate = endpointAccess &&
+      clientTemplateIdentifierMatches(body.clientTemplateId, {
+        id: endpointAccess.frontend_template_id,
+        netlify_site_id: endpointAccess.netlify_site_id,
+      })
+      ? {
+          id: endpointAccess.frontend_template_id,
+          name: endpointAccess.template_name,
+          baseUrl: endpointAccess.template_base_url,
+          origin: requestOrigin,
+          netlifySiteId: endpointAccess.netlify_site_id,
+          status: endpointAccess.template_status,
+        }
+      : null;
+    const originApproved = endpointAccess ||
+      findTenantApprovedFrontend(config, requestOrigin);
+    let template = endpointTemplate || findTenantApprovedFrontend(
       config,
       requestOrigin,
       body.clientTemplateId,
@@ -18808,7 +19406,14 @@ async function router(req, res, parsedRequestUrl = null) {
 
     if (req.method === 'GET' && pathname === '/api/admin/bootstrap') {
       const tenant = activeTenant;
-      const [conversationResult, config, templates, notices, visitorGroups] = await Promise.all([
+      const [
+        conversationResult,
+        config,
+        templates,
+        notices,
+        visitorGroups,
+        endpoints,
+      ] = await Promise.all([
         apiVersion >= 2
           ? getAllSummariesPage(payload.tenantId, {
               limit: pageLimit(url),
@@ -18818,6 +19423,7 @@ async function router(req, res, parsedRequestUrl = null) {
         getTemplateCatalog({ tenantId: payload.tenantId }),
         getTenantNotices(payload.tenantId),
         getVisitorGroups(payload.tenantId),
+        getTenantEndpoints(payload.tenantId),
       ]);
       return sendJson(res, 200, {
         ok: true,
@@ -18836,9 +19442,10 @@ async function router(req, res, parsedRequestUrl = null) {
         autoReplies: config.autoReplies,
         settings: config.settings,
         templates,
+        endpoints,
         visitorGroups,
-        entryUrl: tenantEntryUrl(config.settings, tenant.public_code),
-        qrEntryUrl: tenantQrEntryUrl(tenant.public_code),
+        entryUrl: endpoints[0]?.url || tenantEntryUrl(config.settings, tenant.public_code),
+        qrEntryUrl: endpoints[0]?.url || tenantQrEntryUrl(tenant.public_code),
         ...notices,
       });
     }
@@ -19051,10 +19658,11 @@ async function router(req, res, parsedRequestUrl = null) {
     }
 
     if (req.method === 'GET' && pathname === '/api/admin/config') {
-      const [config, templates, notices] = await Promise.all([
+      const [config, templates, notices, endpoints] = await Promise.all([
         getConfig(payload.tenantId),
         getTemplateCatalog({ tenantId: payload.tenantId }),
         getTenantNotices(payload.tenantId),
+        getTenantEndpoints(payload.tenantId),
       ]);
       return sendJson(res, 200, {
         ok: true,
@@ -19062,11 +19670,12 @@ async function router(req, res, parsedRequestUrl = null) {
         autoReplies: config.autoReplies,
         settings: config.settings,
         templates,
-        entryUrl: tenantEntryUrl(
+        endpoints,
+        entryUrl: endpoints[0]?.url || tenantEntryUrl(
           config.settings,
           activeTenant.public_code,
         ),
-        qrEntryUrl: tenantQrEntryUrl(activeTenant.public_code),
+        qrEntryUrl: endpoints[0]?.url || tenantQrEntryUrl(activeTenant.public_code),
         ...notices,
       });
     }
@@ -19165,6 +19774,7 @@ async function router(req, res, parsedRequestUrl = null) {
       );
       invalidateTenantCaches(payload.tenantId);
       const updated = await getConfig(payload.tenantId);
+      const endpoints = await getTenantEndpoints(payload.tenantId);
       broadcast(
         { type: 'settings-updated', settings: updated.settings },
         null,
@@ -19175,8 +19785,9 @@ async function router(req, res, parsedRequestUrl = null) {
         cannedReplies: updated.cannedReplies,
         autoReplies: updated.autoReplies,
         settings: updated.settings,
-        entryUrl: tenantEntryUrl(updated.settings, tenant.public_code),
-        qrEntryUrl: tenantQrEntryUrl(tenant.public_code),
+        endpoints,
+        entryUrl: endpoints[0]?.url || tenantEntryUrl(updated.settings, tenant.public_code),
+        qrEntryUrl: endpoints[0]?.url || tenantQrEntryUrl(tenant.public_code),
       });
     }
 
@@ -19434,6 +20045,131 @@ async function router(req, res, parsedRequestUrl = null) {
         ok: true,
         assetId: asset.id,
       });
+    }
+
+    if (req.method === 'GET' && pathname === '/api/admin/endpoints') {
+      return sendJson(res, 200, {
+        ok: true,
+        endpoints: await getTenantEndpoints(payload.tenantId),
+      });
+    }
+
+    const endpointIncidentMatch = pathname.match(
+      /^\/api\/admin\/endpoints\/([0-9a-f-]{36})\/incident$/i,
+    );
+    if (req.method === 'POST' && endpointIncidentMatch) {
+      if (
+        !rateLimit(
+          req,
+          res,
+          'tenant-endpoint-incident',
+          12,
+          60 * 60_000,
+          payload.tenantId,
+        )
+      ) return;
+      const endpointId = endpointIncidentMatch[1];
+      if (!isUuid(endpointId)) {
+        return sendError(res, 400, '租户用户端入口无效。', 'TENANT_ENDPOINT');
+      }
+      const changed = await rotateTenantEndpoint(payload.tenantId, endpointId);
+      await writeTenantAudit(req, payload, 'tenant.endpoint.rotate', {
+        targetType: 'tenant_endpoint',
+        targetId: endpointId,
+        riskLevel: 'high',
+        metadata: {
+          oldDomain: changed.oldDomain,
+          newDomain: changed.newDomain,
+        },
+      }).catch(() => {});
+      publishEvent(
+        {
+          type: 'tenant-endpoint-rotated',
+          endpointId,
+          oldDomain: changed.oldDomain,
+          newDomain: changed.newDomain,
+          at: nowIso(),
+        },
+        { tenantId: payload.tenantId, targetKind: 'tenant_admin' },
+      );
+      return sendJson(res, 201, {
+        ok: true,
+        status: 'resolved',
+        oldDomain: changed.oldDomain,
+        newDomain: changed.newDomain,
+        endpoints: changed.endpoints,
+      });
+    }
+
+    const endpointQrMatch = pathname.match(
+      /^\/api\/admin\/endpoints\/([0-9a-f-]{36})\/qr$/i,
+    );
+    if (req.method === 'GET' && endpointQrMatch) {
+      if (
+        !rateLimit(
+          req,
+          res,
+          'tenant-endpoint-qr-render',
+          90,
+          60_000,
+          payload.tenantId,
+        )
+      ) return;
+      const endpointId = endpointQrMatch[1];
+      const endpoints = await getTenantEndpoints(payload.tenantId);
+      const endpoint = endpoints.find((item) => item.id === endpointId);
+      if (!endpoint) {
+        return sendError(res, 404, '租户用户端入口不存在。', 'TENANT_ENDPOINT');
+      }
+      const config = await getConfig(payload.tenantId);
+      const plainQr = url.searchParams.get('plain') === '1';
+      const topText = plainQr ? '' : config.settings.qrTopText || '';
+      const bottomText = plainQr
+        ? ''
+        : config.settings.qrBottomText !== undefined
+          ? config.settings.qrBottomText
+          : DEFAULT_QR_BOTTOM_TEXT;
+      const cacheHash = createHash('sha256').update(JSON.stringify([
+        endpoint.url,
+        plainQr,
+        topText,
+        bottomText,
+        config.settings.qrLogoAssetId || '',
+      ])).digest('base64url');
+      const qrCacheKey = `${payload.tenantId}:${endpoint.id}:${cacheHash}`;
+      let image = cacheGet(tenantQrImageCache, qrCacheKey);
+      if (!image) {
+        const logoData = await readTenantQrLogo(
+          payload.tenantId,
+          config.settings.qrLogoAssetId,
+        ).catch(() => null);
+        image = await buildTenantQrImage(endpoint.url, {
+          topText,
+          bottomText,
+          logoData,
+        });
+        makeRoomInExpiringMap(
+          tenantQrImageCache,
+          MAX_TENANT_QR_CACHE,
+          Date.now(),
+          (item) => item.expiresAt,
+        );
+        cacheSet(
+          tenantQrImageCache,
+          qrCacheKey,
+          image,
+          TENANT_QR_CACHE_MS,
+        );
+      }
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'image/png');
+      res.setHeader('Content-Length', String(image.length));
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader(
+        'Content-Disposition',
+        `inline; filename="tenant-entry-${endpoint.slot}.png"`,
+      );
+      return res.end(image);
     }
 
     if (req.method === 'POST' && pathname === '/api/admin/qr-incident') {
