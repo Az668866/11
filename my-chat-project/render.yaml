@@ -29,8 +29,6 @@ services:
         value: ykf000.com
       - key: TENANT_ENTRY_GATEWAY_SECRET
         sync: false
-      - key: TENANT_ENTRY_ROTATE_COOLDOWN_MINUTES
-        value: 10
       - key: TENANT_ENTRY_LEGACY_DAYS
         value: 30
       - key: APP_VERSION
@@ -82,7 +80,7 @@ services:
       - key: QR_INCIDENT_WINDOW_MINUTES
         value: 10
       - key: QR_INCIDENT_REVIEW_THRESHOLD
-        value: 3
+        value: 10
       - key: ANOMALY_VISITOR_IP_10M
         value: 12
       - key: ANOMALY_VISITOR_TENANT_10M

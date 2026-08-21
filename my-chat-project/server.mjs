@@ -57,9 +57,6 @@ const TENANT_ENTRY_DOMAIN_SUFFIXES = [...new Set(
 const TENANT_ENTRY_GATEWAY_SECRET = String(
   process.env.TENANT_ENTRY_GATEWAY_SECRET || '',
 ).trim();
-const TENANT_ENTRY_ROTATE_COOLDOWN_MINUTES = Math.trunc(
-  envNumber('TENANT_ENTRY_ROTATE_COOLDOWN_MINUTES', 10, 1, 1440),
-);
 const TENANT_ENTRY_LEGACY_DAYS = Math.trunc(
   envNumber('TENANT_ENTRY_LEGACY_DAYS', 30, 0, 3650),
 );
@@ -238,7 +235,7 @@ const QR_INCIDENT_WINDOW_MINUTES = Math.trunc(
   envNumber('QR_INCIDENT_WINDOW_MINUTES', 10, 1, 1440),
 );
 const QR_INCIDENT_REVIEW_THRESHOLD = Math.trunc(
-  envNumber('QR_INCIDENT_REVIEW_THRESHOLD', 3, 2, 1000),
+  envNumber('QR_INCIDENT_REVIEW_THRESHOLD', 10, 2, 1000),
 );
 const MAX_IMAGE_BYTES =
   envNumber('MAX_IMAGE_MB', 8, 1, 16) * 1024 * 1024;
@@ -1609,6 +1606,18 @@ async function initDatabase() {
     await client.query(`ALTER TABLE qr_incidents ADD COLUMN IF NOT EXISTS click_count_30m INTEGER NOT NULL DEFAULT 1`);
     await client.query(`ALTER TABLE qr_incidents ADD COLUMN IF NOT EXISTS click_count_10m INTEGER NOT NULL DEFAULT 1`);
     await client.query(`ALTER TABLE qr_incidents ADD COLUMN IF NOT EXISTS requires_admin_review BOOLEAN NOT NULL DEFAULT FALSE`);
+    await client.query(`ALTER TABLE qr_incidents ADD COLUMN IF NOT EXISTS tenant_endpoint_id UUID REFERENCES tenant_endpoints(id) ON DELETE CASCADE`);
+    await client.query(`DROP INDEX IF EXISTS qr_incidents_active_unique_idx`);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS qr_incidents_active_template_unique_idx
+      ON qr_incidents (tenant_id, template_id)
+      WHERE status IN ('open','processing') AND tenant_endpoint_id IS NULL
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS qr_incidents_active_endpoint_unique_idx
+      ON qr_incidents (tenant_id, tenant_endpoint_id)
+      WHERE status IN ('open','processing') AND tenant_endpoint_id IS NOT NULL
+    `);
     await client.query(`
       CREATE TABLE IF NOT EXISTS qr_incident_reports (
         id UUID PRIMARY KEY,
@@ -6945,7 +6954,7 @@ function newTenantEndpointIdentity(slot = 1, suffixOffset = 0) {
   ];
   const hostnameAlphabet = 'abcdefghjkmnpqrstuvwxyz23456789';
   const label = Array.from(
-    randomBytes(8),
+    randomBytes(4),
     (value) => hostnameAlphabet[value & 31],
   ).join('');
   return {
@@ -6959,7 +6968,7 @@ function isLegacyTenantEndpointHostname(value) {
   const suffix = tenantEntrySuffixForHostname(hostname);
   if (!suffix) return false;
   const label = hostname.slice(0, -(suffix.length + 1));
-  return /^u[0-9a-z]+-[0-9a-f]{12}$/.test(label);
+  return !/^[abcdefghjkmnpqrstuvwxyz23456789]{4}$/.test(label);
 }
 
 function tenantEndpointUrl(endpoint) {
@@ -7312,17 +7321,6 @@ async function rotateTenantEndpoint(tenantId, endpointId, client = pool) {
     const endpoint = locked.rows[0];
     if (!endpoint) {
       throw requestError('租户用户端入口不存在。', 404, 'TENANT_ENDPOINT');
-    }
-    const cooldownMs = TENANT_ENTRY_ROTATE_COOLDOWN_MINUTES * 60_000;
-    if (
-      endpoint.last_rotated_at &&
-      Date.now() - new Date(endpoint.last_rotated_at).getTime() < cooldownMs
-    ) {
-      throw requestError(
-        `该入口刚刚更换过域名，请${TENANT_ENTRY_ROTATE_COOLDOWN_MINUTES}分钟后再试。`,
-        429,
-        'TENANT_ENDPOINT_COOLDOWN',
-      );
     }
     const currentSuffix = tenantEntrySuffixForHostname(endpoint.hostname);
     const currentIndex = Math.max(0, TENANT_ENTRY_DOMAIN_SUFFIXES.indexOf(currentSuffix));
@@ -11342,11 +11340,11 @@ function qrIncidentKeyboard(incidentId) {
   return {
     inline_keyboard: [
       [
-        { text: '✅ 核实并自动更换', callback_data: `qr:auto:${incidentId}` },
+        { text: '🔄 更换', callback_data: `qr:auto:${incidentId}` },
       ],
       [
-        { text: '🟢 二维码正常', callback_data: `qr:normal:${incidentId}` },
-        { text: '⛔ 封禁用户卡密', callback_data: `qr:block:${incidentId}` },
+        { text: '✅ 核实没问题', callback_data: `qr:normal:${incidentId}` },
+        { text: '⛔ 封禁该卡密', callback_data: `qr:block:${incidentId}` },
       ],
     ],
   };
@@ -11359,11 +11357,13 @@ async function getQrIncident(incidentId) {
       SELECT
         qi.*,ft.name AS template_name,ft.base_url AS current_base_url,
         ft.netlify_site_id,t.name AS tenant_name,t.public_code,
+        endpoint.hostname AS tenant_endpoint_hostname,
         lk.key_prefix AS reporter_key_prefix,lk.key_suffix AS reporter_key_suffix,
         lk.status AS reporter_license_status
       FROM qr_incidents qi
       JOIN frontend_templates ft ON ft.id=qi.template_id
       JOIN tenants t ON t.id=qi.tenant_id
+      LEFT JOIN tenant_endpoints endpoint ON endpoint.id=qi.tenant_endpoint_id
       LEFT JOIN license_keys lk ON lk.id=qi.reporter_license_id
       WHERE qi.id=$1
       LIMIT 1
@@ -11600,38 +11600,72 @@ async function resolveQrIncidentDomain(
   }
 }
 
+function qrReviewTelegramText(incident, domain, clickCount, reason = '') {
+  const license = incident.reporter_key_suffix
+    ? `${incident.reporter_key_prefix || ''}***${incident.reporter_key_suffix}`
+    : '未知';
+  return [
+    '<b>🚨 二维码异常更换申请</b>',
+    '',
+    '<b>申请卡密</b>',
+    `<code>${escapeTelegramHtml(license)}</code>`,
+    '',
+    '<b>租户</b>',
+    escapeTelegramHtml(incident.tenant_name || '未命名租户'),
+    '',
+    '<b>租户编号</b>',
+    `<code>${escapeTelegramHtml(incident.public_code)}</code>`,
+    '',
+    '<b>用户端模板</b>',
+    escapeTelegramHtml(incident.template_name || '未知模板'),
+    '',
+    '<b>当前域名</b>',
+    `<code>${escapeTelegramHtml(domain)}</code>`,
+    '',
+    `<b>${QR_INCIDENT_WINDOW_MINUTES}分钟内点击次数</b>`,
+    `<code>${clickCount} 次</code>`,
+    '',
+    clickCount > QR_INCIDENT_REVIEW_THRESHOLD
+      ? `⚠️ 已超过自动更换上限（${QR_INCIDENT_REVIEW_THRESHOLD} 次），请管理员核实后选择下方操作。`
+      : `⚠️ 自动更换未完成：${escapeTelegramHtml(reason || '未知错误')}`,
+  ].join('\n');
+}
+
 async function sendQrReviewTelegram(incident, domain, clickCount, reason = '') {
   const settings = await getPlatformSettings();
   if (!settings.telegramGroupId) throw new Error('平台尚未设置 Telegram 异常通知群。');
-  const sent = await telegramApi('sendMessage', {
-    chat_id: settings.telegramGroupId,
-    text: [
-      '<b>🚨 二维码异常 · 需要管理员核实</b>',
-      '',
-      `<b>租户</b>：${escapeTelegramHtml(incident.tenant_name || '未命名租户')}`,
-      `<b>编号</b>：<code>${escapeTelegramHtml(incident.public_code)}</code>`,
-      `<b>模板</b>：${escapeTelegramHtml(incident.template_name)}`,
-      `<b>异常域名</b>：<code>${escapeTelegramHtml(domain)}</code>`,
-      `<b>${QR_INCIDENT_WINDOW_MINUTES}分钟点击次数</b>：<code>${clickCount}</code>`,
-      incident.reporter_key_suffix
-        ? `<b>报告卡密</b>：<code>${escapeTelegramHtml(`${incident.reporter_key_prefix || ''}***${incident.reporter_key_suffix}`)}</code>`
-        : '<b>报告卡密</b>：未知',
-      '',
-      clickCount >= QR_INCIDENT_REVIEW_THRESHOLD
-        ? `⚠️ 该租户在${QR_INCIDENT_WINDOW_MINUTES}分钟内点击二维码异常达到 ${QR_INCIDENT_REVIEW_THRESHOLD} 次以上，请管理员先核实。`
-        : `自动更换未完成：${escapeTelegramHtml(reason || '未知错误')}`,
-      '核实后可点击下方按钮自动处理。',
-    ].join('\n'),
+  const chatId = incident.telegram_chat_id || String(settings.telegramGroupId);
+  const request = {
+    chat_id: chatId,
+    text: qrReviewTelegramText(incident, domain, clickCount, reason),
     parse_mode: 'HTML',
     link_preview_options: { is_disabled: true },
     reply_markup: qrIncidentKeyboard(incident.id),
-  });
+  };
+  if (incident.telegram_message_id) {
+    try {
+      await telegramApi('editMessageText', {
+        ...request,
+        message_id: incident.telegram_message_id,
+      });
+      await pool.query(
+        `UPDATE qr_incidents
+         SET status='open',requires_admin_review=TRUE,updated_at=NOW()
+         WHERE id=$1`,
+        [incident.id],
+      );
+      return;
+    } catch (error) {
+      if (/message is not modified/i.test(String(error?.message || ''))) return;
+    }
+  }
+  const sent = await telegramApi('sendMessage', request);
   await pool.query(
     `UPDATE qr_incidents
      SET status='open',telegram_chat_id=$2,telegram_message_id=$3,
          requires_admin_review=TRUE,updated_at=NOW()
      WHERE id=$1`,
-    [incident.id, String(settings.telegramGroupId), sent.message_id],
+    [incident.id, String(chatId), sent.message_id],
   );
 }
 
@@ -11682,7 +11716,7 @@ async function createQrIncidentReport(tenant, template, reporter = {}) {
         existing.rows[0].id,
         clickCount,
         isUuid(reporter.licenseId) ? reporter.licenseId : null,
-        clickCount >= QR_INCIDENT_REVIEW_THRESHOLD,
+        clickCount > QR_INCIDENT_REVIEW_THRESHOLD,
       ],
     );
     return {
@@ -11690,7 +11724,7 @@ async function createQrIncidentReport(tenant, template, reporter = {}) {
       duplicate: true,
       status: existing.rows[0].status,
       clickCount,
-      requiresAdminReview: clickCount >= QR_INCIDENT_REVIEW_THRESHOLD,
+      requiresAdminReview: clickCount > QR_INCIDENT_REVIEW_THRESHOLD,
     };
   }
 
@@ -11707,13 +11741,13 @@ async function createQrIncidentReport(tenant, template, reporter = {}) {
       template.base_url,
       isUuid(reporter.licenseId) ? reporter.licenseId : null,
       clickCount,
-      clickCount >= QR_INCIDENT_REVIEW_THRESHOLD,
+      clickCount > QR_INCIDENT_REVIEW_THRESHOLD,
     ],
   );
   let incident = await getQrIncident(incidentId);
   const domain = displayTemplateDomain(template.base_url);
 
-  if (clickCount >= QR_INCIDENT_REVIEW_THRESHOLD) {
+  if (clickCount > QR_INCIDENT_REVIEW_THRESHOLD) {
     await sendQrReviewTelegram(incident, domain, clickCount);
     broadcastSuper({ type: 'qr-incident-updated' });
     return {
@@ -11752,18 +11786,267 @@ async function createQrIncidentReport(tenant, template, reporter = {}) {
   }
 }
 
+async function recordTenantEndpointIncidentClick(
+  tenantId,
+  endpointId,
+  reporterLicenseId = '',
+) {
+  const result = await pool.query(
+    `
+      SELECT
+        endpoint.id,endpoint.tenant_id,endpoint.frontend_template_id,
+        endpoint.hostname,template.name AS template_name,
+        tenant.name AS tenant_name,tenant.public_code
+      FROM tenant_endpoints endpoint
+      JOIN frontend_templates template
+        ON template.id=endpoint.frontend_template_id
+      JOIN tenants tenant ON tenant.id=endpoint.tenant_id
+      WHERE endpoint.id=$1 AND endpoint.tenant_id=$2
+        AND endpoint.status='active'
+      LIMIT 1
+    `,
+    [endpointId, tenantId],
+  );
+  const endpoint = result.rows[0];
+  if (!endpoint) {
+    throw requestError('租户用户端入口不存在。', 404, 'TENANT_ENDPOINT');
+  }
+  await pool.query(
+    `
+      INSERT INTO qr_incident_reports (
+        id,tenant_id,template_id,reporter_license_id,reported_domain
+      ) VALUES ($1,$2,$3,$4,$5)
+    `,
+    [
+      randomUUID(),
+      tenantId,
+      endpoint.frontend_template_id,
+      isUuid(reporterLicenseId) ? reporterLicenseId : null,
+      endpoint.hostname,
+    ],
+  );
+  const countResult = await pool.query(
+    `
+      SELECT COUNT(*)::int AS count
+      FROM qr_incident_reports
+      WHERE tenant_id=$1
+        AND reported_at >= NOW() - ($2::int * INTERVAL '1 minute')
+    `,
+    [tenantId, QR_INCIDENT_WINDOW_MINUTES],
+  );
+  return {
+    ...endpoint,
+    clickCount: Number(countResult.rows[0]?.count || 1),
+    reporterLicenseId: isUuid(reporterLicenseId) ? reporterLicenseId : '',
+  };
+}
+
+async function queueTenantEndpointIncidentReview(context, reason = '') {
+  if (!TELEGRAM_ENABLED) {
+    throw requestError(
+      '已超过自动更换次数，但 Telegram 机器人尚未启用，请联系平台管理员。',
+      503,
+      'TELEGRAM_DISABLED',
+    );
+  }
+  const settings = await getPlatformSettings();
+  if (!settings.telegramGroupId) {
+    throw requestError(
+      '已超过自动更换次数，但平台尚未设置 Telegram 异常通知群。',
+      503,
+      'TELEGRAM_GROUP',
+    );
+  }
+  let existing = await pool.query(
+    `
+      SELECT id
+      FROM qr_incidents
+      WHERE tenant_id=$1 AND tenant_endpoint_id=$2
+        AND status IN ('open','processing')
+      ORDER BY reported_at DESC
+      LIMIT 1
+    `,
+    [context.tenant_id, context.id],
+  );
+  let incidentId = existing.rows[0]?.id || '';
+  if (incidentId) {
+    await pool.query(
+      `
+        UPDATE qr_incidents
+        SET click_count_10m=$2,
+            reporter_license_id=COALESCE($3,reporter_license_id),
+            requires_admin_review=TRUE,updated_at=NOW()
+        WHERE id=$1
+      `,
+      [
+        incidentId,
+        context.clickCount,
+        context.reporterLicenseId || null,
+      ],
+    );
+  } else {
+    incidentId = randomUUID();
+    try {
+      await pool.query(
+        `
+          INSERT INTO qr_incidents (
+            id,tenant_id,template_id,tenant_endpoint_id,
+            reported_base_url,status,reporter_license_id,
+            click_count_10m,requires_admin_review
+          ) VALUES ($1,$2,$3,$4,$5,'open',$6,$7,TRUE)
+        `,
+        [
+          incidentId,
+          context.tenant_id,
+          context.frontend_template_id,
+          context.id,
+          `https://${context.hostname}/`,
+          context.reporterLicenseId || null,
+          context.clickCount,
+        ],
+      );
+    } catch (error) {
+      if (error?.code !== '23505') throw error;
+      existing = await pool.query(
+        `
+          SELECT id
+          FROM qr_incidents
+          WHERE tenant_id=$1 AND tenant_endpoint_id=$2
+            AND status IN ('open','processing')
+          ORDER BY reported_at DESC
+          LIMIT 1
+        `,
+        [context.tenant_id, context.id],
+      );
+      incidentId = existing.rows[0]?.id || '';
+      if (!incidentId) throw error;
+      await pool.query(
+        `
+          UPDATE qr_incidents
+          SET click_count_10m=$2,
+              reporter_license_id=COALESCE($3,reporter_license_id),
+              requires_admin_review=TRUE,updated_at=NOW()
+          WHERE id=$1
+        `,
+        [incidentId, context.clickCount, context.reporterLicenseId || null],
+      );
+    }
+  }
+  const incident = await getQrIncident(incidentId);
+  await sendQrReviewTelegram(
+    incident,
+    context.hostname,
+    context.clickCount,
+    reason,
+  );
+  broadcastSuper({ type: 'qr-incident-updated' });
+  return incident;
+}
+
+async function resolveTenantEndpointIncident(incident, telegramUserId = '') {
+  const claimed = await pool.query(
+    `
+      UPDATE qr_incidents
+      SET status='processing',resolved_by_telegram_user_id=$2,
+          processing_started_at=NOW(),error='',updated_at=NOW()
+      WHERE id=$1
+        AND (
+          status IN ('open','failed')
+          OR (
+            status='processing'
+            AND processing_started_at < NOW() - INTERVAL '15 minutes'
+          )
+        )
+      RETURNING id
+    `,
+    [incident.id, cleanText(telegramUserId, 80)],
+  );
+  if (!claimed.rows[0]) {
+    if (incident.status === 'resolved') {
+      return {
+        duplicate: true,
+        oldDomain: displayTemplateDomain(incident.reported_base_url),
+        newDomain: incident.tenant_endpoint_hostname,
+      };
+    }
+    throw new Error('该异常正在处理中或已经处理。');
+  }
+  try {
+    const changed = await rotateTenantEndpoint(
+      incident.tenant_id,
+      incident.tenant_endpoint_id,
+    );
+    await pool.query(
+      `
+        UPDATE qr_incidents
+        SET status='resolved',requested_base_url=$2,resolved_at=NOW(),
+            error='',updated_at=NOW()
+        WHERE id=$1
+      `,
+      [incident.id, `https://${changed.newDomain}/`],
+    );
+    await pool.query(
+      `
+        INSERT INTO audit_logs (
+          action,target_type,target_id,metadata,risk_level,summary
+        ) VALUES (
+          'tenant.endpoint.telegram_rotate','tenant_endpoint',$1,$2::jsonb,
+          'critical','Telegram 管理员核实后更换了租户独占入口域名'
+        )
+      `,
+      [
+        incident.tenant_endpoint_id,
+        JSON.stringify({
+          incidentId: incident.id,
+          tenantId: incident.tenant_id,
+          oldDomain: changed.oldDomain,
+          newDomain: changed.newDomain,
+          telegramUserId: cleanText(telegramUserId, 80),
+        }),
+      ],
+    );
+    await clearQrIncidentKeyboard(incident);
+    publishEvent(
+      {
+        type: 'tenant-endpoint-rotated',
+        endpointId: incident.tenant_endpoint_id,
+        oldDomain: changed.oldDomain,
+        newDomain: changed.newDomain,
+        at: nowIso(),
+      },
+      { tenantId: incident.tenant_id, targetKind: 'tenant_admin' },
+    );
+    broadcastSuper({ type: 'qr-incident-updated' });
+    return changed;
+  } catch (error) {
+    await pool.query(
+      `
+        UPDATE qr_incidents
+        SET status='failed',error=$2,updated_at=NOW()
+        WHERE id=$1
+      `,
+      [incident.id, cleanText(error.message, 500)],
+    ).catch(() => {});
+    throw error;
+  }
+}
+
 async function markQrIncidentNormal(incidentId, telegramUserId) {
   const incident = await getQrIncident(incidentId);
   if (!incident) throw new Error('二维码异常记录不存在。');
   if (incident.status === 'resolved') return incident;
-  const currentDomain = displayTemplateDomain(incident.current_base_url);
+  const currentDomain = incident.tenant_endpoint_hostname ||
+    displayTemplateDomain(incident.current_base_url);
+  const currentBaseUrl = incident.tenant_endpoint_hostname
+    ? `https://${incident.tenant_endpoint_hostname}/`
+    : incident.current_base_url;
   await pool.query(
     `UPDATE qr_incidents
      SET status='resolved',requested_base_url=$2,
          resolved_by_telegram_user_id=$3,resolved_at=NOW(),
          error='管理员核实二维码正常',updated_at=NOW()
      WHERE id=$1`,
-    [incident.id, incident.current_base_url, cleanText(telegramUserId, 80)],
+    [incident.id, currentBaseUrl, cleanText(telegramUserId, 80)],
   );
   await clearQrIncidentKeyboard(incident);
   publishEvent(
@@ -11845,20 +12128,26 @@ async function handleQrIncidentCallback(callback) {
   }).catch(() => {});
   try {
     if (match[1] === 'auto') {
-      const changed = await resolveQrIncidentDomain(match[2], {
-        telegramUserId: String(userId || ''),
-        source: 'telegram',
-      });
+      const incident = await getQrIncident(match[2]);
+      if (!incident) throw new Error('二维码异常记录不存在。');
+      const changed = isUuid(incident.tenant_endpoint_id)
+        ? await resolveTenantEndpointIncident(incident, String(userId || ''))
+        : await resolveQrIncidentDomain(match[2], {
+            telegramUserId: String(userId || ''),
+            source: 'telegram',
+          });
       await telegramApi('sendMessage', {
         chat_id: chat.id,
-        text: `✅ 已自动更换：${changed.oldDomain} → ${changed.newDomain}`,
+        text: `✅ 已完成更换\n\n旧域名：${changed.oldDomain}\n新域名：${changed.newDomain}`,
         ...telegramThread(callback.message),
       });
     } else if (match[1] === 'normal') {
       const incident = await markQrIncidentNormal(match[2], String(userId || ''));
+      const currentDomain = incident.tenant_endpoint_hostname ||
+        displayTemplateDomain(incident.current_base_url);
       await telegramApi('sendMessage', {
         chat_id: chat.id,
-        text: `🟢 已确认二维码正常，并已反馈到租户后台：${displayTemplateDomain(incident.current_base_url)}`,
+        text: `🟢 已核实没有问题\n\n当前域名：${currentDomain}\n结果已反馈到租户后台。`,
         ...telegramThread(callback.message),
       });
     } else {
@@ -20162,8 +20451,8 @@ async function router(req, res, parsedRequestUrl = null) {
           req,
           res,
           'tenant-endpoint-incident',
-          12,
-          60 * 60_000,
+          100,
+          10 * 60_000,
           payload.tenantId,
         )
       ) return;
@@ -20171,7 +20460,36 @@ async function router(req, res, parsedRequestUrl = null) {
       if (!isUuid(endpointId)) {
         return sendError(res, 400, '租户用户端入口无效。', 'TENANT_ENDPOINT');
       }
-      const changed = await rotateTenantEndpoint(payload.tenantId, endpointId);
+      const context = await recordTenantEndpointIncidentClick(
+        payload.tenantId,
+        endpointId,
+        payload.licenseId,
+      );
+      if (context.clickCount > QR_INCIDENT_REVIEW_THRESHOLD) {
+        const incident = await queueTenantEndpointIncidentReview(context);
+        return sendJson(res, 202, {
+          ok: true,
+          status: 'review',
+          requiresAdminReview: true,
+          incidentId: incident.id,
+          clickCount: context.clickCount,
+          endpoints: await getTenantEndpoints(payload.tenantId),
+        });
+      }
+      let changed;
+      try {
+        changed = await rotateTenantEndpoint(payload.tenantId, endpointId);
+      } catch (error) {
+        const incident = await queueTenantEndpointIncidentReview(context, error.message);
+        return sendJson(res, 202, {
+          ok: true,
+          status: 'review',
+          requiresAdminReview: true,
+          incidentId: incident.id,
+          clickCount: context.clickCount,
+          endpoints: await getTenantEndpoints(payload.tenantId),
+        });
+      }
       await writeTenantAudit(req, payload, 'tenant.endpoint.rotate', {
         targetType: 'tenant_endpoint',
         targetId: endpointId,
@@ -20179,6 +20497,7 @@ async function router(req, res, parsedRequestUrl = null) {
         metadata: {
           oldDomain: changed.oldDomain,
           newDomain: changed.newDomain,
+          clickCount: context.clickCount,
         },
       }).catch(() => {});
       publishEvent(
@@ -20194,6 +20513,8 @@ async function router(req, res, parsedRequestUrl = null) {
       return sendJson(res, 201, {
         ok: true,
         status: 'resolved',
+        requiresAdminReview: false,
+        clickCount: context.clickCount,
         oldDomain: changed.oldDomain,
         newDomain: changed.newDomain,
         endpoints: changed.endpoints,
