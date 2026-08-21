@@ -2359,7 +2359,10 @@ async function initDatabase() {
   }
 
   await cleanupExpiredData();
-  if (TENANT_ENTRY_ENABLED) await backfillTenantEndpoints();
+  if (TENANT_ENTRY_ENABLED) {
+    await migrateLegacyTenantEndpoints();
+    await backfillTenantEndpoints();
+  }
   await refreshApprovedOrigins(true);
 }
 
@@ -6951,6 +6954,14 @@ function newTenantEndpointIdentity(slot = 1, suffixOffset = 0) {
   };
 }
 
+function isLegacyTenantEndpointHostname(value) {
+  const hostname = cleanText(value, 253).toLowerCase().replace(/\.+$/, '');
+  const suffix = tenantEntrySuffixForHostname(hostname);
+  if (!suffix) return false;
+  const label = hostname.slice(0, -(suffix.length + 1));
+  return /^u[0-9a-z]+-[0-9a-f]{12}$/.test(label);
+}
+
 function tenantEndpointUrl(endpoint) {
   if (!endpoint?.hostname) return '';
   return `https://${endpoint.hostname}/`;
@@ -7068,6 +7079,95 @@ async function ensureTenantEndpoints(tenantId, client = pool) {
   if (created && client === pool) {
     invalidateTenantCaches(tenantId);
     invalidateApprovedOrigins();
+  }
+}
+
+async function migrateLegacyTenantEndpoints() {
+  const result = await pool.query(
+    `
+      SELECT id,tenant_id,slot,hostname
+      FROM tenant_endpoints
+      WHERE status='active'
+      ORDER BY tenant_id,slot
+    `,
+  );
+  for (const candidate of result.rows) {
+    if (!isLegacyTenantEndpointHostname(candidate.hostname)) continue;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const locked = await client.query(
+        `
+          SELECT id,tenant_id,slot,hostname
+          FROM tenant_endpoints
+          WHERE id=$1 AND status='active'
+          FOR UPDATE
+        `,
+        [candidate.id],
+      );
+      const endpoint = locked.rows[0];
+      if (!endpoint || !isLegacyTenantEndpointHostname(endpoint.hostname)) {
+        await client.query('COMMIT');
+        continue;
+      }
+      let identity = null;
+      for (let attempt = 0; attempt < 16 && !identity; attempt += 1) {
+        const next = newTenantEndpointIdentity(endpoint.slot, attempt);
+        const collision = await client.query(
+          `
+            SELECT 1
+            FROM tenant_endpoint_domains
+            WHERE hostname=$1 OR entry_token=$2
+            LIMIT 1
+          `,
+          [next.hostname, next.entryToken],
+        );
+        if (!collision.rows[0]) identity = next;
+      }
+      if (!identity) throw new Error('无法为旧租户入口分配短域名。');
+      await client.query(
+        `
+          UPDATE tenant_endpoint_domains
+          SET status='legacy',replaced_at=NOW(),
+              expires_at=CASE
+                WHEN $3::int=0 THEN NULL
+                ELSE NOW()+($3::int*INTERVAL '1 day')
+              END
+          WHERE endpoint_id=$1 AND hostname=$2 AND status='active'
+        `,
+        [endpoint.id, endpoint.hostname, TENANT_ENTRY_LEGACY_DAYS],
+      );
+      await client.query(
+        `
+          UPDATE tenant_endpoints
+          SET hostname=$2,entry_token=$3,updated_at=NOW()
+          WHERE id=$1 AND status='active'
+        `,
+        [endpoint.id, identity.hostname, identity.entryToken],
+      );
+      await client.query(
+        `
+          INSERT INTO tenant_endpoint_domains (
+            id,endpoint_id,tenant_id,hostname,entry_token,status
+          ) VALUES ($1,$2,$3,$4,$5,'active')
+        `,
+        [
+          randomUUID(),
+          endpoint.id,
+          endpoint.tenant_id,
+          identity.hostname,
+          identity.entryToken,
+        ],
+      );
+      await client.query('COMMIT');
+      invalidateTenantCaches(endpoint.tenant_id);
+      invalidateApprovedOrigins();
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 }
 
