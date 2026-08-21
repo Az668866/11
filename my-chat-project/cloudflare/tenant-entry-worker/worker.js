@@ -96,8 +96,7 @@ function upstreamUrl(requestUrl, templateBaseUrl) {
 function navigationNeedsIdentity(request, url, resolved) {
   const acceptsHtml = String(request.headers.get('accept') || '').includes('text/html');
   if (!acceptsHtml) return false;
-  return url.searchParams.get('tenant') !== resolved.tenantCode ||
-    url.searchParams.get('entry') !== resolved.entryToken;
+  return url.searchParams.has('tenant') || url.searchParams.has('entry');
 }
 
 function legacyNavigationTarget(request, url, resolved) {
@@ -113,11 +112,8 @@ function legacyNavigationTarget(request, url, resolved) {
   target.protocol = 'https:';
   target.hostname = currentHostname;
   target.port = '';
-  target.searchParams.set('tenant', resolved.tenantCode);
-  target.searchParams.set(
-    'entry',
-    resolved.currentEntryToken || resolved.entryToken,
-  );
+  target.searchParams.delete('tenant');
+  target.searchParams.delete('entry');
   return target.toString();
 }
 
@@ -150,8 +146,8 @@ export default {
       if (legacyTarget) return Response.redirect(legacyTarget, 302);
       if (navigationNeedsIdentity(request, url, resolved)) {
         url.protocol = 'https:';
-        url.searchParams.set('tenant', resolved.tenantCode);
-        url.searchParams.set('entry', resolved.entryToken);
+        url.searchParams.delete('tenant');
+        url.searchParams.delete('entry');
         return Response.redirect(url.toString(), 302);
       }
       const target = upstreamUrl(request.url, resolved.templateBaseUrl);
@@ -167,6 +163,12 @@ export default {
       );
       const responseHeaders = new Headers(upstreamResponse.headers);
       responseHeaders.delete('set-cookie');
+      if (String(request.headers.get('accept') || '').includes('text/html')) {
+        responseHeaders.append(
+          'Set-Cookie',
+          `tuojie_tenant=${encodeURIComponent(resolved.tenantCode)}; Max-Age=31536000; Path=/; Secure; SameSite=Lax`,
+        );
+      }
       responseHeaders.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
       responseHeaders.set('X-Content-Type-Options', 'nosniff');
       responseHeaders.set('Referrer-Policy', 'strict-origin-when-cross-origin');
