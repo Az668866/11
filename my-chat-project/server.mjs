@@ -962,7 +962,7 @@ async function initDatabase() {
       CREATE TABLE IF NOT EXISTS assets (
         id UUID PRIMARY KEY,
         tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
-        kind TEXT NOT NULL CHECK (kind IN ('brand_avatar','template_cover','qr_logo')),
+        kind TEXT NOT NULL CHECK (kind IN ('brand_avatar','template_cover','qr_logo','reply_image')),
         filename TEXT NOT NULL,
         mime TEXT NOT NULL,
         size INTEGER NOT NULL CHECK (size > 0),
@@ -982,7 +982,7 @@ async function initDatabase() {
     await client.query(`
       ALTER TABLE assets
       ADD CONSTRAINT assets_kind_check
-      CHECK (kind IN ('brand_avatar','template_cover','qr_logo'))
+      CHECK (kind IN ('brand_avatar','template_cover','qr_logo','reply_image'))
     `);
 
     await client.query(`
