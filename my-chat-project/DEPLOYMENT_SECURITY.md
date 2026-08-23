@@ -28,7 +28,7 @@
 
 - `TOKEN_SECRET`：至少 32 位高熵随机值，只用于令牌及短期安全状态。
 - `DATA_PROTECTION_SECRET`：至少 32 位；首次升级必须复制旧 `TOKEN_SECRET`，以后固定不变。
-- `SUPER_ADMIN_PASSWORD`：至少 12 位且唯一，禁止复用个人密码。
+- `SUPER_ADMIN_PASSWORD`、`SUPER_ADMIN_PASSWORD_2`：至少 8 位且唯一，建议使用数字、大小写字母和符号组合，禁止复用个人密码。
 - `SUPER_ADMIN_TOTP_SECRET` 与 `REQUIRE_SUPER_ADMIN_TOTP=true`：正式环境必须配置。若有第二个环境变量管理员，也必须单独配置其 TOTP。
 - 环境变量中的 owner 管理员是权威名单；不在该名单中的旧 owner 会被停用并撤销会话。部署前核对两个可用的应急管理员。
 - `COOKIE_DOMAIN` 保持空值，使用 Host-only Cookie；`COOKIE_SECURE=true`。

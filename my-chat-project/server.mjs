@@ -467,11 +467,11 @@ if (Boolean(SUPER_ADMIN_USERNAME_2) !== Boolean(SUPER_ADMIN_PASSWORD_2)) {
     'SUPER_ADMIN_USERNAME_2 和 SUPER_ADMIN_PASSWORD_2 必须同时设置。',
   );
 }
-if (SUPER_ADMIN_PASSWORD && SUPER_ADMIN_PASSWORD.length < 12) {
-  throw new Error('SUPER_ADMIN_PASSWORD 必须至少12位。');
+if (SUPER_ADMIN_PASSWORD && SUPER_ADMIN_PASSWORD.length < 8) {
+  throw new Error('SUPER_ADMIN_PASSWORD 必须至少8位。');
 }
-if (SUPER_ADMIN_PASSWORD_2 && SUPER_ADMIN_PASSWORD_2.length < 12) {
-  throw new Error('SUPER_ADMIN_PASSWORD_2 必须至少12位。');
+if (SUPER_ADMIN_PASSWORD_2 && SUPER_ADMIN_PASSWORD_2.length < 8) {
+  throw new Error('SUPER_ADMIN_PASSWORD_2 必须至少8位。');
 }
 if (
   SUPER_ADMIN_USERNAME_2 &&
