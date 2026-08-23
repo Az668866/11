@@ -103,6 +103,16 @@ const NEON_ORG_ID = String(process.env.NEON_ORG_ID || '').trim();
 const NETLIFY_AUTH_TOKEN = String(
   process.env.NETLIFY_AUTH_TOKEN || '',
 ).trim();
+const TENANT_ENTRY_ENABLED = process.env.TENANT_ENTRY_ENABLED === 'true';
+const TENANT_ENTRY_DOMAIN_SUFFIXES = [...new Set(
+  String(process.env.TENANT_ENTRY_DOMAIN_SUFFIXES || '')
+    .split(',')
+    .map((item) => normalizeTenantDomainSuffix(item))
+    .filter(Boolean),
+)];
+const TENANT_ENTRY_GATEWAY_SECRET = String(
+  process.env.TENANT_ENTRY_GATEWAY_SECRET || '',
+);
 const INSTANCE_MEMORY_MB = envNumber(
   'INSTANCE_MEMORY_MB',
   2048,
@@ -408,6 +418,17 @@ if (!STATIC_ALLOWED_ORIGINS.length) {
 
 if (TOKEN_SECRET_TEXT.length < 32) {
   throw new Error('TOKEN_SECRET 必须设置，且至少32个字符。');
+}
+
+if (TENANT_ENTRY_ENABLED && !TENANT_ENTRY_DOMAIN_SUFFIXES.length) {
+  throw new Error(
+    '启用模板自有域名入口时必须设置 TENANT_ENTRY_DOMAIN_SUFFIXES。',
+  );
+}
+if (TENANT_ENTRY_ENABLED && TENANT_ENTRY_GATEWAY_SECRET.length < 32) {
+  throw new Error(
+    '启用模板自有域名入口时，TENANT_ENTRY_GATEWAY_SECRET 必须至少32个字符。',
+  );
 }
 if (DATA_PROTECTION_SECRET_TEXT.length < 32) {
   throw new Error('DATA_PROTECTION_SECRET 必须至少32个字符。');
@@ -992,6 +1013,7 @@ async function initDatabase() {
         base_url TEXT NOT NULL,
         origin TEXT NOT NULL,
         netlify_site_id TEXT NOT NULL DEFAULT '',
+        entry_host TEXT NOT NULL DEFAULT '',
         cover_asset_id UUID REFERENCES assets(id) ON DELETE SET NULL,
         client_version TEXT NOT NULL DEFAULT '1.8.1',
         min_backend_version TEXT NOT NULL DEFAULT '1.8.1',
@@ -1018,6 +1040,25 @@ async function initDatabase() {
       ALTER TABLE frontend_templates
       ADD COLUMN IF NOT EXISTS netlify_site_id TEXT NOT NULL DEFAULT ''
     `);
+    await client.query(`
+      ALTER TABLE frontend_templates
+      ADD COLUMN IF NOT EXISTS entry_host TEXT NOT NULL DEFAULT ''
+    `);
+    if (TENANT_ENTRY_ENABLED) {
+      const entryBackfill = await client.query(`
+        SELECT id,base_url
+        FROM frontend_templates
+        WHERE entry_host=''
+      `);
+      for (const row of entryBackfill.rows) {
+        const entryHost = tenantEntryHostFromNetlifyUrl(row.base_url);
+        if (!entryHost) continue;
+        await client.query(
+          `UPDATE frontend_templates SET entry_host=$2 WHERE id=$1 AND entry_host=''`,
+          [row.id, entryHost],
+        );
+      }
+    }
     await client.query(`DROP INDEX IF EXISTS frontend_templates_origin_unique_idx`);
     await client.query(`
       CREATE INDEX IF NOT EXISTS frontend_templates_origin_idx
@@ -1028,15 +1069,22 @@ async function initDatabase() {
       ON frontend_templates (base_url)
     `);
     await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS frontend_templates_entry_host_unique_idx
+      ON frontend_templates (LOWER(entry_host))
+      WHERE entry_host <> ''
+    `);
+    await client.query(`
       INSERT INTO frontend_templates (
-        id, name, base_url, origin, client_version, min_backend_version,
+        id, name, base_url, origin, entry_host,
+        client_version, min_backend_version,
         status, sort_order, recommended, is_default
-      ) VALUES ($1, '拓界经典版', $2, $3, $4, $4, 'enabled', 10, TRUE, TRUE)
+      ) VALUES ($1, '拓界经典版', $2, $3, $4, $5, $5, 'enabled', 10, TRUE, TRUE)
       ON CONFLICT (id) DO NOTHING
     `, [
       DEFAULT_TEMPLATE_ID,
       DEFAULT_USER_SITE_URL,
       new URL(DEFAULT_USER_SITE_URL).origin,
+      tenantEntryHostFromNetlifyUrl(DEFAULT_USER_SITE_URL),
       APP_VERSION,
     ]);
     await client.query(`
@@ -4176,13 +4224,15 @@ async function refreshApprovedOrigins(force = false) {
   );
   try {
     const result = await pool.query(`
-      SELECT origin
+      SELECT origin,entry_host
       FROM frontend_templates
       WHERE status IN ('testing','enabled')
     `);
     for (const row of result.rows) {
       const origin = normalizeOrigin(row.origin);
       if (origin) origins.add(origin);
+      const entryOrigin = tenantEntryOrigin(row.entry_host);
+      if (entryOrigin) origins.add(entryOrigin);
     }
   } catch (error) {
     if (!approvedOriginCache.size) throw error;
@@ -6783,6 +6833,7 @@ async function getConfig(tenantId, client = pool) {
         ft.base_url AS frontend_base_url,
         ft.origin AS frontend_origin,
         ft.netlify_site_id AS frontend_netlify_site_id,
+        ft.entry_host AS frontend_entry_host,
         ft.status AS frontend_template_status,
         approved.approved_frontends
       FROM tenant_config tc
@@ -6795,6 +6846,7 @@ async function getConfig(tenantId, client = pool) {
             'baseUrl', history_template.base_url,
             'origin', history_template.origin,
             'netlifySiteId', history_template.netlify_site_id,
+            'entryHost', history_template.entry_host,
             'status', history_template.status
           )
           ORDER BY
@@ -6836,6 +6888,7 @@ async function getConfig(tenantId, client = pool) {
           baseUrl: cleanText(item?.baseUrl, 500),
           origin: normalizeOrigin(item?.origin),
           netlifySiteId: cleanText(item?.netlifySiteId, 120),
+          entryHost: normalizeTenantEntryHost(item?.entryHost),
           status: cleanText(item?.status, 30),
         }))
         .filter((item) => isUuid(item.id) && item.origin)
@@ -6860,6 +6913,8 @@ async function getConfig(tenantId, client = pool) {
         result.rows[0].frontend_base_url || DEFAULT_USER_SITE_URL,
       frontendOrigin:
         result.rows[0].frontend_origin || new URL(DEFAULT_USER_SITE_URL).origin,
+      frontendEntryHost:
+        normalizeTenantEntryHost(result.rows[0].frontend_entry_host),
     },
   };
   return client === pool
@@ -6875,7 +6930,10 @@ function findTenantApprovedFrontend(
   const origin = normalizeOrigin(requestOrigin);
   if (!origin) return null;
   const candidates = (config?.approvedFrontends || []).filter(
-    (item) => timingSafeTextEqual(normalizeOrigin(item.origin), origin),
+    (item) =>
+      timingSafeTextEqual(normalizeOrigin(item.origin), origin) ||
+      Boolean(tenantEntryOrigin(item.entryHost)) &&
+        timingSafeTextEqual(tenantEntryOrigin(item.entryHost), origin),
   );
   if (!candidates.length) return null;
   if (templateIdentifier) {
@@ -6901,7 +6959,10 @@ function findTenantApprovedFrontendByTemplate(config, templateIdentifier) {
 function tenantApprovedOriginSummary(config) {
   return [...new Set(
     (config?.approvedFrontends || [])
-      .map((item) => normalizeOrigin(item.origin))
+      .flatMap((item) => [
+        normalizeOrigin(item.origin),
+        tenantEntryOrigin(item.entryHost),
+      ])
       .filter(Boolean),
   )].sort().join(', ');
 }
@@ -6915,6 +6976,7 @@ async function getTemplateCatalog(
     `
       SELECT
         ft.id, ft.name, ft.base_url, ft.origin, ft.netlify_site_id,
+        ft.entry_host,
         ft.cover_asset_id,
         ft.client_version, ft.min_backend_version, ft.status,
         ft.selection_closed, ft.sort_order, ft.recommended, ft.is_default,
@@ -6983,12 +7045,16 @@ async function getTemplateCatalog(
       // 超级后台可点击链接。管理员修正数据库记录后会自动重新出现。
       return [];
     }
+    const entryUrl = tenantEntryBaseUrl(row.entry_host);
+    const catalogUrl = !isSuper && entryUrl ? entryUrl : baseUrl;
     return [{
       id: row.id,
       name: row.name,
-      baseUrl,
-      displayUrl: baseUrl.replace(/^https:\/\//i, '').replace(/\/$/, ''),
-      origin: new URL(baseUrl).origin,
+      baseUrl: catalogUrl,
+      displayUrl: catalogUrl.replace(/^https:\/\//i, '').replace(/\/$/, ''),
+      origin: new URL(catalogUrl).origin,
+      entryUrl,
+      entryHost: normalizeTenantEntryHost(row.entry_host),
       ...(isSuper
         ? { netlifySiteId: row.netlify_site_id || '' }
         : { netlifyReady: Boolean(row.netlify_site_id && NETLIFY_AUTH_TOKEN) }),
@@ -7013,7 +7079,8 @@ async function getTemplateCatalog(
 }
 
 function tenantEntryUrl(settings, publicCode) {
-  const base = settings?.frontendBaseUrl || DEFAULT_USER_SITE_URL;
+  const base = tenantEntryBaseUrl(settings?.frontendEntryHost) ||
+    settings?.frontendBaseUrl || DEFAULT_USER_SITE_URL;
   const url = new URL(base);
   url.searchParams.set('tenant', publicCode);
   return url.toString();
@@ -10436,6 +10503,12 @@ function displayTemplateDomain(value) {
   }
 }
 
+function displayTenantEntryDomain(value, entryHost = '') {
+  return normalizeTenantEntryHost(entryHost) ||
+    tenantEntryHostFromNetlifyUrl(value) ||
+    displayTemplateDomain(value);
+}
+
 async function sendTelegramReply(message, text, extra = {}) {
   return telegramApi('sendMessage', {
     chat_id: message.chat.id,
@@ -10533,6 +10606,7 @@ async function getQrIncident(incidentId) {
     `
       SELECT
         qi.*,ft.name AS template_name,ft.base_url AS current_base_url,
+        ft.entry_host AS current_entry_host,
         ft.netlify_site_id,t.name AS tenant_name,t.public_code,
         lk.key_prefix AS reporter_key_prefix,lk.key_suffix AS reporter_key_suffix,
         lk.status AS reporter_license_status
@@ -10559,6 +10633,107 @@ async function clearQrIncidentKeyboard(incident) {
 
 function domainChangeMessage(oldDomain, newDomain) {
   return `模板域名已由 ${oldDomain} 更换为 ${newDomain}。旧链接和旧二维码现已不可用，请在“链接生成”中复制新链接并重新保存二维码。`;
+}
+
+function normalizeTenantDomainSuffix(value) {
+  let suffix = String(value || '').trim().toLowerCase();
+  suffix = suffix
+    .replace(/^https?:\/\//i, '')
+    .replace(/[\/?#].*$/, '')
+    .replace(/^\.+|\.+$/g, '');
+  return /^(?=.{3,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(suffix)
+    ? suffix
+    : '';
+}
+
+function normalizeTenantEntryHost(value) {
+  let host = String(value || '').trim().toLowerCase();
+  if (/^https?:\/\//i.test(host)) {
+    try {
+      host = new URL(host).hostname.toLowerCase();
+    } catch {
+      return '';
+    }
+  } else {
+    host = host.replace(/[\/?#].*$/, '').replace(/\.+$/, '');
+  }
+  if (!/^(?=.{1,253}$)[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/.test(host)) {
+    return '';
+  }
+  const suffix = TENANT_ENTRY_DOMAIN_SUFFIXES.find((item) =>
+    host.endsWith(`.${item}`),
+  );
+  if (!suffix) return '';
+  const label = host.slice(0, -(suffix.length + 1));
+  return /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)
+    ? host
+    : '';
+}
+
+function tenantEntryHostFromNetlifyUrl(value) {
+  if (!TENANT_ENTRY_ENABLED || !TENANT_ENTRY_DOMAIN_SUFFIXES.length) return '';
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return '';
+  }
+  const netlifyDomain = normalizeNetlifyDomain(parsed.hostname);
+  if (!netlifyDomain) return '';
+  const label = netlifyDomain.slice(0, -'.netlify.app'.length);
+  return normalizeTenantEntryHost(
+    `${label}.${TENANT_ENTRY_DOMAIN_SUFFIXES[0]}`,
+  );
+}
+
+function tenantEntryOrigin(value) {
+  if (!TENANT_ENTRY_ENABLED) return '';
+  const host = normalizeTenantEntryHost(value);
+  return host ? `https://${host}` : '';
+}
+
+function tenantEntryBaseUrl(value) {
+  const origin = tenantEntryOrigin(value);
+  return origin ? `${origin}/` : '';
+}
+
+async function resolveTenantEntryUpstream(value, client = pool) {
+  if (!TENANT_ENTRY_ENABLED) return null;
+  const entryHost = normalizeTenantEntryHost(value);
+  if (!entryHost) return null;
+  const result = await client.query(
+    `
+      SELECT base_url,origin
+      FROM frontend_templates
+      WHERE LOWER(entry_host)=LOWER($1)
+        AND status IN ('testing','enabled')
+      LIMIT 1
+    `,
+    [entryHost],
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  let target;
+  try {
+    target = parseTemplateFetchTarget(row.base_url);
+  } catch {
+    return null;
+  }
+  const netlifyDomain = normalizeNetlifyDomain(target.hostname);
+  if (!netlifyDomain || netlifyDomain !== target.hostname.toLowerCase()) {
+    return null;
+  }
+  if (!timingSafeTextEqual(normalizeOrigin(row.origin), target.origin)) {
+    return null;
+  }
+  target.username = '';
+  target.password = '';
+  target.search = '';
+  target.hash = '';
+  return {
+    entryHost,
+    upstreamBaseUrl: target.toString(),
+  };
 }
 
 async function publishDomainChange(incident, oldDomain, newDomain) {
@@ -10645,9 +10820,10 @@ async function resolveQrIncidentDomain(
   if (incident.status === 'resolved') {
     return {
       duplicate: true,
-      oldDomain: displayTemplateDomain(incident.reported_base_url),
-      newDomain: displayTemplateDomain(
+      oldDomain: displayTenantEntryDomain(incident.reported_base_url),
+      newDomain: displayTenantEntryDomain(
         incident.requested_base_url || incident.current_base_url,
+        incident.current_entry_host,
       ),
     };
   }
@@ -10655,9 +10831,13 @@ async function resolveQrIncidentDomain(
   if (!normalizeNetlifySiteId(incident.netlify_site_id)) {
     throw new Error('请先在超级后台为该模板填写 Netlify Site ID。');
   }
-  const oldDomain = displayTemplateDomain(incident.current_base_url);
-  if (!normalizeNetlifyDomain(oldDomain)) {
-    throw new Error(`当前域名 ${oldDomain} 不是可自动更换的 netlify.app 域名。`);
+  const oldNetlifyDomain = displayTemplateDomain(incident.current_base_url);
+  const oldDomain = displayTenantEntryDomain(
+    incident.current_base_url,
+    incident.current_entry_host,
+  );
+  if (!normalizeNetlifyDomain(oldNetlifyDomain)) {
+    throw new Error(`当前后台域名 ${oldNetlifyDomain} 不是可自动更换的 netlify.app 域名。`);
   }
   const manualDomain = targetDomain ? normalizeNetlifyDomain(targetDomain) : '';
   if (targetDomain && !manualDomain) throw new Error('目标域名格式无效。');
@@ -10689,14 +10869,14 @@ async function resolveQrIncidentDomain(
   try {
     const candidates = manualDomain
       ? [manualDomain]
-      : await qrDomainCandidates(oldDomain, incident.template_id);
+      : await qrDomainCandidates(oldNetlifyDomain, incident.template_id);
     if (!candidates.length) throw new Error('没有找到可用的递增域名。');
     let nextBaseUrl = '';
     let selectedDomain = '';
     let lastError = null;
     for (const candidate of candidates) {
       try {
-        nextBaseUrl = oldDomain === candidate
+        nextBaseUrl = oldNetlifyDomain === candidate
           ? `https://${candidate}/`
           : await updateNetlifySiteDomain(incident.netlify_site_id, candidate);
         selectedDomain = candidate;
@@ -10709,15 +10889,25 @@ async function resolveQrIncidentDomain(
     if (!nextBaseUrl || !selectedDomain) {
       throw lastError || new Error('Netlify 未接受候选域名。');
     }
+    const nextEntryHost = tenantEntryHostFromNetlifyUrl(nextBaseUrl);
+    if (TENANT_ENTRY_ENABLED && !nextEntryHost) {
+      throw new Error('新 Netlify 后台域名无法生成对应的自有域名入口。');
+    }
+    const newDomain = nextEntryHost || selectedDomain;
 
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
       await client.query(
         `UPDATE frontend_templates
-         SET base_url=$2,origin=$3,updated_at=NOW()
+         SET base_url=$2,origin=$3,entry_host=$4,updated_at=NOW()
          WHERE id=$1`,
-        [incident.template_id, nextBaseUrl, new URL(nextBaseUrl).origin],
+        [
+          incident.template_id,
+          nextBaseUrl,
+          new URL(nextBaseUrl).origin,
+          nextEntryHost,
+        ],
       );
       await client.query(
         `UPDATE qr_incidents
@@ -10739,7 +10929,9 @@ async function resolveQrIncidentDomain(
             incidentId: incident.id,
             tenantId: incident.tenant_id,
             oldDomain,
-            newDomain: selectedDomain,
+            newDomain,
+            oldNetlifyDomain,
+            newNetlifyDomain: selectedDomain,
             telegramUserId: cleanText(telegramUserId, 80),
             source,
           }),
@@ -10759,11 +10951,11 @@ async function resolveQrIncidentDomain(
       { type: 'frontend_catalog_updated' },
       { targetKind: 'tenant_admin' },
     );
-    await publishDomainChange(incident, oldDomain, selectedDomain);
+    await publishDomainChange(incident, oldDomain, newDomain);
     await clearQrIncidentKeyboard(incident);
-    await sendQrResolvedTelegram(incident, oldDomain, selectedDomain, source);
+    await sendQrResolvedTelegram(incident, oldDomain, newDomain, source);
     broadcastSuper({ type: 'qr-incident-updated' });
-    return { oldDomain, newDomain: selectedDomain, duplicate: false };
+    return { oldDomain, newDomain, duplicate: false };
   } catch (error) {
     await pool.query(
       `UPDATE qr_incidents
@@ -10828,7 +11020,7 @@ async function createQrIncidentReport(tenant, template, reporter = {}) {
       tenant.id,
       template.id,
       isUuid(reporter.licenseId) ? reporter.licenseId : null,
-      displayTemplateDomain(template.base_url),
+      displayTenantEntryDomain(template.base_url, template.entry_host),
     ],
   );
   const countResult = await pool.query(
@@ -10886,7 +11078,7 @@ async function createQrIncidentReport(tenant, template, reporter = {}) {
     ],
   );
   let incident = await getQrIncident(incidentId);
-  const domain = displayTemplateDomain(template.base_url);
+  const domain = displayTenantEntryDomain(template.base_url, template.entry_host);
 
   if (clickCount >= QR_INCIDENT_REVIEW_THRESHOLD) {
     await sendQrReviewTelegram(incident, domain, clickCount);
@@ -10931,7 +11123,10 @@ async function markQrIncidentNormal(incidentId, telegramUserId) {
   const incident = await getQrIncident(incidentId);
   if (!incident) throw new Error('二维码异常记录不存在。');
   if (incident.status === 'resolved') return incident;
-  const currentDomain = displayTemplateDomain(incident.current_base_url);
+  const currentDomain = displayTenantEntryDomain(
+    incident.current_base_url,
+    incident.current_entry_host,
+  );
   await pool.query(
     `UPDATE qr_incidents
      SET status='resolved',requested_base_url=$2,
@@ -11033,7 +11228,7 @@ async function handleQrIncidentCallback(callback) {
       const incident = await markQrIncidentNormal(match[2], String(userId || ''));
       await telegramApi('sendMessage', {
         chat_id: chat.id,
-        text: `🟢 已确认二维码正常，并已反馈到租户后台：${displayTemplateDomain(incident.current_base_url)}`,
+        text: `🟢 已确认二维码正常，并已反馈到租户后台：${displayTenantEntryDomain(incident.current_base_url, incident.current_entry_host)}`,
         ...telegramThread(callback.message),
       });
     } else {
@@ -16822,6 +17017,7 @@ return sendJson(res, 200, { ok: true });
     }
     parsed.hash = '';
     const baseUrl = parsed.toString();
+    const entryHost = tenantEntryHostFromNetlifyUrl(baseUrl);
     const netlifySiteId = normalizeNetlifySiteId(body.netlifySiteId);
     if (body.netlifySiteId && !netlifySiteId) {
       return sendError(
@@ -16849,11 +17045,11 @@ return sendJson(res, 200, { ok: true });
       await client.query(
         `
           INSERT INTO frontend_templates (
-            id,name,base_url,origin,netlify_site_id,
+            id,name,base_url,origin,netlify_site_id,entry_host,
             client_version,min_backend_version,
             status,selection_closed,sort_order,recommended,is_default,
             test_tenant_ids
-          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE,$9,$10,$11,$12::jsonb)
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,FALSE,$10,$11,$12,$13::jsonb)
         `,
         [
           id,
@@ -16861,6 +17057,7 @@ return sendJson(res, 200, { ok: true });
           baseUrl,
           parsed.origin,
           netlifySiteId,
+          entryHost,
           cleanText(body.clientVersion, 30) || APP_VERSION,
           cleanText(body.minBackendVersion, 30) || APP_VERSION,
           status,
@@ -17053,6 +17250,7 @@ return sendJson(res, 200, { ok: true });
       let baseUrl = null;
       let origin = null;
       let netlifySiteId = null;
+      let entryHost = null;
       if (body.baseUrl !== undefined) {
         try {
           const parsed = parseTemplateFetchTarget(
@@ -17061,6 +17259,7 @@ return sendJson(res, 200, { ok: true });
           parsed.hash = '';
           baseUrl = parsed.toString();
           origin = parsed.origin;
+          entryHost = tenantEntryHostFromNetlifyUrl(baseUrl);
         } catch {
           return sendError(res, 400, '模板必须使用有效 HTTPS 地址。', 'TEMPLATE_URL');
         }
@@ -17199,14 +17398,15 @@ return sendJson(res, 200, { ok: true });
                 base_url=COALESCE($3,base_url),
                 origin=COALESCE($4,origin),
                 netlify_site_id=COALESCE($5,netlify_site_id),
-                client_version=COALESCE($6,client_version),
-                min_backend_version=COALESCE($7,min_backend_version),
-                status=COALESCE($8,status),
-                selection_closed=COALESCE($9,selection_closed),
-                sort_order=COALESCE($10,sort_order),
-                recommended=COALESCE($11,recommended),
-                is_default=CASE WHEN $12::boolean THEN TRUE ELSE is_default END,
-                test_tenant_ids=COALESCE($13::jsonb,test_tenant_ids),
+                entry_host=COALESCE($6,entry_host),
+                client_version=COALESCE($7,client_version),
+                min_backend_version=COALESCE($8,min_backend_version),
+                status=COALESCE($9,status),
+                selection_closed=COALESCE($10,selection_closed),
+                sort_order=COALESCE($11,sort_order),
+                recommended=COALESCE($12,recommended),
+                is_default=CASE WHEN $13::boolean THEN TRUE ELSE is_default END,
+                test_tenant_ids=COALESCE($14::jsonb,test_tenant_ids),
                 updated_at=NOW()
             WHERE id=$1
           `,
@@ -17216,6 +17416,7 @@ return sendJson(res, 200, { ok: true });
             baseUrl,
             origin,
             netlifySiteId,
+            entryHost,
             body.clientVersion === undefined
               ? null : cleanText(body.clientVersion, 30),
             body.minBackendVersion === undefined
@@ -17583,6 +17784,29 @@ async function router(req, res, parsedRequestUrl = null) {
     !pathname.startsWith('/api/public/') &&
     !requireLegacyApi(res, apiVersion)
   ) return;
+
+  if (
+    req.method === 'GET' &&
+    pathname === '/api/public/tenant-entry/resolve'
+  ) {
+    const gatewaySecret = String(
+      req.headers['x-tenant-entry-gateway-secret'] || '',
+    );
+    if (
+      !TENANT_ENTRY_ENABLED ||
+      !gatewaySecret ||
+      !timingSafeTextEqual(gatewaySecret, TENANT_ENTRY_GATEWAY_SECRET)
+    ) {
+      return sendError(res, 404, '资源不存在。', 'NOT_FOUND');
+    }
+    const resolved = await resolveTenantEntryUpstream(
+      url.searchParams.get('host'),
+    );
+    if (!resolved) {
+      return sendError(res, 404, '模板入口不可用。', 'ENTRY_NOT_FOUND');
+    }
+    return sendJson(res, 200, { ok: true, ...resolved });
+  }
 
   if (
     req.method === 'GET' &&
@@ -19167,7 +19391,7 @@ async function router(req, res, parsedRequestUrl = null) {
       }
       const templateResult = await pool.query(
         `
-          SELECT id,name,base_url,netlify_site_id
+          SELECT id,name,base_url,entry_host,netlify_site_id
           FROM frontend_templates
           WHERE id=$1
             AND (
@@ -19237,8 +19461,8 @@ async function router(req, res, parsedRequestUrl = null) {
         )
       ) return;
       const config = await getConfig(payload.tenantId);
-      // 二维码直接编码当前模板的共享 Netlify 域名，并用 tenant 参数识别租户。
-      // 模板或域名变更后必须重新生成二维码，避免继续指向旧站点。
+      // 二维码编码当前模板的自有域名入口，并用 tenant 参数识别租户。
+      // Netlify 仅作为隐藏源站；模板入口域名变更后需要重新保存二维码。
       const entryUrl = tenantEntryUrl(config.settings, activeTenant.public_code);
       // plain=1 只返回二维码主体（仍保留租户上传的中心图片）。
       // 新版租户后台会在浏览器 Canvas 中绘制中文文字，避免服务器缺少中文字体时出现方框乱码。
