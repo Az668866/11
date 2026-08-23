@@ -41,6 +41,20 @@ services:
         sync: false
       - key: CLOUDFLARE_ANALYTICS_API_TOKEN
         sync: false
+      - key: TENANT_ENTRY_ENABLED
+        value: "true"
+      - key: TENANT_ENTRY_DOMAIN_SUFFIXES
+        value: "ccxxcc.org"
+      - key: TENANT_ENTRY_DOMAIN_POOL
+        value: "6687878.xyz,6687876.xyz,6687879.xyz"
+      - key: TENANT_ENTRY_GATEWAY_SECRET
+        sync: false
+      - key: CLOUDFLARE_API_TOKEN
+        sync: false
+      - key: CLOUDFLARE_TENANT_ENTRY_WORKER_SCRIPT
+        value: "tuojie-tenant-entry"
+      - key: CLOUDFLARE_TENANT_ENTRY_DNS_IPV4
+        value: "192.0.2.1"
       - key: CLOUDFLARE_REALTIME_MONTHLY_QUOTA_GB
         value: 1000
       - key: CLOUDFLARE_ANALYTICS_CACHE_MINUTES

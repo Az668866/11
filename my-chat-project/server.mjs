@@ -110,9 +110,26 @@ const TENANT_ENTRY_DOMAIN_SUFFIXES = [...new Set(
     .map((item) => normalizeTenantDomainSuffix(item))
     .filter(Boolean),
 )];
+const TENANT_ENTRY_DOMAIN_POOL = [...new Set(
+  String(process.env.TENANT_ENTRY_DOMAIN_POOL || '')
+    .split(',')
+    .map((item) => normalizeTenantDomainSuffix(item))
+    .filter(Boolean),
+)];
 const TENANT_ENTRY_GATEWAY_SECRET = String(
   process.env.TENANT_ENTRY_GATEWAY_SECRET || '',
 );
+const CLOUDFLARE_API_TOKEN = String(
+  process.env.CLOUDFLARE_API_TOKEN || '',
+).trim();
+const CLOUDFLARE_TENANT_ENTRY_WORKER_SCRIPT = cleanText(
+  process.env.CLOUDFLARE_TENANT_ENTRY_WORKER_SCRIPT ||
+    'tuojie-tenant-entry',
+  120,
+);
+const CLOUDFLARE_TENANT_ENTRY_DNS_IPV4 = String(
+  process.env.CLOUDFLARE_TENANT_ENTRY_DNS_IPV4 || '192.0.2.1',
+).trim();
 const INSTANCE_MEMORY_MB = envNumber(
   'INSTANCE_MEMORY_MB',
   2048,
@@ -241,7 +258,7 @@ const MAX_COVER_BYTES = 5 * 1024 * 1024;
 const LEGACY_QR_BOTTOM_TEXT =
   '支持微信、支付宝、QQ和浏览器进入\n此二维码为活码，模板域名更换后仍可继续使用';
 const DEFAULT_QR_BOTTOM_TEXT =
-  '支持微信、支付宝、QQ和浏览器进入\n二维码已绑定当前模板和租户专属识别码';
+  '支持微信、支付宝、QQ和浏览器进入\n二维码已绑定当前模板和商家专属识别码';
 const MAX_ALBUM_IMAGES = 9;
 const MAX_CONCURRENT_UPLOADS = Math.trunc(
   envNumber('MAX_CONCURRENT_UPLOADS', 4, 1, 8),
@@ -450,11 +467,11 @@ if (Boolean(SUPER_ADMIN_USERNAME_2) !== Boolean(SUPER_ADMIN_PASSWORD_2)) {
     'SUPER_ADMIN_USERNAME_2 和 SUPER_ADMIN_PASSWORD_2 必须同时设置。',
   );
 }
-if (SUPER_ADMIN_PASSWORD && SUPER_ADMIN_PASSWORD.length < 8) {
-  throw new Error('SUPER_ADMIN_PASSWORD 必须至少8位。');
+if (SUPER_ADMIN_PASSWORD && SUPER_ADMIN_PASSWORD.length < 12) {
+  throw new Error('SUPER_ADMIN_PASSWORD 必须至少12位。');
 }
-if (SUPER_ADMIN_PASSWORD_2 && SUPER_ADMIN_PASSWORD_2.length < 8) {
-  throw new Error('SUPER_ADMIN_PASSWORD_2 必须至少8位。');
+if (SUPER_ADMIN_PASSWORD_2 && SUPER_ADMIN_PASSWORD_2.length < 12) {
+  throw new Error('SUPER_ADMIN_PASSWORD_2 必须至少12位。');
 }
 if (
   SUPER_ADMIN_USERNAME_2 &&
@@ -600,12 +617,23 @@ const alertState = new Map();
 const tenantConfigCache = new Map();
 const tenantFeatureCache = new Map();
 const tenantQrImageCache = new Map();
+const tenantEntryResolutionCache = new Map();
+const tenantEntryRootDomains = new Set(TENANT_ENTRY_DOMAIN_SUFFIXES);
+let activeTenantEntryRootDomain = TENANT_ENTRY_DOMAIN_SUFFIXES[0] || '';
 const pushSubscriptionCache = new Map();
 const PUSH_SUBSCRIPTION_CACHE_MS = 60_000;
 const MAX_PUSH_SUBSCRIPTION_CACHE = 2_000;
 const MAX_PUSH_SUBSCRIPTIONS_PER_CONVERSATION = 8;
 const TENANT_QR_CACHE_MS = 5 * 60_000;
 const MAX_TENANT_QR_CACHE = 100;
+const TENANT_ENTRY_RESOLUTION_CACHE_MS = 60_000;
+const TENANT_ENTRY_NEGATIVE_CACHE_MS = 5_000;
+const MAX_TENANT_ENTRY_RESOLUTION_CACHE = 500;
+const TENANT_ENTRY_DOMAIN_STATUS_CACHE_MS = 5 * 60_000;
+let tenantEntryDomainStatusCache = {
+  expiresAt: 0,
+  rows: [],
+};
 let approvedOriginCache = new Set(STATIC_ALLOWED_ORIGINS);
 let approvedOriginCacheExpiresAt = 0;
 let nextEventId = 1;
@@ -773,6 +801,21 @@ function invalidateTenantCaches(tenantId = '') {
   tenantQrImageCache.clear();
 }
 
+function invalidateTenantEntryCaches() {
+  tenantEntryResolutionCache.clear();
+  tenantEntryDomainStatusCache = { expiresAt: 0, rows: [] };
+}
+
+function cacheTenantEntryResolution(hostname, value, ttl) {
+  makeRoomInExpiringMap(
+    tenantEntryResolutionCache,
+    MAX_TENANT_ENTRY_RESOLUTION_CACHE,
+    Date.now(),
+    (item) => item.expiresAt,
+  );
+  return cacheSet(tenantEntryResolutionCache, hostname, value, ttl);
+}
+
 function invalidatePlatformCache() {
   platformSettingsCacheExpiresAt = 0;
 }
@@ -826,6 +869,7 @@ function defaultConfig() {
       autoReplyEnabled: true,
       defaultAutoReplyEnabled: true,
       defaultAutoReply: '消息已收到，客服看到后会尽快回复。',
+      defaultAutoReplyImageAssetId: '',
       autoReplyCooldownSeconds: 20,
       frontendTemplateId: DEFAULT_TEMPLATE_ID,
       retentionHours: 24,
@@ -1043,6 +1087,91 @@ async function initDatabase() {
     await client.query(`
       ALTER TABLE frontend_templates
       ADD COLUMN IF NOT EXISTS entry_host TEXT NOT NULL DEFAULT ''
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS tenant_entry_root_domains (
+        domain TEXT PRIMARY KEY CHECK (domain=LOWER(domain)),
+        status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (status IN ('pending','available','current','historical','error')),
+        cloudflare_zone_id TEXT NOT NULL DEFAULT '',
+        dns_record_id TEXT NOT NULL DEFAULT '',
+        worker_route_id TEXT NOT NULL DEFAULT '',
+        last_error TEXT NOT NULL DEFAULT '',
+        last_checked_at TIMESTAMPTZ,
+        activated_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS tenant_entry_root_domains_current_idx
+      ON tenant_entry_root_domains ((status='current'))
+      WHERE status='current'
+    `);
+    for (const domain of [
+      ...TENANT_ENTRY_DOMAIN_SUFFIXES,
+      ...TENANT_ENTRY_DOMAIN_POOL,
+    ]) {
+      await client.query(
+        `INSERT INTO tenant_entry_root_domains (domain,status)
+         VALUES ($1,'pending')
+         ON CONFLICT (domain) DO NOTHING`,
+        [domain],
+      );
+    }
+    if (TENANT_ENTRY_DOMAIN_SUFFIXES[0]) {
+      await client.query(
+        `UPDATE tenant_entry_root_domains
+         SET status='current',activated_at=COALESCE(activated_at,NOW()),
+             updated_at=NOW()
+         WHERE domain=$1
+           AND NOT EXISTS (
+             SELECT 1 FROM tenant_entry_root_domains WHERE status='current'
+           )`,
+        [TENANT_ENTRY_DOMAIN_SUFFIXES[0]],
+      );
+    }
+    const rootDomainRegistry = await client.query(
+      `SELECT domain,status FROM tenant_entry_root_domains`,
+    );
+    for (const row of rootDomainRegistry.rows) {
+      const domain = normalizeTenantDomainSuffix(row.domain);
+      if (domain) tenantEntryRootDomains.add(domain);
+      if (domain && row.status === 'current') {
+        activeTenantEntryRootDomain = domain;
+      }
+    }
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS frontend_template_entry_aliases (
+        hostname TEXT PRIMARY KEY CHECK (hostname=LOWER(hostname)),
+        template_id UUID NOT NULL REFERENCES frontend_templates(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS frontend_template_entry_aliases_template_idx
+      ON frontend_template_entry_aliases (template_id)
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS tenant_entry_domain_switch_requests (
+        id UUID PRIMARY KEY,
+        domain TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (status IN ('pending','processing','completed','cancelled','failed')),
+        telegram_chat_id TEXT NOT NULL,
+        telegram_message_id BIGINT,
+        requested_by_telegram_user_id TEXT NOT NULL,
+        confirmed_by_telegram_user_id TEXT NOT NULL DEFAULT '',
+        previous_domain TEXT NOT NULL DEFAULT '',
+        error TEXT NOT NULL DEFAULT '',
+        expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '15 minutes',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS tenant_entry_domain_switch_requests_status_idx
+      ON tenant_entry_domain_switch_requests (status,expires_at)
     `);
     if (TENANT_ENTRY_ENABLED) {
       const entryBackfill = await client.query(`
@@ -1782,13 +1911,17 @@ async function initDatabase() {
         type TEXT NOT NULL CHECK (type IN ('text','image','video','audio')),
         text TEXT NOT NULL DEFAULT '',
         attachment_id UUID UNIQUE REFERENCES attachments(id) ON DELETE CASCADE,
+        asset_id UUID REFERENCES assets(id) ON DELETE RESTRICT,
         album_id UUID,
         album_position SMALLINT NOT NULL DEFAULT 0 CHECK (album_position BETWEEN 0 AND 9),
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         CHECK (
-          (type = 'text' AND attachment_id IS NULL AND length(text) > 0)
+          (type = 'text' AND attachment_id IS NULL AND asset_id IS NULL AND length(text) > 0)
           OR
-          (type IN ('image','video','audio') AND attachment_id IS NOT NULL)
+          (
+            type IN ('image','video','audio')
+            AND ((attachment_id IS NOT NULL)::int + (asset_id IS NOT NULL)::int) = 1
+          )
         )
       )
     `);
@@ -1798,6 +1931,7 @@ async function initDatabase() {
     await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ`);
     await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS recalled_at TIMESTAMPTZ`);
     await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`);
+    await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS asset_id UUID REFERENCES assets(id) ON DELETE RESTRICT`);
     await client.query(`ALTER TABLE attachments DROP CONSTRAINT IF EXISTS attachments_mime_check`);
     await client.query(`
       ALTER TABLE attachments
@@ -1816,9 +1950,12 @@ async function initDatabase() {
     await client.query(`
       ALTER TABLE messages
       ADD CONSTRAINT messages_check CHECK (
-        (type = 'text' AND attachment_id IS NULL AND length(text) > 0)
+        (type = 'text' AND attachment_id IS NULL AND asset_id IS NULL AND length(text) > 0)
         OR
-        (type IN ('image','video','audio') AND attachment_id IS NOT NULL)
+        (
+          type IN ('image','video','audio')
+          AND ((attachment_id IS NOT NULL)::int + (asset_id IS NOT NULL)::int) = 1
+        )
       )
     `);
     await client.query(`
@@ -2448,6 +2585,29 @@ async function cleanupExpiredData() {
             )
           )
       `,
+    );
+
+    const replyImages = await client.query(`
+      DELETE FROM assets a
+      WHERE a.kind = 'reply_image'
+        AND a.created_at < NOW() - INTERVAL '7 days'
+        AND NOT EXISTS (
+          SELECT 1 FROM messages m WHERE m.asset_id = a.id
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM tenant_config tc
+          WHERE tc.tenant_id = a.tenant_id
+            AND (
+              tc.canned_replies::text LIKE '%' || a.id::text || '%'
+              OR tc.auto_replies::text LIKE '%' || a.id::text || '%'
+              OR tc.settings::text LIKE '%' || a.id::text || '%'
+            )
+        )
+      RETURNING object_key
+    `);
+    objectKeys.push(
+      ...replyImages.rows.map((row) => row.object_key).filter(Boolean),
     );
 
     const conversations = await client.query(
@@ -4234,6 +4394,11 @@ async function refreshApprovedOrigins(force = false) {
       SELECT origin,entry_host
       FROM frontend_templates
       WHERE status IN ('testing','enabled')
+      UNION ALL
+      SELECT '' AS origin,aliases.hostname AS entry_host
+      FROM frontend_template_entry_aliases aliases
+      JOIN frontend_templates templates ON templates.id=aliases.template_id
+      WHERE templates.status IN ('testing','enabled')
     `);
     for (const row of result.rows) {
       const origin = normalizeOrigin(row.origin);
@@ -5341,7 +5506,7 @@ async function saveAsset({
   let storedInR2 = false;
   try {
     storedInR2 = await putObject(objectKey, data, mime);
-    const result = await pool.query(
+    let result = await pool.query(
       `
         INSERT INTO assets (
           id, tenant_id, kind, filename, mime, size, storage, object_key, data
@@ -5417,7 +5582,10 @@ async function withImageTransformSlot(task) {
   }
 }
 
-async function prepareImageUpload(req, { maxBytes, width, height }) {
+async function prepareImageUpload(
+  req,
+  { maxBytes, width, height, fit = 'cover' },
+) {
   const mime = String(req.headers['content-type'] || '')
     .split(';')[0]
     .trim()
@@ -5441,8 +5609,9 @@ async function prepareImageUpload(req, { maxBytes, width, height }) {
       })
         .rotate()
         .resize(width, height, {
-          fit: 'cover',
-          position: 'attention',
+          fit: fit === 'inside' ? 'inside' : 'cover',
+          ...(fit === 'inside' ? {} : { position: 'attention' }),
+          withoutEnlargement: fit === 'inside',
         })
         .webp({ quality: 84, effort: 4 })
         .toBuffer();
@@ -5680,7 +5849,8 @@ function publicMessage(row) {
     source: row.source || 'manual',
     type: row.type,
     text: row.text || '',
-    attachmentId: row.attachment_id || null,
+    attachmentId: row.attachment_id || row.asset_id || null,
+    assetId: row.asset_id || null,
     albumId: row.album_id || null,
     albumPosition: Number(row.album_position || 0),
     createdAt: new Date(row.created_at).toISOString(),
@@ -6854,6 +7024,11 @@ async function getConfig(tenantId, client = pool) {
             'origin', history_template.origin,
             'netlifySiteId', history_template.netlify_site_id,
             'entryHost', history_template.entry_host,
+            'entryAliases', COALESCE((
+              SELECT jsonb_agg(entry_alias.hostname ORDER BY entry_alias.hostname)
+              FROM frontend_template_entry_aliases entry_alias
+              WHERE entry_alias.template_id=history_template.id
+            ), '[]'::jsonb),
             'status', history_template.status
           )
           ORDER BY
@@ -6896,6 +7071,11 @@ async function getConfig(tenantId, client = pool) {
           origin: normalizeOrigin(item?.origin),
           netlifySiteId: cleanText(item?.netlifySiteId, 120),
           entryHost: normalizeTenantEntryHost(item?.entryHost),
+          entryAliases: Array.isArray(item?.entryAliases)
+            ? item.entryAliases
+                .map((host) => normalizeTenantEntryHost(host))
+                .filter(Boolean)
+            : [],
           status: cleanText(item?.status, 30),
         }))
         .filter((item) => isUuid(item.id) && item.origin)
@@ -6940,7 +7120,10 @@ function findTenantApprovedFrontend(
     (item) =>
       timingSafeTextEqual(normalizeOrigin(item.origin), origin) ||
       Boolean(tenantEntryOrigin(item.entryHost)) &&
-        timingSafeTextEqual(tenantEntryOrigin(item.entryHost), origin),
+        timingSafeTextEqual(tenantEntryOrigin(item.entryHost), origin) ||
+      (item.entryAliases || []).some((host) =>
+        timingSafeTextEqual(tenantEntryOrigin(host), origin),
+      ),
   );
   if (!candidates.length) return null;
   if (templateIdentifier) {
@@ -6969,6 +7152,7 @@ function tenantApprovedOriginSummary(config) {
       .flatMap((item) => [
         normalizeOrigin(item.origin),
         tenantEntryOrigin(item.entryHost),
+        ...(item.entryAliases || []).map((host) => tenantEntryOrigin(host)),
       ])
       .filter(Boolean),
   )].sort().join(', ');
@@ -7783,26 +7967,36 @@ function timingSafeTextEqual(a, b) {
 }
 
 function matchAutoReply(config, text) {
-  if (!config.settings?.autoReplyEnabled) return '';
+  if (!config.settings?.autoReplyEnabled) return null;
   const normalized = String(text || '').toLowerCase();
 
   for (const rule of Array.isArray(config.autoReplies) ? config.autoReplies : []) {
-    if (!rule?.enabled || !rule.replyText) continue;
+    if (!rule?.enabled || (!rule.replyText && !rule.imageAssetId)) continue;
     const keywords = Array.isArray(rule.keywords) ? rule.keywords : [];
     if (
       keywords.some((keyword) =>
         normalized.includes(String(keyword || '').toLowerCase()),
       )
     ) {
-      return cleanText(rule.replyText, 4000);
+      return {
+        text: cleanText(rule.replyText, 4000),
+        imageAssetId: cleanText(rule.imageAssetId, 80),
+      };
     }
   }
 
   if (config.settings?.defaultAutoReplyEnabled) {
-    return cleanText(config.settings.defaultAutoReply, 4000);
+    const reply = {
+      text: cleanText(config.settings.defaultAutoReply, 4000),
+      imageAssetId: cleanText(
+        config.settings.defaultAutoReplyImageAssetId,
+        80,
+      ),
+    };
+    if (reply.text || reply.imageAssetId) return reply;
   }
 
-  return '';
+  return null;
 }
 
 async function validateAdminSettings(body, current, tenantId) {
@@ -7813,8 +8007,9 @@ async function validateAdminSettings(body, current, tenantId) {
           id: cleanText(item?.id, 80) || randomUUID(),
           title: cleanText(item?.title, 40) || '快捷语',
           text: cleanText(item?.text, 2000),
+          imageAssetId: cleanText(item?.imageAssetId, 80),
         }))
-        .filter((item) => item.text)
+        .filter((item) => item.text || item.imageAssetId)
     : current.cannedReplies;
 
   const autoReplies = Array.isArray(body.autoReplies)
@@ -7831,12 +8026,48 @@ async function validateAdminSettings(body, current, tenantId) {
                 .slice(0, 30)
             : [],
           replyText: cleanText(item?.replyText, 2000),
+          imageAssetId: cleanText(item?.imageAssetId, 80),
         }))
-        .filter((item) => item.replyText)
+        .filter((item) => item.replyText || item.imageAssetId)
     : current.autoReplies;
 
   const input =
     body.settings && typeof body.settings === 'object' ? body.settings : {};
+  const defaultAutoReplyImageAssetId = cleanText(
+    input.defaultAutoReplyImageAssetId !== undefined
+      ? input.defaultAutoReplyImageAssetId
+      : current.settings.defaultAutoReplyImageAssetId,
+    80,
+  );
+  const replyImageAssetIds = [
+    ...cannedReplies.map((item) => item.imageAssetId),
+    ...autoReplies.map((item) => item.imageAssetId),
+    defaultAutoReplyImageAssetId,
+  ].filter(Boolean);
+  if (replyImageAssetIds.some((assetId) => !isUuid(assetId))) {
+    throw requestError('快捷语或自动回复图片无效。', 400, 'INVALID_REPLY_IMAGE');
+  }
+  const uniqueReplyImageAssetIds = [...new Set(replyImageAssetIds)];
+  if (uniqueReplyImageAssetIds.length) {
+    const assetResult = await pool.query(
+      `
+        SELECT id
+        FROM assets
+        WHERE id = ANY($1::uuid[])
+          AND tenant_id = $2
+          AND kind = 'reply_image'
+          AND mime = 'image/webp'
+      `,
+      [uniqueReplyImageAssetIds, tenantId],
+    );
+    if (assetResult.rows.length !== uniqueReplyImageAssetIds.length) {
+      throw requestError(
+        '快捷语或自动回复图片不存在，或不属于当前客户。',
+        400,
+        'INVALID_REPLY_IMAGE',
+      );
+    }
+  }
   const brandFields = [
     'siteName',
     'welcomeText',
@@ -7967,6 +8198,7 @@ async function validateAdminSettings(body, current, tenantId) {
       input.defaultAutoReply !== undefined
         ? cleanText(input.defaultAutoReply, 2000)
         : current.settings.defaultAutoReply,
+    defaultAutoReplyImageAssetId,
     autoReplyCooldownSeconds: Number.isFinite(cooldownRaw)
       ? Math.min(3600, Math.max(0, cooldownRaw))
       : 20,
@@ -8459,7 +8691,7 @@ function parseMessageInput(body = {}) {
   const text = cleanText(body.text, 4000);
   if (requestedType === 'text') {
     if (!text) throw requestError('消息不能为空。', 400, 'EMPTY_MESSAGE');
-    return { type: 'text', text, attachmentIds: [] };
+    return { type: 'text', text, attachmentIds: [], assetIds: [] };
   }
 
   const inputIds = Array.isArray(body.attachmentIds)
@@ -8468,29 +8700,116 @@ function parseMessageInput(body = {}) {
   const attachmentIds = inputIds
     .map((value) => cleanText(value, 80))
     .filter(Boolean);
+  const inputAssetIds = Array.isArray(body.assetIds)
+    ? body.assetIds
+    : [body.assetId];
+  const assetIds = inputAssetIds
+    .map((value) => cleanText(value, 80))
+    .filter(Boolean);
 
   if (
-    !attachmentIds.length ||
+    (!attachmentIds.length && !assetIds.length) ||
+    (attachmentIds.length && assetIds.length) ||
     attachmentIds.some((id) => !isUuid(id)) ||
-    new Set(attachmentIds).size !== attachmentIds.length
+    assetIds.some((id) => !isUuid(id)) ||
+    new Set(attachmentIds).size !== attachmentIds.length ||
+    new Set(assetIds).size !== assetIds.length
   ) {
     throw requestError('媒体附件无效。', 400, 'INVALID_ATTACHMENT');
   }
-  if (requestedType === 'image' && attachmentIds.length > MAX_ALBUM_IMAGES) {
+  const mediaCount = attachmentIds.length || assetIds.length;
+  if (assetIds.length && requestedType !== 'image') {
+    throw requestError('预设素材只能作为图片发送。', 400, 'INVALID_ASSET_TYPE');
+  }
+  if (requestedType === 'image' && mediaCount > MAX_ALBUM_IMAGES) {
     throw requestError(
       `一次最多发送 ${MAX_ALBUM_IMAGES} 张图片。`,
       400,
       'ALBUM_LIMIT',
     );
   }
-  if (requestedType === 'video' && attachmentIds.length !== 1) {
+  if (requestedType === 'video' && mediaCount !== 1) {
     throw requestError('一次只能发送一个视频。', 400, 'VIDEO_LIMIT');
   }
-  if (requestedType === 'audio' && attachmentIds.length !== 1) {
+  if (requestedType === 'audio' && mediaCount !== 1) {
     throw requestError('一次只能发送一条语音。', 400, 'AUDIO_LIMIT');
   }
 
-  return { type: requestedType, text, attachmentIds };
+  return { type: requestedType, text, attachmentIds, assetIds };
+}
+
+async function lockReplyImageAssets(client, tenantId, assetIds) {
+  const result = await client.query(
+    `
+      SELECT id
+      FROM assets
+      WHERE id = ANY($1::uuid[])
+        AND tenant_id = $2
+        AND kind = 'reply_image'
+        AND mime = 'image/webp'
+      FOR SHARE
+    `,
+    [assetIds, tenantId],
+  );
+  if (result.rows.length !== assetIds.length) {
+    throw requestError(
+      '快捷语或自动回复图片无效，或不属于当前客户。',
+      400,
+      'INVALID_REPLY_IMAGE',
+    );
+  }
+}
+
+async function insertAssetImageMessages(
+  client,
+  conversationId,
+  assetIds,
+  {
+    source = 'manual',
+    text = '',
+    retentionHours = 24,
+    createdAfter = null,
+  } = {},
+) {
+  const albumId = assetIds.length > 1 ? randomUUID() : null;
+  const result = await client.query(
+    `
+      INSERT INTO messages (
+        id, conversation_id, role, source, type, text, asset_id,
+        album_id, album_position, created_at, expires_at
+      )
+      SELECT
+        input.id,$4,'admin',$5,'image',input.body_text,input.asset_id,
+        $6,input.position,
+        COALESCE(
+          $9::timestamptz + ((input.position + 2)::text || ' milliseconds')::interval,
+          NOW()
+        ),
+        COALESCE(
+          $9::timestamptz + ((input.position + 2)::text || ' milliseconds')::interval,
+          NOW()
+        ) + ($7::text || ' hours')::interval
+      FROM unnest(
+        $1::uuid[],$2::uuid[],$3::text[],$8::int[]
+      ) AS input(id,asset_id,body_text,position)
+      RETURNING *
+    `,
+    [
+      assetIds.map(() => randomUUID()),
+      assetIds,
+      assetIds.map((_, index) => index === 0 ? text : ''),
+      conversationId,
+      source,
+      albumId,
+      retentionHours,
+      assetIds.map((_, index) => index),
+      createdAfter,
+    ],
+  );
+  return result.rows.sort(
+    (left, right) =>
+      Number(left.album_position || 0) - Number(right.album_position || 0),
+  );
 }
 
 async function lockPendingAttachments(
@@ -8595,6 +8914,9 @@ async function createUserMessage(
   { includeConversation = true } = {},
 ) {
   const input = parseMessageInput(body);
+  if (input.assetIds.length) {
+    throw requestError('访客不能发送后台预设素材。', 403, 'FORBIDDEN_ASSET');
+  }
   const [config, featureStates] = await Promise.all([
     getConfig(tenantId),
     getTenantFeatureStates(tenantId),
@@ -8671,7 +8993,7 @@ async function createUserMessage(
       )
     ).rows[0];
 
-    let autoReplyRow = null;
+    let autoReplyRows = [];
     if (input.type === 'text') {
       const cooldownSeconds = Math.min(
         3600,
@@ -8683,56 +9005,77 @@ async function createUserMessage(
       const cooldownPassed =
         !lastAutoReplyAt ||
         Date.now() - lastAutoReplyAt >= cooldownSeconds * 1000;
-      const replyText =
+      const autoReply =
         cooldownPassed &&
         featureStates.auto_reply
         ? matchAutoReply(config, input.text)
-        : '';
+        : null;
 
-      if (replyText) {
-        const autoResult = await client.query(
-          `
-            INSERT INTO messages (
-              id, conversation_id, role, source, type, text, created_at, expires_at
-            )
-            VALUES (
-              $1,$2,'admin','auto','text',$3,
-              $5::timestamptz + INTERVAL '1 millisecond',
-              $5::timestamptz + INTERVAL '1 millisecond'
-                + ($4::text || ' hours')::interval
-            )
-            RETURNING *
-          `,
-          [
-            randomUUID(),
+      if (autoReply) {
+        if (autoReply.text) {
+          const autoResult = await client.query(
+            `
+              INSERT INTO messages (
+                id, conversation_id, role, source, type, text, created_at, expires_at
+              )
+              VALUES (
+                $1,$2,'admin','auto','text',$3,
+                $5::timestamptz + INTERVAL '1 millisecond',
+                $5::timestamptz + INTERVAL '1 millisecond'
+                  + ($4::text || ' hours')::interval
+              )
+              RETURNING *
+            `,
+            [
+              randomUUID(),
+              conversationId,
+              autoReply.text,
+              retentionHours,
+              messageRows.at(-1).created_at,
+            ],
+          );
+          autoReplyRows.push(autoResult.rows[0]);
+        }
+        if (autoReply.imageAssetId) {
+          await lockReplyImageAssets(
+            client,
+            tenantId,
+            [autoReply.imageAssetId],
+          );
+          autoReplyRows.push(...await insertAssetImageMessages(
+            client,
             conversationId,
-            replyText,
-            retentionHours,
-            messageRows.at(-1).created_at,
-          ],
-        );
-        autoReplyRow = autoResult.rows[0];
-        updatedConversation = (
-          await client.query(
-          `
-            UPDATE conversations
-            SET unread_user = unread_user + 1,
-                last_auto_reply_at = NOW(),
-                updated_at = NOW()
-            WHERE id = $1 AND tenant_id = $2
-            RETURNING *
-          `,
-          [conversationId, tenantId],
-          )
-        ).rows[0];
+            [autoReply.imageAssetId],
+            {
+              source: 'auto',
+              retentionHours,
+              createdAfter: messageRows.at(-1).created_at,
+            },
+          ));
+        }
+        if (autoReplyRows.length) {
+          updatedConversation = (
+            await client.query(
+            `
+              UPDATE conversations
+              SET unread_user = unread_user + $3::int,
+                  last_auto_reply_at = NOW(),
+                  updated_at = NOW()
+              WHERE id = $1 AND tenant_id = $2
+              RETURNING *
+            `,
+            [conversationId, tenantId, autoReplyRows.length],
+            )
+          ).rows[0];
+        }
       }
     }
 
     await client.query('COMMIT');
     minuteCounters.messages +=
-      messageRows.length + (autoReplyRow ? 1 : 0);
+      messageRows.length + autoReplyRows.length;
     const messages = messageRows.map(publicMessage);
-    const latestRow = autoReplyRow || messageRows.at(-1);
+    const latestRow = autoReplyRows.at(-1) || messageRows.at(-1);
     const summary = conversationSummary({
       ...updatedConversation,
       latest_id: latestRow?.id,
@@ -8751,7 +9094,8 @@ async function createUserMessage(
     return {
       message: messages[0],
       messages,
-      autoReply: autoReplyRow ? publicMessage(autoReplyRow) : null,
+      autoReply: autoReplyRows[0] ? publicMessage(autoReplyRows[0]) : null,
+      autoReplies: autoReplyRows.map(publicMessage),
       conversation: publicConversation,
       summary,
     };
@@ -8815,6 +9159,14 @@ async function createAdminMessage(
         [randomUUID(), conversationId, input.text, retentionHours],
       );
       messageRows = [result.rows[0]];
+    } else if (input.assetIds.length) {
+      await lockReplyImageAssets(client, tenantId, input.assetIds);
+      messageRows = await insertAssetImageMessages(
+        client,
+        conversationId,
+        input.assetIds,
+        { text: input.text, retentionHours },
+      );
     } else {
       await lockPendingAttachments(
         client,
@@ -8838,11 +9190,11 @@ async function createAdminMessage(
       await client.query(
       `
         UPDATE conversations
-        SET unread_user = unread_user + 1, updated_at = NOW()
+        SET unread_user = unread_user + $3::int, updated_at = NOW()
         WHERE id = $1 AND tenant_id = $2
         RETURNING *
       `,
-      [conversationId, tenantId],
+      [conversationId, tenantId, messageRows.length],
       )
     ).rows[0];
 
@@ -9190,6 +9542,7 @@ async function recallAdminMessage(
         SET type = 'text',
             text = '客服已撤回了一条消息',
             attachment_id = NULL,
+            asset_id = NULL,
             album_id = NULL,
             album_position = 0,
             recalled_at = NOW()
@@ -10499,7 +10852,22 @@ function parseQrIncidentDomainReply(value) {
   const raw = cleanText(value, 500).trim();
   const match = raw.match(/^更换域名\s*(.+)$/i);
   if (!match) return { matched: false, domain: '' };
+  if (!/\.netlify\.app(?:[/?#]|$)/i.test(match[1])) {
+    return { matched: false, domain: '' };
+  }
   return { matched: true, domain: normalizeNetlifyDomain(match[1]) };
+}
+
+function parseTenantEntryDomainSwitchCommand(value) {
+  const raw = cleanText(value, 500).trim();
+  const match = raw.match(/^更换域名\s*(.+)$/i);
+  if (!match || /\.netlify\.app(?:[/?#]|$)/i.test(match[1])) {
+    return { matched: false, domain: '' };
+  }
+  return {
+    matched: true,
+    domain: normalizeTenantDomainSuffix(match[1]),
+  };
 }
 
 function displayTemplateDomain(value) {
@@ -10527,6 +10895,697 @@ async function sendTelegramReply(message, text, extra = {}) {
     ...telegramThread(message),
     ...extra,
   });
+}
+
+async function cloudflareApi(pathname, { method = 'GET', body } = {}) {
+  if (!CLOUDFLARE_API_TOKEN) {
+    throw new Error('服务器尚未配置 CLOUDFLARE_API_TOKEN。');
+  }
+  const response = await fetch(
+    `https://api.cloudflare.com/client/v4${pathname}`,
+    {
+      method,
+      headers: {
+        Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(20_000),
+    },
+  );
+  const result = await response.json().catch(() => null);
+  if (!response.ok || result?.success === false) {
+    const message = cleanText(
+      result?.errors?.[0]?.message ||
+        result?.messages?.[0]?.message ||
+        `Cloudflare 返回状态 ${response.status}`,
+      300,
+    );
+    throw new Error(message || 'Cloudflare 请求失败。');
+  }
+  return result?.result;
+}
+
+async function inspectCloudflareTenantEntryDomain(
+  value,
+  { ensure = false } = {},
+) {
+  const domain = normalizeTenantDomainSuffix(value);
+  if (!domain) throw new Error('根域名格式无效。');
+  const zones = await cloudflareApi(
+    `/zones?name=${encodeURIComponent(domain)}&per_page=5`,
+  );
+  const zone = Array.isArray(zones)
+    ? zones.find((item) => String(item?.name || '').toLowerCase() === domain)
+    : null;
+  if (!zone) {
+    throw new Error(`Cloudflare 中没有找到 ${domain}，请先添加该域名。`);
+  }
+  if (zone.status !== 'active') {
+    throw new Error(
+      `${domain} 在 Cloudflare 中尚未 Active，请先把 Cloudflare 名称服务器填入 Spaceship。`,
+    );
+  }
+
+  const wildcardName = `*.${domain}`;
+  let dnsRecords = await cloudflareApi(
+    `/zones/${encodeURIComponent(zone.id)}/dns_records?name=${encodeURIComponent(wildcardName)}&per_page=100`,
+  );
+  dnsRecords = Array.isArray(dnsRecords) ? dnsRecords : [];
+  let dnsRecord = dnsRecords.find((item) =>
+    String(item?.name || '').toLowerCase() === wildcardName &&
+    ['A', 'AAAA', 'CNAME'].includes(item?.type),
+  );
+  if (ensure && !dnsRecord) {
+    dnsRecord = await cloudflareApi(
+      `/zones/${encodeURIComponent(zone.id)}/dns_records`,
+      {
+        method: 'POST',
+        body: {
+          type: 'A',
+          name: '*',
+          content: CLOUDFLARE_TENANT_ENTRY_DNS_IPV4,
+          ttl: 1,
+          proxied: true,
+          comment: 'Tuojie tenant entry Worker wildcard',
+        },
+      },
+    );
+  } else if (ensure && dnsRecord && !dnsRecord.proxied) {
+    dnsRecord = await cloudflareApi(
+      `/zones/${encodeURIComponent(zone.id)}/dns_records/${encodeURIComponent(dnsRecord.id)}`,
+      { method: 'PATCH', body: { proxied: true } },
+    );
+  }
+
+  const routePattern = `*.${domain}/*`;
+  let routes = await cloudflareApi(
+    `/zones/${encodeURIComponent(zone.id)}/workers/routes`,
+  );
+  routes = Array.isArray(routes) ? routes : [];
+  let workerRoute = routes.find((item) =>
+    String(item?.pattern || '').toLowerCase() === routePattern,
+  );
+  if (ensure && !workerRoute) {
+    workerRoute = await cloudflareApi(
+      `/zones/${encodeURIComponent(zone.id)}/workers/routes`,
+      {
+        method: 'POST',
+        body: {
+          pattern: routePattern,
+          script: CLOUDFLARE_TENANT_ENTRY_WORKER_SCRIPT,
+        },
+      },
+    );
+  }
+
+  const ready = Boolean(
+    dnsRecord?.proxied &&
+    workerRoute &&
+    String(workerRoute.script || '') === CLOUDFLARE_TENANT_ENTRY_WORKER_SCRIPT,
+  );
+  if (ensure && !ready) {
+    throw new Error(`${domain} 的通配 DNS 或 Worker 路由尚未就绪。`);
+  }
+  return {
+    domain,
+    zoneId: cleanText(zone.id, 80),
+    zoneStatus: cleanText(zone.status, 30),
+    dnsRecordId: cleanText(dnsRecord?.id, 80),
+    dnsReady: Boolean(dnsRecord?.proxied),
+    workerRouteId: cleanText(workerRoute?.id, 80),
+    routeReady: Boolean(
+      workerRoute &&
+      String(workerRoute.script || '') === CLOUDFLARE_TENANT_ENTRY_WORKER_SCRIPT,
+    ),
+    ready,
+  };
+}
+
+async function recordTenantEntryDomainInspection(
+  domain,
+  inspection = null,
+  error = null,
+) {
+  const normalized = normalizeTenantDomainSuffix(domain);
+  if (!normalized) return;
+  tenantEntryRootDomains.add(normalized);
+  await pool.query(
+    `
+      INSERT INTO tenant_entry_root_domains (
+        domain,status,cloudflare_zone_id,dns_record_id,worker_route_id,
+        last_error,last_checked_at,updated_at
+      ) VALUES (
+        $1,$2,$3,$4,$5,$6,NOW(),NOW()
+      )
+      ON CONFLICT (domain) DO UPDATE SET
+        status=CASE
+          WHEN tenant_entry_root_domains.status IN ('current','historical')
+            THEN tenant_entry_root_domains.status
+          ELSE EXCLUDED.status
+        END,
+        cloudflare_zone_id=EXCLUDED.cloudflare_zone_id,
+        dns_record_id=EXCLUDED.dns_record_id,
+        worker_route_id=EXCLUDED.worker_route_id,
+        last_error=EXCLUDED.last_error,
+        last_checked_at=NOW(),
+        updated_at=CASE
+          WHEN tenant_entry_root_domains.status IS DISTINCT FROM EXCLUDED.status
+            OR tenant_entry_root_domains.cloudflare_zone_id IS DISTINCT FROM EXCLUDED.cloudflare_zone_id
+            OR tenant_entry_root_domains.dns_record_id IS DISTINCT FROM EXCLUDED.dns_record_id
+            OR tenant_entry_root_domains.worker_route_id IS DISTINCT FROM EXCLUDED.worker_route_id
+            OR tenant_entry_root_domains.last_error IS DISTINCT FROM EXCLUDED.last_error
+          THEN NOW()
+          ELSE tenant_entry_root_domains.updated_at
+        END
+    `,
+    [
+      normalized,
+      inspection?.ready ? 'available' : error ? 'error' : 'pending',
+      cleanText(inspection?.zoneId, 80),
+      cleanText(inspection?.dnsRecordId, 80),
+      cleanText(inspection?.workerRouteId, 80),
+      cleanText(error?.message || error, 500),
+    ],
+  );
+  tenantEntryDomainStatusCache.expiresAt = 0;
+}
+
+async function listTenantEntryRootDomains(force = false) {
+  if (!force && tenantEntryDomainStatusCache.expiresAt > Date.now()) {
+    return tenantEntryDomainStatusCache.rows;
+  }
+  const result = await pool.query(`
+    SELECT domain,status,cloudflare_zone_id,dns_record_id,worker_route_id,
+           last_error,last_checked_at,activated_at,created_at,updated_at
+    FROM tenant_entry_root_domains
+    ORDER BY
+      CASE status
+        WHEN 'current' THEN 0
+        WHEN 'available' THEN 1
+        WHEN 'historical' THEN 2
+        WHEN 'pending' THEN 3
+        ELSE 4
+      END,
+      domain
+  `);
+  tenantEntryDomainStatusCache = {
+    expiresAt: Date.now() + TENANT_ENTRY_DOMAIN_STATUS_CACHE_MS,
+    rows: result.rows,
+  };
+  for (const row of result.rows) {
+    const domain = normalizeTenantDomainSuffix(row.domain);
+    if (domain) tenantEntryRootDomains.add(domain);
+  }
+  return result.rows;
+}
+
+async function refreshTenantEntryDomainStatuses() {
+  const rows = await listTenantEntryRootDomains(true);
+  for (const row of rows) {
+    const checkedAt = row.last_checked_at
+      ? new Date(row.last_checked_at).getTime()
+      : 0;
+    if (checkedAt && Date.now() - checkedAt < TENANT_ENTRY_DOMAIN_STATUS_CACHE_MS) {
+      continue;
+    }
+    try {
+      const inspection = await inspectCloudflareTenantEntryDomain(row.domain);
+      await recordTenantEntryDomainInspection(row.domain, inspection);
+    } catch (error) {
+      await recordTenantEntryDomainInspection(row.domain, null, error);
+    }
+  }
+  return listTenantEntryRootDomains(true);
+}
+
+function tenantEntryDomainSwitchKeyboard(requestId) {
+  return {
+    inline_keyboard: [[
+      {
+        text: '✅ 确认切换',
+        callback_data: `domain:switch:${requestId}`,
+      },
+      {
+        text: '取消',
+        callback_data: `domain:cancel:${requestId}`,
+      },
+    ]],
+  };
+}
+
+function tenantEntryDomainListText(rows) {
+  const group = (status) => rows.filter((row) => row.status === status);
+  const current = group('current');
+  const available = group('available');
+  const historical = group('historical');
+  const pending = group('pending');
+  const errors = group('error');
+  const lines = [
+    '<b>🌐 客服入口域名池</b>',
+    '',
+    '<b>🟢 当前使用</b>',
+    ...(current.length
+      ? current.map((row) => `  • <code>${escapeTelegramHtml(row.domain)}</code>`)
+      : ['  • 暂无']),
+    '',
+    `<b>✅ 已解析 · 未使用（${available.length}）</b>`,
+    ...(available.length
+      ? available.map((row) => `  • <code>${escapeTelegramHtml(row.domain)}</code>`)
+      : ['  • 暂无']),
+    '',
+    `<b>📚 历史保留（${historical.length}）</b>`,
+    ...(historical.length
+      ? historical.map((row) => `  • <code>${escapeTelegramHtml(row.domain)}</code> · 旧二维码继续有效`)
+      : ['  • 暂无']),
+  ];
+  if (pending.length) {
+    lines.push(
+      '',
+      `<b>🕘 待完成解析（${pending.length}）</b>`,
+      ...pending.map((row) => `  • <code>${escapeTelegramHtml(row.domain)}</code>`),
+    );
+  }
+  if (errors.length) {
+    lines.push(
+      '',
+      `<b>⚠️ 需要处理（${errors.length}）</b>`,
+      ...errors.map((row) =>
+        `  • <code>${escapeTelegramHtml(row.domain)}</code>\n    ${escapeTelegramHtml(cleanText(row.last_error, 160) || '检查失败')}`,
+      ),
+    );
+  }
+  lines.push(
+    '',
+    '<b>切换格式</b>',
+    '<code>更换域名 6687878.xyz</code>',
+    '',
+    '切换后旧域名不会删除，原链接、二维码和聊天记录继续有效。',
+  );
+  return lines.join('\n');
+}
+
+async function sendTenantEntryDomainList(message) {
+  let rows;
+  try {
+    rows = await refreshTenantEntryDomainStatuses();
+  } catch (error) {
+    rows = await listTenantEntryRootDomains(true);
+  }
+  await sendTelegramReply(message, tenantEntryDomainListText(rows), {
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+  });
+}
+
+async function createTenantEntryDomainSwitchRequest(message, domain) {
+  if (!domain) {
+    await sendTelegramReply(
+      message,
+      '❌ 域名格式不正确。\n\n请使用：<code>更换域名 6687878.xyz</code>',
+      { parse_mode: 'HTML' },
+    );
+    return;
+  }
+  tenantEntryRootDomains.add(domain);
+  let inspection;
+  try {
+    inspection = await inspectCloudflareTenantEntryDomain(domain);
+    await recordTenantEntryDomainInspection(domain, inspection);
+  } catch (error) {
+    await recordTenantEntryDomainInspection(domain, null, error).catch(() => {});
+    await sendTelegramReply(
+      message,
+      [
+        '<b>❌ 域名暂时不能切换</b>',
+        '',
+        `<b>域名</b>：<code>${escapeTelegramHtml(domain)}</code>`,
+        `<b>原因</b>：${escapeTelegramHtml(cleanText(error.message, 300))}`,
+        '',
+        '请先在 Cloudflare 添加域名，并把 Cloudflare 提供的名称服务器填入 Spaceship，等待状态变为 Active。',
+      ].join('\n'),
+      { parse_mode: 'HTML', link_preview_options: { is_disabled: true } },
+    );
+    return;
+  }
+
+  const current = (await listTenantEntryRootDomains(true))
+    .find((row) => row.status === 'current');
+  if (current?.domain === domain) {
+    await sendTelegramReply(
+      message,
+      `ℹ️ <code>${escapeTelegramHtml(domain)}</code> 已经是当前使用的域名。`,
+      { parse_mode: 'HTML' },
+    );
+    return;
+  }
+  const requestId = randomUUID();
+  await pool.query(
+    `
+      INSERT INTO tenant_entry_domain_switch_requests (
+        id,domain,telegram_chat_id,requested_by_telegram_user_id,
+        previous_domain
+      ) VALUES ($1,$2,$3,$4,$5)
+    `,
+    [
+      requestId,
+      domain,
+      String(message.chat.id),
+      String(message.from?.id || ''),
+      cleanText(current?.domain, 253),
+    ],
+  );
+  const sent = await sendTelegramReply(
+    message,
+    [
+      '<b>⚠️ 确认切换客服入口域名</b>',
+      '',
+      `<b>当前域名</b>：<code>${escapeTelegramHtml(current?.domain || '未设置')}</code>`,
+      `<b>目标域名</b>：<code>${escapeTelegramHtml(domain)}</code>`,
+      '',
+      `<b>Cloudflare Zone</b>：${inspection.zoneStatus === 'active' ? '✅ Active' : '⚠️ 未就绪'}`,
+      `<b>通配 DNS</b>：${inspection.dnsReady ? '✅ 已解析' : '🛠 将自动创建'}`,
+      `<b>Worker 路由</b>：${inspection.routeReady ? '✅ 已绑定' : '🛠 将自动绑定'}`,
+      '',
+      '确认后系统会配置缺少的项目、更新全部模板入口并逐个验收。全部成功后才完成切换；失败会恢复原域名。',
+      '',
+      '旧域名会作为历史入口永久保留，旧二维码和聊天记录不会失效。',
+    ].join('\n'),
+    {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: tenantEntryDomainSwitchKeyboard(requestId),
+    },
+  );
+  await pool.query(
+    `UPDATE tenant_entry_domain_switch_requests
+     SET telegram_message_id=$2,updated_at=NOW()
+     WHERE id=$1`,
+    [requestId, sent.message_id],
+  );
+}
+
+async function smokeTestTenantEntryHosts(changes) {
+  for (const change of changes.filter((item) =>
+    ['testing', 'enabled'].includes(item.status),
+  )) {
+    const response = await fetch(
+      `https://${change.newHost}/?tenant=domain-switch-smoke`,
+      {
+        method: 'GET',
+        redirect: 'manual',
+        headers: { 'User-Agent': 'Tuojie-Domain-Switch-Smoke/2.4.8' },
+        signal: AbortSignal.timeout(20_000),
+      },
+    );
+    if (response.status >= 500) {
+      throw new Error(`${change.newHost} HTTPS 验收失败（${response.status}）。`);
+    }
+    await response.body?.cancel().catch(() => {});
+  }
+}
+
+async function restoreTenantEntryRootDomainSwitch(
+  changes,
+  previousDomain,
+  targetDomain,
+) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtext('tenant-entry-host-registry'))`,
+    );
+    for (const change of changes) {
+      await client.query(
+        `UPDATE frontend_templates SET entry_host=$2,updated_at=NOW() WHERE id=$1`,
+        [change.templateId, change.oldHost],
+      );
+    }
+    await client.query(
+      `UPDATE tenant_entry_root_domains
+       SET status='available',updated_at=NOW()
+       WHERE domain=$1`,
+      [targetDomain],
+    );
+    await client.query(
+      `UPDATE tenant_entry_root_domains
+       SET status='current',updated_at=NOW()
+       WHERE domain=$1`,
+      [previousDomain],
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+  activeTenantEntryRootDomain = previousDomain;
+  invalidateTenantCaches();
+  invalidateTenantEntryCaches();
+  invalidateApprovedOrigins();
+  await refreshApprovedOrigins(true);
+}
+
+async function switchTenantEntryRootDomain(
+  value,
+  { telegramUserId = '', requestId = '' } = {},
+) {
+  const domain = normalizeTenantDomainSuffix(value);
+  if (!domain) throw new Error('目标根域名格式无效。');
+  tenantEntryRootDomains.add(domain);
+  const inspection = await inspectCloudflareTenantEntryDomain(
+    domain,
+    { ensure: true },
+  );
+  await recordTenantEntryDomainInspection(domain, inspection);
+
+  const client = await pool.connect();
+  let changes = [];
+  let previousDomain = '';
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtext('tenant-entry-host-registry'))`,
+    );
+    const currentDomain = await client.query(
+      `SELECT domain FROM tenant_entry_root_domains WHERE status='current' LIMIT 1`,
+    );
+    previousDomain = cleanText(currentDomain.rows[0]?.domain, 253);
+    if (previousDomain === domain) {
+      await client.query('ROLLBACK');
+      return { duplicate: true, previousDomain, domain, changes: [] };
+    }
+    const templates = await client.query(`
+      SELECT id,name,base_url,entry_host,status
+      FROM frontend_templates
+      ORDER BY sort_order,created_at
+      FOR UPDATE
+    `);
+    for (const template of templates.rows) {
+      const oldHost = normalizeTenantEntryHost(template.entry_host);
+      const label = tenantEntryHostLabel(oldHost) || netlifySiteLabel(template.base_url);
+      const newHost = normalizeTenantEntryHost(`${label}.${domain}`);
+      if (!oldHost || !label || !newHost) {
+        throw new Error(`模板 ${template.name || template.id} 无法生成新入口域名。`);
+      }
+      await assertTemplateEntryHostAvailable(client, newHost, template.id);
+      await storeTemplateEntryAlias(client, template.id, oldHost);
+      await client.query(
+        `DELETE FROM frontend_template_entry_aliases
+         WHERE hostname=$1 AND template_id=$2`,
+        [newHost, template.id],
+      );
+      changes.push({
+        templateId: template.id,
+        templateName: template.name,
+        status: template.status,
+        oldHost,
+        newHost,
+      });
+    }
+    for (const change of changes) {
+      await client.query(
+        `UPDATE frontend_templates SET entry_host=$2,updated_at=NOW() WHERE id=$1`,
+        [change.templateId, change.newHost],
+      );
+    }
+    await client.query(
+      `UPDATE tenant_entry_root_domains
+       SET status='historical',last_error='',updated_at=NOW()
+       WHERE domain=$1`,
+      [previousDomain],
+    );
+    await client.query(
+      `UPDATE tenant_entry_root_domains
+       SET status='current',activated_at=NOW(),last_error='',updated_at=NOW()
+       WHERE domain=$1`,
+      [domain],
+    );
+    await client.query(
+      `INSERT INTO audit_logs (
+        action,target_type,target_id,metadata,risk_level,summary
+      ) VALUES (
+        'tenant_entry.root_domain_switch','tenant_entry_root_domain',
+        NULL,$1::jsonb,'critical','Telegram 管理员切换了客服入口根域名'
+      )`,
+      [JSON.stringify({
+        requestId,
+        previousDomain,
+        domain,
+        telegramUserId: cleanText(telegramUserId, 80),
+        templateCount: changes.length,
+      })],
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  activeTenantEntryRootDomain = domain;
+  invalidateTenantCaches();
+  invalidateTenantEntryCaches();
+  invalidateApprovedOrigins();
+  try {
+    await refreshApprovedOrigins(true);
+    await smokeTestTenantEntryHosts(changes);
+  } catch (error) {
+    await restoreTenantEntryRootDomainSwitch(
+      changes,
+      previousDomain,
+      domain,
+    );
+    throw error;
+  }
+  publishEvent(
+    { type: 'frontend_catalog_updated' },
+    { targetKind: 'tenant_admin' },
+  );
+  broadcastSuper({ type: 'frontend_catalog_updated' });
+  return { duplicate: false, previousDomain, domain, changes };
+}
+
+async function handleTenantEntryDomainCallback(callback) {
+  const match = String(callback?.data || '').match(
+    /^domain:(switch|cancel):([0-9a-f-]{36})$/i,
+  );
+  if (!match || !isUuid(match[2])) return false;
+  const chat = callback.message?.chat;
+  const userId = callback.from?.id;
+  if (!(await telegramOperatorAllowedAsync(chat, userId))) {
+    await telegramApi('answerCallbackQuery', {
+      callback_query_id: callback.id,
+      text: '当前用户或群组未被授权。',
+      show_alert: true,
+    });
+    return true;
+  }
+  const requestId = match[2];
+  const request = await pool.query(
+    `SELECT * FROM tenant_entry_domain_switch_requests WHERE id=$1 LIMIT 1`,
+    [requestId],
+  );
+  const row = request.rows[0];
+  if (!row || row.status !== 'pending' || new Date(row.expires_at) <= new Date()) {
+    await telegramApi('answerCallbackQuery', {
+      callback_query_id: callback.id,
+      text: '此切换确认已失效或已经处理。',
+      show_alert: true,
+    });
+    return true;
+  }
+  if (match[1] === 'cancel') {
+    await pool.query(
+      `UPDATE tenant_entry_domain_switch_requests
+       SET status='cancelled',updated_at=NOW()
+       WHERE id=$1 AND status='pending'`,
+      [requestId],
+    );
+    await telegramApi('answerCallbackQuery', {
+      callback_query_id: callback.id,
+      text: '已取消切换。',
+    });
+    await clearTelegramCallbackKeyboard(callback.message);
+    await sendTelegramReply(callback.message, '已取消本次域名切换。');
+    return true;
+  }
+
+  const claimed = await pool.query(
+    `UPDATE tenant_entry_domain_switch_requests
+     SET status='processing',confirmed_by_telegram_user_id=$2,updated_at=NOW()
+     WHERE id=$1 AND status='pending' AND expires_at>NOW()
+     RETURNING *`,
+    [requestId, String(userId || '')],
+  );
+  if (!claimed.rows[0]) {
+    await telegramApi('answerCallbackQuery', {
+      callback_query_id: callback.id,
+      text: '切换已经由其他管理员处理。',
+      show_alert: true,
+    });
+    return true;
+  }
+  await telegramApi('answerCallbackQuery', {
+    callback_query_id: callback.id,
+    text: '正在配置和验收，请稍候…',
+  }).catch(() => {});
+  await clearTelegramCallbackKeyboard(callback.message);
+  try {
+    const result = await switchTenantEntryRootDomain(row.domain, {
+      telegramUserId: String(userId || ''),
+      requestId,
+    });
+    await pool.query(
+      `UPDATE tenant_entry_domain_switch_requests
+       SET status='completed',previous_domain=$2,error='',updated_at=NOW()
+       WHERE id=$1`,
+      [requestId, result.previousDomain],
+    );
+    await telegramApi('sendMessage', {
+      chat_id: chat.id,
+      text: [
+        '<b>✅ 客服入口域名切换完成</b>',
+        '',
+        `<b>原域名</b>：<code>${escapeTelegramHtml(result.previousDomain)}</code>`,
+        `<b>新域名</b>：<code>${escapeTelegramHtml(result.domain)}</code>`,
+        `<b>模板数量</b>：${result.changes.length} 个`,
+        '',
+        '✅ 通配 DNS 已就绪',
+        '✅ Worker 路由已就绪',
+        '✅ HTTPS 与模板入口已验收',
+        '✅ 新生成链接已使用新域名',
+        '✅ 旧链接、旧二维码和原聊天记录继续有效',
+      ].join('\n'),
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      ...telegramThread(callback.message),
+    });
+  } catch (error) {
+    await pool.query(
+      `UPDATE tenant_entry_domain_switch_requests
+       SET status='failed',error=$2,updated_at=NOW()
+       WHERE id=$1`,
+      [requestId, cleanText(error.message, 500)],
+    ).catch(() => {});
+    await telegramApi('sendMessage', {
+      chat_id: chat.id,
+      text: [
+        '<b>❌ 域名切换失败</b>',
+        '',
+        `<b>目标域名</b>：<code>${escapeTelegramHtml(row.domain)}</code>`,
+        `<b>原因</b>：${escapeTelegramHtml(cleanText(error.message, 300))}`,
+        '',
+        '系统已停止切换；如果数据库已进入新域名阶段，也已自动恢复原域名。',
+      ].join('\n'),
+      parse_mode: 'HTML',
+      ...telegramThread(callback.message),
+    });
+  }
+  return true;
 }
 
 async function updateNetlifySiteDomain(siteId, domain) {
@@ -10584,13 +11643,18 @@ async function qrDomainCandidates(currentDomain, templateId, limit = 40) {
   for (let offset = 1; offset <= limit; offset += 1) {
     const domain = incrementNetlifyDomain(currentDomain, offset);
     if (!domain) break;
-    const collision = await pool.query(
-      `SELECT 1 FROM frontend_templates WHERE base_url=$1 AND id<>$2 LIMIT 1`,
-      [`https://${domain}/`, templateId],
-    );
-    if (!collision.rows[0]) candidates.push(domain);
+    candidates.push(domain);
   }
-  return candidates;
+  if (!candidates.length) return [];
+  const urls = candidates.map((domain) => `https://${domain}/`);
+  const collisions = await pool.query(
+    `SELECT base_url
+     FROM frontend_templates
+     WHERE base_url=ANY($1::text[]) AND id<>$2`,
+    [urls, templateId],
+  );
+  const occupied = new Set(collisions.rows.map((row) => row.base_url));
+  return candidates.filter((domain) => !occupied.has(`https://${domain}/`));
 }
 
 function qrIncidentKeyboard(incidentId) {
@@ -10639,7 +11703,7 @@ async function clearQrIncidentKeyboard(incident) {
 }
 
 function domainChangeMessage(oldDomain, newDomain) {
-  return `模板域名已由 ${oldDomain} 更换为 ${newDomain}。旧链接和旧二维码现已不可用，请在“链接生成”中复制新链接并重新保存二维码。`;
+  return `微信模板入口已由 ${oldDomain} 更新为 ${newDomain}。新生成的链接会使用新域名；原有 ${oldDomain} 链接和二维码仍然有效，访客会继续进入原商家的聊天记录。`;
 }
 
 function normalizeTenantDomainSuffix(value) {
@@ -10667,14 +11731,29 @@ function normalizeTenantEntryHost(value) {
   if (!/^(?=.{1,253}$)[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/.test(host)) {
     return '';
   }
-  const suffix = TENANT_ENTRY_DOMAIN_SUFFIXES.find((item) =>
-    host.endsWith(`.${item}`),
-  );
+  let suffix = '';
+  for (const item of tenantEntryRootDomains) {
+    if (host.endsWith(`.${item}`) && item.length > suffix.length) {
+      suffix = item;
+    }
+  }
   if (!suffix) return '';
   const label = host.slice(0, -(suffix.length + 1));
   return /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)
     ? host
     : '';
+}
+
+function tenantEntryRootDomain(value) {
+  const host = normalizeTenantEntryHost(value);
+  if (!host) return '';
+  let matched = '';
+  for (const domain of tenantEntryRootDomains) {
+    if (host.endsWith(`.${domain}`) && domain.length > matched.length) {
+      matched = domain;
+    }
+  }
+  return matched;
 }
 
 function netlifySiteLabel(value) {
@@ -10717,7 +11796,7 @@ function tenantEntryHostFromNetlifyUrl(value) {
   const label = netlifySiteLabel(value);
   if (!label) return '';
   return normalizeTenantEntryHost(
-    `${label}.${TENANT_ENTRY_DOMAIN_SUFFIXES[0]}`,
+    `${label}.${activeTenantEntryRootDomain || TENANT_ENTRY_DOMAIN_SUFFIXES[0]}`,
   );
 }
 
@@ -10732,22 +11811,96 @@ function tenantEntryBaseUrl(value) {
   return origin ? `${origin}/` : '';
 }
 
+async function assertTemplateEntryHostAvailable(
+  client,
+  hostname,
+  templateId,
+) {
+  const normalized = normalizeTenantEntryHost(hostname);
+  if (!normalized || !isUuid(templateId)) {
+    throw new Error('模板入口域名格式无效。');
+  }
+  const collision = await client.query(
+    `
+      SELECT template_id
+      FROM (
+        SELECT id AS template_id
+        FROM frontend_templates
+        WHERE entry_host=$1 AND id<>$2
+        UNION ALL
+        SELECT template_id
+        FROM frontend_template_entry_aliases
+        WHERE hostname=$1 AND template_id<>$2
+      ) conflicts
+      LIMIT 1
+    `,
+    [normalized, templateId],
+  );
+  if (collision.rows[0]) {
+    throw new Error(`入口域名 ${normalized} 已归属于其他模板。`);
+  }
+  return normalized;
+}
+
+async function storeTemplateEntryAlias(client, templateId, hostname) {
+  const normalized = normalizeTenantEntryHost(hostname);
+  if (!normalized) return '';
+  await assertTemplateEntryHostAvailable(client, normalized, templateId);
+  await client.query(
+    `INSERT INTO frontend_template_entry_aliases (hostname,template_id)
+     VALUES ($1,$2)
+     ON CONFLICT (hostname) DO NOTHING`,
+    [normalized, templateId],
+  );
+  const owner = await client.query(
+    `SELECT template_id FROM frontend_template_entry_aliases WHERE hostname=$1`,
+    [normalized],
+  );
+  if (!owner.rows[0] || owner.rows[0].template_id !== templateId) {
+    throw new Error(`历史入口域名 ${normalized} 归属冲突。`);
+  }
+  return normalized;
+}
+
 async function resolveTenantEntryUpstream(value, client = pool) {
   if (!TENANT_ENTRY_ENABLED) return null;
   const entryHost = normalizeTenantEntryHost(value);
   if (!entryHost) return null;
+  if (client === pool) {
+    const cached = cacheGet(tenantEntryResolutionCache, entryHost);
+    if (cached) return cached.resolved;
+  }
   const result = await client.query(
     `
-      SELECT base_url,origin
-      FROM frontend_templates
-      WHERE LOWER(entry_host)=LOWER($1)
-        AND status IN ('testing','enabled')
+      WITH matched AS (
+        SELECT id AS template_id
+        FROM frontend_templates
+        WHERE entry_host=$1
+        UNION ALL
+        SELECT template_id
+        FROM frontend_template_entry_aliases
+        WHERE hostname=$1
+        LIMIT 1
+      )
+      SELECT templates.base_url,templates.origin
+      FROM matched
+      JOIN frontend_templates templates ON templates.id=matched.template_id
+      WHERE templates.status IN ('testing','enabled')
       LIMIT 1
     `,
     [entryHost],
   );
   const row = result.rows[0];
-  if (!row) return null;
+  if (!row) {
+    if (client === pool) {
+      cacheTenantEntryResolution(
+        entryHost,
+        { resolved: null },
+        TENANT_ENTRY_NEGATIVE_CACHE_MS,
+      );
+    }
+    return null;
+  }
   let target;
   try {
     target = parseTemplateFetchTarget(row.base_url);
@@ -10765,10 +11918,18 @@ async function resolveTenantEntryUpstream(value, client = pool) {
   target.password = '';
   target.search = '';
   target.hash = '';
-  return {
+  const resolved = {
     entryHost,
     upstreamBaseUrl: target.toString(),
   };
+  if (client === pool) {
+    cacheTenantEntryResolution(
+      entryHost,
+      { resolved },
+      TENANT_ENTRY_RESOLUTION_CACHE_MS,
+    );
+  }
+  return resolved;
 }
 
 async function publishDomainChange(incident, oldDomain, newDomain) {
@@ -10825,7 +11986,7 @@ async function sendQrResolvedTelegram(incident, oldDomain, newDomain, source) {
     text: [
       '<b>✅ 域名已自动更换</b>',
       '',
-      `<b>租户</b>：${escapeTelegramHtml(incident.tenant_name || '未命名租户')}`,
+      `<b>商家</b>：${escapeTelegramHtml(incident.tenant_name || '未命名商家')}`,
       `<b>编号</b>：<code>${escapeTelegramHtml(incident.public_code)}</code>`,
       `<b>模板</b>：${escapeTelegramHtml(incident.template_name)}`,
       `<b>处理方式</b>：${source === 'automatic' ? '自动递增' : '管理员确认'}`,
@@ -10833,7 +11994,7 @@ async function sendQrResolvedTelegram(incident, oldDomain, newDomain, source) {
       `<b>旧域名</b>：<code>${escapeTelegramHtml(oldDomain)}</code>`,
       `<b>新域名</b>：<code>${escapeTelegramHtml(newDomain)}</code>`,
       '',
-      '已向正在使用该模板的租户推送并保存通知。旧链接和旧二维码已不可用，请重新保存二维码。',
+      '已向正在使用该模板的商家推送并保存通知。旧链接和旧二维码仍然有效，聊天记录不会丢失；新链接会使用新域名。',
     ].join('\n'),
     parse_mode: 'HTML',
     link_preview_options: { is_disabled: true },
@@ -10901,13 +12062,15 @@ async function resolveQrIncidentDomain(
     throw new Error('异常状态已经变化，请刷新后重试。');
   }
 
+  let selectedDomain = '';
+  let netlifyRenamed = false;
+  let databaseCommitted = false;
   try {
     const candidates = manualDomain
       ? [manualDomain]
       : await qrDomainCandidates(oldNetlifyDomain, incident.template_id);
     if (!candidates.length) throw new Error('没有找到可用的递增域名。');
     let nextBaseUrl = '';
-    let selectedDomain = '';
     let lastError = null;
     for (const candidate of candidates) {
       try {
@@ -10915,6 +12078,7 @@ async function resolveQrIncidentDomain(
           ? `https://${candidate}/`
           : await updateNetlifySiteDomain(incident.netlify_site_id, candidate);
         selectedDomain = candidate;
+        netlifyRenamed = oldNetlifyDomain !== candidate;
         break;
       } catch (error) {
         lastError = error;
@@ -10933,6 +12097,26 @@ async function resolveQrIncidentDomain(
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtext('tenant-entry-host-registry'))`,
+      );
+      await storeTemplateEntryAlias(
+        client,
+        incident.template_id,
+        incident.current_entry_host,
+      );
+      if (nextEntryHost) {
+        await assertTemplateEntryHostAvailable(
+          client,
+          nextEntryHost,
+          incident.template_id,
+        );
+        await client.query(
+          `DELETE FROM frontend_template_entry_aliases
+           WHERE hostname=$1 AND template_id=$2`,
+          [nextEntryHost, incident.template_id],
+        );
+      }
       await client.query(
         `UPDATE frontend_templates
          SET base_url=$2,origin=$3,entry_host=$4,updated_at=NOW()
@@ -10973,6 +12157,7 @@ async function resolveQrIncidentDomain(
         ],
       );
       await client.query('COMMIT');
+      databaseCommitted = true;
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
@@ -10980,18 +12165,33 @@ async function resolveQrIncidentDomain(
       client.release();
     }
     invalidateTenantCaches();
+    invalidateTenantEntryCaches();
     invalidateApprovedOrigins();
-    await refreshApprovedOrigins(true);
+    await refreshApprovedOrigins(true).catch((error) =>
+      console.error('域名更换后来源缓存刷新失败：', error.message),
+    );
     publishEvent(
       { type: 'frontend_catalog_updated' },
       { targetKind: 'tenant_admin' },
     );
-    await publishDomainChange(incident, oldDomain, newDomain);
-    await clearQrIncidentKeyboard(incident);
-    await sendQrResolvedTelegram(incident, oldDomain, newDomain, source);
+    await publishDomainChange(incident, oldDomain, newDomain).catch((error) =>
+      console.error('域名更换通知保存失败：', error.message),
+    );
+    await clearQrIncidentKeyboard(incident).catch(() => {});
+    await sendQrResolvedTelegram(incident, oldDomain, newDomain, source).catch(
+      (error) => console.error('域名更换 Telegram 回执失败：', error.message),
+    );
     broadcastSuper({ type: 'qr-incident-updated' });
     return { oldDomain, newDomain, duplicate: false };
   } catch (error) {
+    if (netlifyRenamed && !databaseCommitted) {
+      await updateNetlifySiteDomain(
+        incident.netlify_site_id,
+        oldNetlifyDomain,
+      ).catch((rollbackError) =>
+        console.error('Netlify 域名自动恢复失败：', rollbackError.message),
+      );
+    }
     await pool.query(
       `UPDATE qr_incidents
        SET status='failed',error=$2,updated_at=NOW()
@@ -11732,6 +12932,9 @@ async function processTelegramUpdate(update) {
     const isSystemStatus =
       ['查看服务器状态', '/查看服务器状态'].includes(raw) ||
       ['/status', '/server_status'].includes(command);
+    const isTenantEntryDomainList =
+      ['查看可用域名', '/查看可用域名'].includes(raw) ||
+      ['/domains', '/available_domains'].includes(command);
     const revokeMatch = raw.match(
       /^(?:\/revoke(?:@[A-Za-z0-9_]+)?|禁用卡密)\s+(.+)$/i,
     );
@@ -11744,14 +12947,17 @@ async function processTelegramUpdate(update) {
       Math.max(1, Math.trunc(Number(listMatch?.[1] || 1))),
     );
     const qrDomainReply = parseQrIncidentDomainReply(raw);
+    const rootDomainSwitch = parseTenantEntryDomainSwitchCommand(raw);
 
     if (
       !isHelp &&
       !isGenerate &&
       !isSystemStatus &&
+      !isTenantEntryDomainList &&
       !revokeMatch &&
       !isList &&
-      !qrDomainReply.matched
+      !qrDomainReply.matched &&
+      !rootDomainSwitch.matched
     ) return;
 
     if (!(await telegramOperatorAllowedAsync(chat, userId))) {
@@ -11760,6 +12966,14 @@ async function processTelegramUpdate(update) {
         text: '⛔ 当前用户或群组未被授权使用此机器人。',
         ...telegramThread(message),
       });
+      return;
+    }
+
+    if (rootDomainSwitch.matched) {
+      await createTenantEntryDomainSwitchRequest(
+        message,
+        rootDomainSwitch.domain,
+      );
       return;
     }
 
@@ -11779,6 +12993,8 @@ async function processTelegramUpdate(update) {
           '历史卡密：也可发送“禁用卡密 尾号5位”',
           '查看卡密：发送“查看卡密”或 /licenses，每页 50 张',
           '服务器状态：发送“/查看服务器状态”或 /status',
+          '域名池：发送“查看可用域名”或 /domains',
+          '切换根域名：发送“更换域名 6687878.xyz”并点击确认',
           '二维码异常：回复异常消息并发送“更换域名wxmb2.netlify.app”',
         ].join('\n'),
         ...telegramThread(message),
@@ -11788,6 +13004,11 @@ async function processTelegramUpdate(update) {
 
     if (isSystemStatus) {
       await sendTelegramSystemStatus(message);
+      return;
+    }
+
+    if (isTenantEntryDomainList) {
+      await sendTenantEntryDomainList(message);
       return;
     }
 
@@ -11889,6 +13110,10 @@ async function processTelegramUpdate(update) {
 
   if (callback?.data?.startsWith('qr:')) {
     if (await handleQrIncidentCallback(callback)) return;
+  }
+
+  if (callback?.data?.startsWith('domain:')) {
+    if (await handleTenantEntryDomainCallback(callback)) return;
   }
 
   if (callback?.data?.startsWith('sec:')) {
@@ -15276,11 +16501,11 @@ async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
         'DISTRIBUTOR_USERNAME',
       );
     }
-    if (password.length < 8 || password.length > 128) {
+    if (password.length < 12 || password.length > 128) {
       return sendError(
         res,
         400,
-        '代理密码必须为8-128位。',
+        '代理密码必须为12-128位。',
         'DISTRIBUTOR_PASSWORD',
       );
     }
@@ -15497,11 +16722,11 @@ async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
       const password = body.password === undefined
         ? ''
         : String(body.password || '');
-      if (password && (password.length < 8 || password.length > 128)) {
+      if (password && (password.length < 12 || password.length > 128)) {
         return sendError(
           res,
           400,
-          '新密码必须为8-128位。',
+          '新密码必须为12-128位。',
           'DISTRIBUTOR_PASSWORD',
         );
       }
@@ -16940,6 +18165,7 @@ return sendJson(res, 200, { ok: true });
       targetId: featureMatch[1],
     });
     invalidateTenantCaches();
+    invalidateTenantEntryCaches();
     publishEvent(
       { type: 'feature-catalog-updated' },
       { targetKind: 'tenant_admin' },
@@ -17072,6 +18298,12 @@ return sendJson(res, 200, { ok: true });
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtext('tenant-entry-host-registry'))`,
+      );
+      if (entryHost) {
+        await assertTemplateEntryHostAvailable(client, entryHost, id);
+      }
       if (isDefault) {
         await client.query(
           `UPDATE frontend_templates SET is_default=FALSE WHERE is_default=TRUE`,
@@ -17319,7 +18551,7 @@ return sendJson(res, 200, { ok: true });
         await client.query('BEGIN');
         const current = await client.query(
           `
-            SELECT id,status,is_default,selection_closed
+            SELECT id,status,is_default,selection_closed,entry_host
             FROM frontend_templates
             WHERE id=$1
             FOR UPDATE
@@ -17328,6 +18560,22 @@ return sendJson(res, 200, { ok: true });
         );
         if (!current.rows[0]) {
           throw requestError('模板不存在。', 404, 'NOT_FOUND');
+        }
+        if (entryHost && entryHost !== current.rows[0].entry_host) {
+          await client.query(
+            `SELECT pg_advisory_xact_lock(hashtext('tenant-entry-host-registry'))`,
+          );
+          await storeTemplateEntryAlias(
+            client,
+            templateId,
+            current.rows[0].entry_host,
+          );
+          await assertTemplateEntryHostAvailable(client, entryHost, templateId);
+          await client.query(
+            `DELETE FROM frontend_template_entry_aliases
+             WHERE hostname=$1 AND template_id=$2`,
+            [entryHost, templateId],
+          );
         }
         let nextStatus = status;
         let selectionClosed = null;
@@ -17476,6 +18724,7 @@ return sendJson(res, 200, { ok: true });
         client.release();
       }
       invalidateTenantCaches();
+      invalidateTenantEntryCaches();
       invalidateApprovedOrigins();
       await refreshApprovedOrigins(true);
       await writeAudit(req, admin, 'template.update', {
@@ -17854,7 +19103,7 @@ async function router(req, res, parsedRequestUrl = null) {
       return sendError(res, 404, '资源不存在。', 'NOT_FOUND');
     }
     const result = await pool.query(
-      `SELECT * FROM assets WHERE id=$1`,
+      `SELECT * FROM assets WHERE id=$1 AND kind <> 'reply_image'`,
       [assetId],
     );
     const row = result.rows[0];
@@ -19399,6 +20648,72 @@ async function router(req, res, parsedRequestUrl = null) {
       return sendJson(res, 200, { ok: true, settings });
     }
 
+    if (
+      req.method === 'GET' &&
+      pathname.startsWith('/api/admin/reply-images/')
+    ) {
+      await requireTenantFeature('media_album', payload.tenantId);
+      const assetId = safeDecodeURIComponent(
+        pathname.slice('/api/admin/reply-images/'.length),
+      );
+      if (!isUuid(assetId)) {
+        return sendError(res, 404, '回复图片不存在。', 'NOT_FOUND');
+      }
+      const result = await pool.query(
+        `
+          SELECT *
+          FROM assets
+          WHERE id=$1 AND tenant_id=$2 AND kind='reply_image'
+        `,
+        [assetId, payload.tenantId],
+      );
+      const row = result.rows[0];
+      if (!row) return sendError(res, 404, '回复图片不存在。', 'NOT_FOUND');
+      const data = await readStoredRow(row);
+      if (!Buffer.isBuffer(data)) {
+        return sendError(res, 404, '回复图片不存在。', 'NOT_FOUND');
+      }
+      res.statusCode = 200;
+      res.setHeader('Content-Type', row.mime);
+      res.setHeader('Content-Length', String(data.length));
+      res.setHeader('Cache-Control', 'private, max-age=300');
+      res.setHeader('Content-Disposition', 'inline; filename="reply-image.webp"');
+      return res.end(data);
+    }
+
+    if (req.method === 'POST' && pathname === '/api/admin/reply-images') {
+      await requireTenantFeature('media_album', payload.tenantId);
+      if (
+        !rateLimit(
+          req,
+          res,
+          'tenant-reply-image-upload',
+          30,
+          10 * 60_000,
+          payload.tenantId,
+          { tenantId: payload.tenantId, licenseId: payload.licenseId },
+        )
+      ) return;
+      const data = await prepareImageUpload(req, {
+        maxBytes: MAX_IMAGE_BYTES,
+        width: 1600,
+        height: 1600,
+        fit: 'inside',
+      });
+      const asset = await saveAsset({
+        tenantId: payload.tenantId,
+        kind: 'reply_image',
+        filename: 'reply-image.webp',
+        mime: 'image/webp',
+        data,
+      });
+      await writeTenantAudit(req, payload, 'tenant.reply-image.upload', {
+        targetType: 'asset',
+        targetId: asset.id,
+      }).catch(() => {});
+      return sendJson(res, 201, { ok: true, assetId: asset.id });
+    }
+
     if (req.method === 'POST' && pathname === '/api/admin/qr-incident') {
       if (
         !rateLimit(
@@ -20151,7 +21466,7 @@ async function router(req, res, parsedRequestUrl = null) {
     if (!isUuid(attachmentId)) {
       return sendError(res, 404, '媒体不存在。', 'NOT_FOUND');
     }
-    const result = await pool.query(
+    let result = await pool.query(
       `
         SELECT
           a.*,
@@ -20169,7 +21484,43 @@ async function router(req, res, parsedRequestUrl = null) {
       `,
       [attachmentId],
     );
-    const row = result.rows[0];
+    let row = result.rows[0];
+    if (!row && ['user', 'tenant_admin'].includes(payload.kind)) {
+      const scopeId = payload.kind === 'user'
+        ? payload.conversationId
+        : payload.tenantId;
+      if (isUuid(scopeId)) {
+        result = await pool.query(
+          `
+            SELECT
+              a.*,
+              m.conversation_id,
+              c.visitor_key_hash,
+              c.tenant_id,
+              c.visitor_name,
+              c.status,
+              c.unread_admin,
+              c.unread_user,
+              c.created_at AS conversation_created_at,
+              c.updated_at AS conversation_updated_at
+            FROM assets a
+            JOIN messages m ON m.asset_id = a.id
+            JOIN conversations c ON c.id = m.conversation_id
+            WHERE a.id = $1
+              AND a.kind = 'reply_image'
+              AND m.recalled_at IS NULL
+              AND (
+                ($2 = 'user' AND m.conversation_id = $3)
+                OR ($2 = 'tenant_admin' AND c.tenant_id = $3)
+              )
+            ORDER BY m.created_at DESC
+            LIMIT 1
+          `,
+          [attachmentId, payload.kind, scopeId],
+        );
+        row = result.rows[0];
+      }
+    }
     if (!row) return sendError(res, 404, '媒体不存在。', 'NOT_FOUND');
 
     const conversationForAuth = {

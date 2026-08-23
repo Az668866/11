@@ -1,6 +1,18 @@
-const RESOLVER_CACHE_MS = 30_000;
-const NEGATIVE_CACHE_MS = 5_000;
+const RESOLVER_CACHE_MS = 5_000;
+const NEGATIVE_CACHE_MS = 1_000;
+const MAX_RESOLVER_CACHE_ENTRIES = 400;
 const resolverCache = new Map();
+
+function makeResolverCacheRoom(now) {
+  for (const [key, item] of resolverCache) {
+    if (!item || item.expiresAt <= now) resolverCache.delete(key);
+  }
+  while (resolverCache.size >= MAX_RESOLVER_CACHE_ENTRIES) {
+    const oldestKey = resolverCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    resolverCache.delete(oldestKey);
+  }
+}
 
 function normalizeBaseUrl(value) {
   try {
@@ -101,6 +113,7 @@ async function resolveUpstream(hostname, env) {
     }));
     upstreamBaseUrl = '';
   }
+  makeResolverCacheRoom(now);
   resolverCache.set(hostname, {
     value: upstreamBaseUrl,
     expiresAt: now + (upstreamBaseUrl ? RESOLVER_CACHE_MS : NEGATIVE_CACHE_MS),
