@@ -1,11 +1,8 @@
 import http from 'node:http';
 import https from 'node:https';
-import fs from 'node:fs';
-import path from 'node:path';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { lookup as dnsLookup } from 'node:dns';
 import { BlockList, isIP } from 'node:net';
-import { fileURLToPath } from 'node:url';
 import {
   createCipheriv,
   createDecipheriv,
@@ -25,7 +22,6 @@ import {
 } from '@aws-sdk/client-s3';
 import pg from 'pg';
 import QRCode from 'qrcode';
-import archiver from 'archiver';
 import sharp from 'sharp';
 import webpush from 'web-push';
 
@@ -46,39 +42,6 @@ const DATA_PROTECTION_SECRET_CONFIGURED = Boolean(
 const PUBLIC_API_BASE = String(
   process.env.PUBLIC_API_BASE || 'https://api.ykf000.com',
 ).replace(/\/+$/, '');
-// 二维码只保存这个长期稳定的入口域名。模板站点域名以后可以任意更换。
-const QR_ENTRY_BASE = String(
-  process.env.QR_ENTRY_BASE || PUBLIC_API_BASE,
-).replace(/\/+$/, '');
-const TENANT_NETLIFY_ENABLED = process.env.TENANT_NETLIFY_ENABLED === 'true';
-const TENANT_NETLIFY_TEAM_SLUG = String(
-  process.env.TENANT_NETLIFY_TEAM_SLUG || '',
-).trim();
-const TENANT_NETLIFY_BUNDLE_ROOT = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  String(process.env.TENANT_NETLIFY_BUNDLE_ROOT || 'tenant-site-bundles'),
-);
-const TENANT_NETLIFY_NAME_LENGTH = Math.trunc(
-  envNumber('TENANT_NETLIFY_NAME_LENGTH', 4, 4, 8),
-);
-// Netlify 站点本身就是租户入口时，不再需要 Cloudflare Worker；仍保留
-// TENANT_ENTRY_ENABLED 作为旧版 ykf000.com 入口的兼容开关。
-const TENANT_ENTRY_ENABLED =
-  process.env.TENANT_ENTRY_ENABLED === 'true' || TENANT_NETLIFY_ENABLED;
-const TENANT_ENTRY_DOMAIN_SUFFIXES = [...new Set([
-  ...String(process.env.TENANT_ENTRY_DOMAIN_SUFFIXES || '')
-    .split(',')
-    .map((value) => value.trim().toLowerCase().replace(/^\.+|\.+$/g, ''))
-    .filter((value) =>
-      /^(?=.{3,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(value)),
-  ...(TENANT_NETLIFY_ENABLED ? ['netlify.app'] : []),
-])];
-const TENANT_ENTRY_GATEWAY_SECRET = String(
-  process.env.TENANT_ENTRY_GATEWAY_SECRET || '',
-).trim();
-const TENANT_ENTRY_LEGACY_DAYS = Math.trunc(
-  envNumber('TENANT_ENTRY_LEGACY_DAYS', 30, 0, 3650),
-);
 const APP_VERSION = String(process.env.APP_VERSION || '2.4.8').trim();
 const SUPPORT_TELEGRAM = String(
   process.env.SUPPORT_TELEGRAM || '@YingYingUu',
@@ -254,7 +217,7 @@ const QR_INCIDENT_WINDOW_MINUTES = Math.trunc(
   envNumber('QR_INCIDENT_WINDOW_MINUTES', 10, 1, 1440),
 );
 const QR_INCIDENT_REVIEW_THRESHOLD = Math.trunc(
-  envNumber('QR_INCIDENT_REVIEW_THRESHOLD', 10, 2, 1000),
+  envNumber('QR_INCIDENT_REVIEW_THRESHOLD', 3, 2, 1000),
 );
 const MAX_IMAGE_BYTES =
   envNumber('MAX_IMAGE_MB', 8, 1, 16) * 1024 * 1024;
@@ -265,8 +228,10 @@ const MAX_AUDIO_BYTES =
 const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
 const MAX_QR_LOGO_BYTES = 3 * 1024 * 1024;
 const MAX_COVER_BYTES = 5 * 1024 * 1024;
+const LEGACY_QR_BOTTOM_TEXT =
+  '支持微信、支付宝、QQ和浏览器进入\n此二维码为活码，模板域名更换后仍可继续使用';
 const DEFAULT_QR_BOTTOM_TEXT =
-  '支持微信、支付宝、QQ和浏览器进入\n域名异常更换后，请使用后台生成的新二维码';
+  '支持微信、支付宝、QQ和浏览器进入\n二维码已绑定当前模板和租户专属识别码';
 const MAX_ALBUM_IMAGES = 9;
 const MAX_CONCURRENT_UPLOADS = Math.trunc(
   envNumber('MAX_CONCURRENT_UPLOADS', 4, 1, 8),
@@ -420,10 +385,7 @@ if (!DATABASE_URL || !/^postgres(?:ql)?:\/\//i.test(DATABASE_URL)) {
   throw new Error('DATABASE_URL 必须设置为 Neon PostgreSQL 连接串。');
 }
 
-for (const [name, value] of [
-  ['PUBLIC_API_BASE', PUBLIC_API_BASE],
-  ['QR_ENTRY_BASE', QR_ENTRY_BASE],
-]) {
+for (const [name, value] of [['PUBLIC_API_BASE', PUBLIC_API_BASE]]) {
   try {
     const parsed = new URL(value);
     if (
@@ -441,25 +403,6 @@ for (const [name, value] of [
 if (!STATIC_ALLOWED_ORIGINS.length) {
   throw new Error(
     'ALLOWED_ORIGINS 必须设置，例如：https://user.example.com,https://admin.example.com',
-  );
-}
-
-if (TENANT_ENTRY_ENABLED) {
-  if (!TENANT_ENTRY_DOMAIN_SUFFIXES.length) {
-    throw new Error(
-      'TENANT_ENTRY_ENABLED=true 时必须配置 TENANT_ENTRY_DOMAIN_SUFFIXES。',
-    );
-  }
-  if (!TENANT_NETLIFY_ENABLED && TENANT_ENTRY_GATEWAY_SECRET.length < 32) {
-    throw new Error(
-      'TENANT_ENTRY_GATEWAY_SECRET 必须至少32位，并与 Cloudflare Worker Secret 保持一致。',
-    );
-  }
-}
-
-if (TENANT_NETLIFY_ENABLED && !NETLIFY_AUTH_TOKEN) {
-  throw new Error(
-    'TENANT_NETLIFY_ENABLED=true 时必须配置 NETLIFY_AUTH_TOKEN。',
   );
 }
 
@@ -862,7 +805,6 @@ function defaultConfig() {
       autoReplyEnabled: true,
       defaultAutoReplyEnabled: true,
       defaultAutoReply: '消息已收到，客服看到后会尽快回复。',
-      defaultAutoReplyImageAssetId: '',
       autoReplyCooldownSeconds: 20,
       frontendTemplateId: DEFAULT_TEMPLATE_ID,
       retentionHours: 24,
@@ -1020,7 +962,7 @@ async function initDatabase() {
       CREATE TABLE IF NOT EXISTS assets (
         id UUID PRIMARY KEY,
         tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
-        kind TEXT NOT NULL CHECK (kind IN ('brand_avatar','template_cover','qr_logo','reply_image')),
+        kind TEXT NOT NULL CHECK (kind IN ('brand_avatar','template_cover','qr_logo')),
         filename TEXT NOT NULL,
         mime TEXT NOT NULL,
         size INTEGER NOT NULL CHECK (size > 0),
@@ -1040,7 +982,7 @@ async function initDatabase() {
     await client.query(`
       ALTER TABLE assets
       ADD CONSTRAINT assets_kind_check
-      CHECK (kind IN ('brand_avatar','template_cover','qr_logo','reply_image'))
+      CHECK (kind IN ('brand_avatar','template_cover','qr_logo'))
     `);
 
     await client.query(`
@@ -1140,93 +1082,6 @@ async function initDatabase() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS tenant_frontend_templates_template_idx
       ON tenant_frontend_templates (template_id, tenant_id)
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS tenant_endpoints (
-        id UUID PRIMARY KEY,
-        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        slot INTEGER NOT NULL CHECK (slot > 0),
-        frontend_template_id UUID NOT NULL
-          REFERENCES frontend_templates(id) ON DELETE RESTRICT,
-        hostname TEXT NOT NULL UNIQUE,
-        entry_token TEXT NOT NULL UNIQUE,
-        status TEXT NOT NULL DEFAULT 'active'
-          CHECK (status IN ('active','disabled')),
-        rotation_count INTEGER NOT NULL DEFAULT 0,
-        last_rotated_at TIMESTAMPTZ,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE (tenant_id, slot)
-      )
-    `);
-    await client.query(`
-      ALTER TABLE tenant_endpoints
-      ADD COLUMN IF NOT EXISTS netlify_site_id TEXT NOT NULL DEFAULT ''
-    `);
-    await client.query(`
-      ALTER TABLE tenant_endpoints
-      ADD COLUMN IF NOT EXISTS netlify_status TEXT NOT NULL DEFAULT 'ready'
-    `);
-    await client.query(`
-      ALTER TABLE tenant_endpoints
-      ADD COLUMN IF NOT EXISTS netlify_error TEXT NOT NULL DEFAULT ''
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS tenant_endpoints_netlify_site_idx
-      ON tenant_endpoints (netlify_site_id)
-      WHERE netlify_site_id <> ''
-    `);
-    await client.query(`
-      ALTER TABLE tenant_endpoints
-      DROP CONSTRAINT IF EXISTS tenant_endpoints_slot_check
-    `);
-    await client.query(`
-      ALTER TABLE tenant_endpoints
-      ADD CONSTRAINT tenant_endpoints_slot_check CHECK (slot > 0)
-    `);
-    // 兼容曾试运行过“固定入口数量”的数据库：同一模板只保留最早的
-    // 一个入口，之后改为一个租户的每个可用模板各有一个独占入口。
-    await client.query(`
-      WITH ranked AS (
-        SELECT id,ROW_NUMBER() OVER (
-          PARTITION BY tenant_id,frontend_template_id
-          ORDER BY created_at,id
-        ) AS position
-        FROM tenant_endpoints
-      )
-      DELETE FROM tenant_endpoints endpoint
-      USING ranked
-      WHERE endpoint.id=ranked.id AND ranked.position>1
-    `);
-    await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS tenant_endpoints_template_idx
-      ON tenant_endpoints (tenant_id, frontend_template_id)
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS tenant_endpoints_tenant_idx
-      ON tenant_endpoints (tenant_id, slot)
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS tenant_endpoint_domains (
-        id UUID PRIMARY KEY,
-        endpoint_id UUID NOT NULL REFERENCES tenant_endpoints(id) ON DELETE CASCADE,
-        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        hostname TEXT NOT NULL UNIQUE,
-        entry_token TEXT NOT NULL UNIQUE,
-        status TEXT NOT NULL DEFAULT 'active'
-          CHECK (status IN ('active','legacy','retired')),
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        replaced_at TIMESTAMPTZ,
-        expires_at TIMESTAMPTZ
-      )
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS tenant_endpoint_domains_lookup_idx
-      ON tenant_endpoint_domains (hostname, status, expires_at)
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS tenant_endpoint_domains_tenant_idx
-      ON tenant_endpoint_domains (tenant_id, endpoint_id, created_at DESC)
     `);
     // Existing databases only know the currently selected template. Seed that
     // trusted selection first; every later switch is retained automatically.
@@ -1648,18 +1503,6 @@ async function initDatabase() {
     await client.query(`ALTER TABLE qr_incidents ADD COLUMN IF NOT EXISTS click_count_30m INTEGER NOT NULL DEFAULT 1`);
     await client.query(`ALTER TABLE qr_incidents ADD COLUMN IF NOT EXISTS click_count_10m INTEGER NOT NULL DEFAULT 1`);
     await client.query(`ALTER TABLE qr_incidents ADD COLUMN IF NOT EXISTS requires_admin_review BOOLEAN NOT NULL DEFAULT FALSE`);
-    await client.query(`ALTER TABLE qr_incidents ADD COLUMN IF NOT EXISTS tenant_endpoint_id UUID REFERENCES tenant_endpoints(id) ON DELETE CASCADE`);
-    await client.query(`DROP INDEX IF EXISTS qr_incidents_active_unique_idx`);
-    await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS qr_incidents_active_template_unique_idx
-      ON qr_incidents (tenant_id, template_id)
-      WHERE status IN ('open','processing') AND tenant_endpoint_id IS NULL
-    `);
-    await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS qr_incidents_active_endpoint_unique_idx
-      ON qr_incidents (tenant_id, tenant_endpoint_id)
-      WHERE status IN ('open','processing') AND tenant_endpoint_id IS NOT NULL
-    `);
     await client.query(`
       CREATE TABLE IF NOT EXISTS qr_incident_reports (
         id UUID PRIMARY KEY,
@@ -1884,17 +1727,13 @@ async function initDatabase() {
         type TEXT NOT NULL CHECK (type IN ('text','image','video','audio')),
         text TEXT NOT NULL DEFAULT '',
         attachment_id UUID UNIQUE REFERENCES attachments(id) ON DELETE CASCADE,
-        asset_id UUID REFERENCES assets(id) ON DELETE RESTRICT,
         album_id UUID,
         album_position SMALLINT NOT NULL DEFAULT 0 CHECK (album_position BETWEEN 0 AND 9),
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         CHECK (
-          (type = 'text' AND attachment_id IS NULL AND asset_id IS NULL AND length(text) > 0)
+          (type = 'text' AND attachment_id IS NULL AND length(text) > 0)
           OR
-          (
-            type IN ('image','video','audio')
-            AND ((attachment_id IS NOT NULL)::int + (asset_id IS NOT NULL)::int) = 1
-          )
+          (type IN ('image','video','audio') AND attachment_id IS NOT NULL)
         )
       )
     `);
@@ -1904,7 +1743,6 @@ async function initDatabase() {
     await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ`);
     await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS recalled_at TIMESTAMPTZ`);
     await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`);
-    await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS asset_id UUID REFERENCES assets(id) ON DELETE RESTRICT`);
     await client.query(`ALTER TABLE attachments DROP CONSTRAINT IF EXISTS attachments_mime_check`);
     await client.query(`
       ALTER TABLE attachments
@@ -1923,12 +1761,9 @@ async function initDatabase() {
     await client.query(`
       ALTER TABLE messages
       ADD CONSTRAINT messages_check CHECK (
-        (type = 'text' AND attachment_id IS NULL AND asset_id IS NULL AND length(text) > 0)
+        (type = 'text' AND attachment_id IS NULL AND length(text) > 0)
         OR
-        (
-          type IN ('image','video','audio')
-          AND ((attachment_id IS NOT NULL)::int + (asset_id IS NOT NULL)::int) = 1
-        )
+        (type IN ('image','video','audio') AND attachment_id IS NOT NULL)
       )
     `);
     await client.query(`
@@ -2052,16 +1887,29 @@ async function initDatabase() {
           FROM pg_constraint
           WHERE conrelid = 'messages'::regclass
             AND conname = 'messages_check'
-            AND pg_get_constraintdef(oid) LIKE '%asset_id%'
+            AND pg_get_constraintdef(oid) LIKE '%recalled_at%'
         ) THEN
           ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_check;
           ALTER TABLE messages
             ADD CONSTRAINT messages_check CHECK (
-              (type = 'text' AND attachment_id IS NULL AND asset_id IS NULL AND length(text) > 0)
+              (
+                recalled_at IS NOT NULL
+                AND type = 'text'
+                AND attachment_id IS NULL
+                AND length(text) > 0
+              )
               OR
               (
-                type IN ('image','video','audio')
-                AND ((attachment_id IS NOT NULL)::int + (asset_id IS NOT NULL)::int) = 1
+                recalled_at IS NULL
+                AND type = 'text'
+                AND attachment_id IS NULL
+                AND length(text) > 0
+              )
+              OR
+              (
+                recalled_at IS NULL
+                AND type IN ('image','video','audio')
+                AND attachment_id IS NOT NULL
               )
             );
         END IF;
@@ -2410,10 +2258,6 @@ async function initDatabase() {
   }
 
   await cleanupExpiredData();
-  if (TENANT_ENTRY_ENABLED) {
-    await migrateLegacyTenantEndpoints();
-    await backfillTenantEndpoints();
-  }
   await refreshApprovedOrigins(true);
 }
 
@@ -2551,31 +2395,6 @@ async function cleanupExpiredData() {
       `,
     );
 
-    // 上传后未保存、已从快捷语移除且从未发送的回复图，保留七天后清理，
-    // 防止反复更换预览图造成数据库或 R2 存储持续增长。
-    const replyImages = await client.query(`
-      DELETE FROM assets a
-      WHERE a.kind = 'reply_image'
-        AND a.created_at < NOW() - INTERVAL '7 days'
-        AND NOT EXISTS (
-          SELECT 1 FROM messages m WHERE m.asset_id = a.id
-        )
-        AND NOT EXISTS (
-          SELECT 1
-          FROM tenant_config tc
-          WHERE tc.tenant_id = a.tenant_id
-            AND (
-              tc.canned_replies::text LIKE '%' || a.id::text || '%'
-              OR tc.auto_replies::text LIKE '%' || a.id::text || '%'
-              OR tc.settings::text LIKE '%' || a.id::text || '%'
-            )
-        )
-      RETURNING object_key
-    `);
-    objectKeys.push(
-      ...replyImages.rows.map((row) => row.object_key).filter(Boolean),
-    );
-
     const conversations = await client.query(
       `
         DELETE FROM conversations c
@@ -2675,7 +2494,6 @@ async function cleanupExpiredData() {
     return {
       messages: messages.rowCount,
       attachments: attachments.rowCount,
-      replyImages: replyImages.rowCount,
       conversations: conversations.rowCount,
       purgedTenants: purgedTenantIds.length,
     };
@@ -4380,7 +4198,7 @@ function invalidateApprovedOrigins() {
 function originAllowed(origin) {
   if (!origin) return true;
   const normalized = normalizeOrigin(origin);
-  return approvedOriginCache.has(normalized) || tenantEntryOriginAllowed(normalized);
+  return approvedOriginCache.has(normalized);
 }
 
 function setCommonHeaders(req, res) {
@@ -5542,10 +5360,7 @@ async function withImageTransformSlot(task) {
   }
 }
 
-async function prepareImageUpload(
-  req,
-  { maxBytes, width, height, fit = 'cover' },
-) {
+async function prepareImageUpload(req, { maxBytes, width, height }) {
   const mime = String(req.headers['content-type'] || '')
     .split(';')[0]
     .trim()
@@ -5569,9 +5384,8 @@ async function prepareImageUpload(
       })
         .rotate()
         .resize(width, height, {
-          fit,
+          fit: 'cover',
           position: 'attention',
-          withoutEnlargement: fit === 'inside',
         })
         .webp({ quality: 84, effort: 4 })
         .toBuffer();
@@ -5809,8 +5623,7 @@ function publicMessage(row) {
     source: row.source || 'manual',
     type: row.type,
     text: row.text || '',
-    attachmentId: row.attachment_id || row.asset_id || null,
-    assetId: row.asset_id || null,
+    attachmentId: row.attachment_id || null,
     albumId: row.album_id || null,
     albumPosition: Number(row.album_position || 0),
     createdAt: new Date(row.created_at).toISOString(),
@@ -5976,20 +5789,11 @@ async function realtimeConfig(scopeKey = 'shared') {
   try {
     const cloudflare = await requestCloudflareTurnCredentials(scopeKey);
     cloudflareTurnFailureUntil = 0;
-    const fallbackSignatures = new Set(
-      cloudflare.iceServers.flatMap((server) => server.urls || []),
-    );
-    const combinedIceServers = [
-      ...cloudflare.iceServers,
-      ...fallback.iceServers.filter((server) =>
-        (server.urls || []).some((url) => !fallbackSignatures.has(url)),
-      ),
-    ];
     return {
       ...fallback,
-      iceServers: combinedIceServers,
+      iceServers: cloudflare.iceServers,
       turnConfigured: true,
-      turnProvider: fallback.turnConfigured ? 'cloudflare+static' : 'cloudflare',
+      turnProvider: 'cloudflare',
       turnExpiresAt: new Date(cloudflare.expiresAt).toISOString(),
     };
   } catch (error) {
@@ -6959,703 +6763,6 @@ async function createTenantConfig(tenantId, client = pool) {
     `,
     [tenantId],
   );
-  if (TENANT_ENTRY_ENABLED) await ensureTenantEndpoints(tenantId, client);
-}
-
-function tenantEntrySuffixForHostname(value) {
-  const hostname = cleanText(value, 253).toLowerCase().replace(/\.+$/, '');
-  if (!hostname) return '';
-  return TENANT_ENTRY_DOMAIN_SUFFIXES.find((suffix) => {
-    if (!hostname.endsWith(`.${suffix}`)) return false;
-    const label = hostname.slice(0, -(suffix.length + 1));
-    return /^(?=.{3,63}$)[a-z0-9](?:[a-z0-9-]*[a-z0-9])$/.test(label) &&
-      !label.includes('.');
-  }) || '';
-}
-
-function tenantEntryOriginAllowed(value) {
-  if (!TENANT_ENTRY_ENABLED) return false;
-  try {
-    const parsed = new URL(value);
-    return parsed.protocol === 'https:' &&
-      !parsed.username &&
-      !parsed.password &&
-      !parsed.port &&
-      parsed.pathname === '/' &&
-      !parsed.search &&
-      !parsed.hash &&
-      Boolean(tenantEntrySuffixForHostname(parsed.hostname));
-  } catch {
-    return false;
-  }
-}
-
-function newTenantEndpointIdentity(slot = 1, suffixOffset = 0) {
-  const suffix = TENANT_ENTRY_DOMAIN_SUFFIXES[
-    Math.abs(Number(suffixOffset) || 0) % TENANT_ENTRY_DOMAIN_SUFFIXES.length
-  ];
-  const hostnameAlphabet = 'abcdefghjkmnpqrstuvwxyz23456789';
-  const label = Array.from(
-    randomBytes(4),
-    (value) => hostnameAlphabet[value & 31],
-  ).join('');
-  return {
-    hostname: `${label}.${suffix}`,
-    entryToken: randomBytes(24).toString('base64url'),
-  };
-}
-
-const NETLIFY_SITE_NAME_ALPHABET = 'abcdefghjkmnpqrstuvwxyz23456789';
-
-const NETLIFY_TEMPLATE_PREFIXES = [
-  [/微信|wechat|wxmb/i, 'wxmb'],
-  [/小红书|xiaohongshu|xhsmb/i, 'xhsmb'],
-  [/抖音|douyin|tiktok|dymb/i, 'dymb'],
-  [/快手|kuaishou|kwai|ksmb/i, 'ksmb'],
-  [/闲鱼|xianyu|xymb/i, 'xymb'],
-  [/支付宝|alipay|zfbmb/i, 'zfbmb'],
-  [/淘宝|taobao|tbmb/i, 'tbmb'],
-  [/拼多多|pinduoduo|pddmb/i, 'pddmb'],
-  [/企业微信|wecom|qywx/i, 'qywx'],
-  [/qq/i, 'qqmb'],
-];
-
-function netlifySiteNamePrefix(template) {
-  const source = `${cleanText(template?.name, 100)} ${cleanText(template?.base_url, 253)}`;
-  return NETLIFY_TEMPLATE_PREFIXES.find(([pattern]) => pattern.test(source))?.[1] || 'site';
-}
-
-async function nextNetlifySiteName(template) {
-  const prefix = netlifySiteNamePrefix(template);
-  const result = await pool.query(
-    `SELECT hostname FROM tenant_endpoint_domains WHERE hostname LIKE $1`,
-    [`${prefix}%.netlify.app`],
-  );
-  let nextNumber = 1;
-  for (const row of result.rows) {
-    const hostname = cleanText(row.hostname, 253).toLowerCase();
-    const label = hostname.endsWith('.netlify.app')
-      ? hostname.slice(0, -'.netlify.app'.length)
-      : '';
-    if (!label.startsWith(prefix)) continue;
-    const suffix = label.slice(prefix.length);
-    if (/^\d+$/.test(suffix)) {
-      nextNumber = Math.max(nextNumber, Number(suffix) + 1);
-    }
-  }
-  return { prefix, nextNumber };
-}
-
-function randomNetlifySiteName() {
-  const bytes = randomBytes(TENANT_NETLIFY_NAME_LENGTH);
-  return Array.from(bytes, (value) =>
-    NETLIFY_SITE_NAME_ALPHABET[value % NETLIFY_SITE_NAME_ALPHABET.length]
-  ).join('');
-}
-
-function newNetlifyEndpointIdentity() {
-  const label = randomNetlifySiteName();
-  return {
-    label,
-    hostname: `${label}.netlify.app`,
-    entryToken: randomBytes(24).toString('base64url'),
-  };
-}
-
-function isNetlifyEndpointHostname(value) {
-  const hostname = cleanText(value, 253).toLowerCase().replace(/\.+$/, '');
-  return Boolean(hostname) && hostname.endsWith('.netlify.app') &&
-    /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.netlify\.app$/.test(hostname);
-}
-
-function isLegacyTenantEndpointHostname(value) {
-  const hostname = cleanText(value, 253).toLowerCase().replace(/\.+$/, '');
-  const suffix = tenantEntrySuffixForHostname(hostname);
-  if (!suffix) return false;
-  const label = hostname.slice(0, -(suffix.length + 1));
-  return !/^[abcdefghjkmnpqrstuvwxyz23456789]{4}$/.test(label);
-}
-
-function tenantEndpointUrl(endpoint) {
-  if (!endpoint?.hostname) return '';
-  return `https://${endpoint.hostname}/`;
-}
-
-async function ensureTenantEndpoints(tenantId, client = pool) {
-  if (!TENANT_ENTRY_ENABLED || !isUuid(tenantId)) return;
-  let created = false;
-  const templates = await client.query(
-    TENANT_NETLIFY_ENABLED
-      ? `
-          SELECT template.id
-          FROM tenant_config config
-          JOIN frontend_templates template
-            ON template.id=config.frontend_template_id
-          WHERE config.tenant_id=$1
-            AND template.status IN ('enabled','testing')
-          LIMIT 1
-        `
-      : `
-          SELECT template.id
-          FROM frontend_templates template
-          WHERE (
-            template.status='enabled'
-            AND (
-              template.selection_closed=FALSE
-              OR EXISTS (
-                SELECT 1
-                FROM tenant_frontend_templates selected
-                WHERE selected.tenant_id=$1
-                  AND selected.template_id=template.id
-              )
-            )
-          ) OR (
-            template.status='testing'
-            AND EXISTS (
-              SELECT 1
-              FROM jsonb_array_elements_text(template.test_tenant_ids) allowed(id)
-              WHERE allowed.id=$1::text
-            )
-          )
-          ORDER BY
-            template.is_default DESC,
-            template.recommended DESC,
-            template.sort_order,
-            template.created_at,
-            template.id
-        `,
-    [tenantId],
-  );
-  const existingResult = await client.query(
-    `SELECT * FROM tenant_endpoints WHERE tenant_id=$1 ORDER BY slot`,
-    [tenantId],
-  );
-  const endpointsByTemplate = new Map(
-    existingResult.rows.map((endpoint) => [endpoint.frontend_template_id, endpoint]),
-  );
-  let nextSlot = existingResult.rows.reduce(
-    (maximum, endpoint) => Math.max(maximum, Number(endpoint.slot) || 0),
-    0,
-  ) + 1;
-  for (let templateIndex = 0; templateIndex < templates.rows.length; templateIndex += 1) {
-    const templateId = templates.rows[templateIndex].id;
-    let endpoint = endpointsByTemplate.get(templateId);
-    if (
-      TENANT_NETLIFY_ENABLED &&
-      endpoint &&
-      !isNetlifyEndpointHostname(endpoint.hostname)
-    ) {
-      let identity = null;
-      for (let attempt = 0; attempt < 16 && !identity; attempt += 1) {
-        const candidate = newNetlifyEndpointIdentity();
-        const collision = await client.query(
-          `
-            SELECT 1
-            FROM tenant_endpoint_domains
-            WHERE hostname=$1 OR entry_token=$2
-            LIMIT 1
-          `,
-          [candidate.hostname, candidate.entryToken],
-        );
-        if (!collision.rows[0]) identity = candidate;
-      }
-      if (!identity) throw new Error('无法为租户分配短的 Netlify 域名。');
-      await client.query(
-        `
-          UPDATE tenant_endpoint_domains
-          SET status='legacy',replaced_at=NOW(),
-              expires_at=CASE
-                WHEN $3::int=0 THEN NULL
-                ELSE NOW()+($3::int*INTERVAL '1 day')
-              END
-          WHERE endpoint_id=$1 AND hostname=$2 AND status='active'
-        `,
-        [endpoint.id, endpoint.hostname, TENANT_ENTRY_LEGACY_DAYS],
-      );
-      const migrated = await client.query(
-        `
-          UPDATE tenant_endpoints
-          SET hostname=$2,entry_token=$3,netlify_site_id='',
-              netlify_status='pending',netlify_error='',updated_at=NOW()
-          WHERE id=$1
-          RETURNING *
-        `,
-        [endpoint.id, identity.hostname, identity.entryToken],
-      );
-      endpoint = migrated.rows[0] || endpoint;
-      created = true;
-    }
-    if (!endpoint) {
-      let lastError = null;
-      for (let attempt = 0; attempt < 8 && !endpoint; attempt += 1) {
-        const slot = nextSlot + attempt;
-        const identity = TENANT_NETLIFY_ENABLED
-          ? newNetlifyEndpointIdentity()
-          : newTenantEndpointIdentity(slot, templateIndex + attempt);
-        try {
-          const inserted = await client.query(
-            `
-              INSERT INTO tenant_endpoints (
-                id,tenant_id,slot,frontend_template_id,hostname,entry_token,
-                netlify_status
-              ) VALUES ($1,$2,$3,$4,$5,$6,$7)
-              ON CONFLICT (tenant_id,slot) DO NOTHING
-              RETURNING *
-            `,
-            [
-              randomUUID(),
-              tenantId,
-              slot,
-              templateId,
-              identity.hostname,
-              identity.entryToken,
-              TENANT_NETLIFY_ENABLED ? 'pending' : 'ready',
-            ],
-          );
-          endpoint = inserted.rows[0] || (await client.query(
-            `
-              SELECT * FROM tenant_endpoints
-              WHERE tenant_id=$1 AND frontend_template_id=$2
-              LIMIT 1
-            `,
-            [tenantId, templateId],
-          )).rows[0];
-          if (inserted.rows[0]) created = true;
-        } catch (error) {
-          lastError = error;
-          if (error?.code !== '23505') throw error;
-        }
-      }
-      if (!endpoint) throw lastError || new Error('无法创建租户独占入口。');
-      endpointsByTemplate.set(templateId, endpoint);
-      nextSlot = Math.max(nextSlot, Number(endpoint.slot) + 1);
-    }
-    await client.query(
-      `
-        INSERT INTO tenant_endpoint_domains (
-          id,endpoint_id,tenant_id,hostname,entry_token,status
-        ) VALUES ($1,$2,$3,$4,$5,'active')
-        ON CONFLICT (hostname) DO NOTHING
-      `,
-      [
-        randomUUID(),
-        endpoint.id,
-        tenantId,
-        endpoint.hostname,
-        endpoint.entry_token,
-      ],
-    );
-  }
-  if (created && client === pool) {
-    invalidateTenantCaches(tenantId);
-    invalidateApprovedOrigins();
-  }
-}
-
-async function migrateLegacyTenantEndpoints() {
-  const result = await pool.query(
-    `
-      SELECT id,tenant_id,slot,hostname
-      FROM tenant_endpoints
-      WHERE status='active'
-      ORDER BY tenant_id,slot
-    `,
-  );
-  for (const candidate of result.rows) {
-    if (!isLegacyTenantEndpointHostname(candidate.hostname)) continue;
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const locked = await client.query(
-        `
-          SELECT id,tenant_id,slot,hostname
-          FROM tenant_endpoints
-          WHERE id=$1 AND status='active'
-          FOR UPDATE
-        `,
-        [candidate.id],
-      );
-      const endpoint = locked.rows[0];
-      if (!endpoint || !isLegacyTenantEndpointHostname(endpoint.hostname)) {
-        await client.query('COMMIT');
-        continue;
-      }
-      let identity = null;
-      for (let attempt = 0; attempt < 16 && !identity; attempt += 1) {
-        const next = newTenantEndpointIdentity(endpoint.slot, attempt);
-        const collision = await client.query(
-          `
-            SELECT 1
-            FROM tenant_endpoint_domains
-            WHERE hostname=$1 OR entry_token=$2
-            LIMIT 1
-          `,
-          [next.hostname, next.entryToken],
-        );
-        if (!collision.rows[0]) identity = next;
-      }
-      if (!identity) throw new Error('无法为旧租户入口分配短域名。');
-      await client.query(
-        `
-          UPDATE tenant_endpoint_domains
-          SET status='legacy',replaced_at=NOW(),
-              expires_at=CASE
-                WHEN $3::int=0 THEN NULL
-                ELSE NOW()+($3::int*INTERVAL '1 day')
-              END
-          WHERE endpoint_id=$1 AND hostname=$2 AND status='active'
-        `,
-        [endpoint.id, endpoint.hostname, TENANT_ENTRY_LEGACY_DAYS],
-      );
-      await client.query(
-        `
-          UPDATE tenant_endpoints
-          SET hostname=$2,entry_token=$3,updated_at=NOW()
-          WHERE id=$1 AND status='active'
-        `,
-        [endpoint.id, identity.hostname, identity.entryToken],
-      );
-      await client.query(
-        `
-          INSERT INTO tenant_endpoint_domains (
-            id,endpoint_id,tenant_id,hostname,entry_token,status
-          ) VALUES ($1,$2,$3,$4,$5,'active')
-        `,
-        [
-          randomUUID(),
-          endpoint.id,
-          endpoint.tenant_id,
-          identity.hostname,
-          identity.entryToken,
-        ],
-      );
-      await client.query('COMMIT');
-      invalidateTenantCaches(endpoint.tenant_id);
-      invalidateApprovedOrigins();
-    } catch (error) {
-      await client.query('ROLLBACK');
-      throw error;
-    } finally {
-      client.release();
-    }
-  }
-}
-
-async function backfillTenantEndpoints() {
-  const tenants = await pool.query(`SELECT id FROM tenants ORDER BY created_at,id`);
-  for (const tenant of tenants.rows) {
-    await ensureTenantEndpoints(tenant.id);
-  }
-}
-
-async function getTenantEndpoints(tenantId, client = pool) {
-  if (!TENANT_ENTRY_ENABLED) return [];
-  await ensureTenantEndpoints(tenantId, client);
-  const result = await client.query(
-    `
-      SELECT
-        endpoint.*,tenant.public_code,
-        template.name AS template_name,
-        template.base_url AS template_base_url,
-        template.status AS template_status,
-        COALESCE(history.domains,'[]'::jsonb) AS domains
-      FROM tenant_endpoints endpoint
-      JOIN tenants tenant ON tenant.id=endpoint.tenant_id
-      JOIN frontend_templates template ON template.id=endpoint.frontend_template_id
-      LEFT JOIN LATERAL (
-        SELECT jsonb_agg(
-          jsonb_build_object(
-            'hostname',domain.hostname,
-            'status',domain.status,
-            'createdAt',domain.created_at,
-            'replacedAt',domain.replaced_at,
-            'expiresAt',domain.expires_at
-          ) ORDER BY domain.created_at DESC
-        ) AS domains
-        FROM tenant_endpoint_domains domain
-        WHERE domain.endpoint_id=endpoint.id
-      ) history ON TRUE
-      WHERE endpoint.tenant_id=$1
-        AND (
-          NOT $2::boolean
-          OR endpoint.frontend_template_id = (
-            SELECT frontend_template_id
-            FROM tenant_config
-            WHERE tenant_id=$1
-          )
-        )
-        AND (
-          template.status='enabled'
-          OR (
-            template.status='testing'
-            AND EXISTS (
-              SELECT 1
-              FROM jsonb_array_elements_text(template.test_tenant_ids) allowed(id)
-              WHERE allowed.id=endpoint.tenant_id::text
-            )
-          )
-        )
-      ORDER BY
-        template.is_default DESC,
-        template.recommended DESC,
-        template.sort_order,
-        endpoint.slot
-    `,
-    [tenantId, TENANT_NETLIFY_ENABLED],
-  );
-  if (TENANT_NETLIFY_ENABLED) {
-    for (const row of result.rows) {
-      if (row.netlify_status !== 'ready' || !row.netlify_site_id) {
-        scheduleTenantNetlifyProvisioning(row.id);
-      }
-    }
-  }
-  return result.rows.map((row) => ({
-    id: row.id,
-    slot: Number(row.slot),
-    hostname: row.hostname,
-    entryToken: row.entry_token,
-    status: row.status,
-    frontendTemplateId: row.frontend_template_id,
-    frontendTemplateName: row.template_name,
-    frontendBaseUrl: row.template_base_url,
-    templateStatus: row.template_status,
-    netlifySiteId: row.netlify_site_id || '',
-    netlifyStatus: row.netlify_status || 'ready',
-    netlifyError: row.netlify_error || '',
-    rotationCount: Number(row.rotation_count || 0),
-    lastRotatedAt: row.last_rotated_at
-      ? new Date(row.last_rotated_at).toISOString()
-      : null,
-    url: TENANT_NETLIFY_ENABLED && row.netlify_status !== 'ready'
-      ? ''
-      : tenantEndpointUrl(row),
-    domains: Array.isArray(row.domains) ? row.domains : [],
-  }));
-}
-
-async function findTenantEndpointDomain({
-  hostname,
-  tenantId = '',
-  entryToken = '',
-} = {}, client = pool) {
-  const normalizedHostname = cleanText(hostname, 253).toLowerCase().replace(/\.+$/, '');
-  if (!tenantEntrySuffixForHostname(normalizedHostname)) return null;
-  const result = await client.query(
-    `
-      SELECT
-        domain.hostname,domain.entry_token,domain.status AS domain_status,
-        domain.expires_at,endpoint.id AS endpoint_id,endpoint.tenant_id,
-        endpoint.slot,endpoint.status AS endpoint_status,
-        endpoint.hostname AS current_hostname,
-        endpoint.entry_token AS current_entry_token,
-        endpoint.frontend_template_id,tenant.public_code,
-        tenant.status AS tenant_status,tenant.access_expires_at,
-        template.name AS template_name,template.base_url AS template_base_url,
-        template.origin AS template_origin,template.status AS template_status,
-        template.netlify_site_id
-      FROM tenant_endpoint_domains domain
-      JOIN tenant_endpoints endpoint ON endpoint.id=domain.endpoint_id
-      JOIN tenants tenant ON tenant.id=endpoint.tenant_id
-      JOIN frontend_templates template ON template.id=endpoint.frontend_template_id
-      WHERE domain.hostname=$1
-        AND domain.status IN ('active','legacy')
-        AND (domain.expires_at IS NULL OR domain.expires_at>NOW())
-        AND endpoint.status='active'
-        AND ($2::uuid IS NULL OR endpoint.tenant_id=$2)
-        AND ($3::text='' OR domain.entry_token=$3)
-        AND (
-          template.status='enabled'
-          OR (
-            template.status='testing'
-            AND EXISTS (
-              SELECT 1
-              FROM jsonb_array_elements_text(template.test_tenant_ids) allowed(id)
-              WHERE allowed.id=endpoint.tenant_id::text
-            )
-          )
-        )
-      LIMIT 1
-    `,
-    [
-      normalizedHostname,
-      isUuid(tenantId) ? tenantId : null,
-      cleanText(entryToken, 200),
-    ],
-  );
-  return result.rows[0] || null;
-}
-
-async function rotateTenantNetlifyEndpoint(tenantId, endpointId) {
-  const currentResult = await pool.query(
-    `
-      SELECT endpoint.*,tenant.public_code,
-             template.name AS template_name,
-             template.base_url AS template_base_url,
-             template.client_version
-      FROM tenant_endpoints endpoint
-      JOIN tenants tenant ON tenant.id=endpoint.tenant_id
-      JOIN frontend_templates template
-        ON template.id=endpoint.frontend_template_id
-      WHERE endpoint.id=$1 AND endpoint.tenant_id=$2
-        AND endpoint.status='active'
-      LIMIT 1
-    `,
-    [endpointId, tenantId],
-  );
-  const current = currentResult.rows[0];
-  if (!current) {
-    throw requestError('租户用户端入口不存在。', 404, 'TENANT_ENDPOINT');
-  }
-  const nextEntryToken = randomBytes(24).toString('base64url');
-  const created = await createAndDeployTenantNetlifySite(
-    {
-      id: current.frontend_template_id,
-      name: current.template_name,
-      base_url: current.template_base_url,
-      client_version: current.client_version,
-    },
-    {
-      public_code: current.public_code,
-      entry_token: nextEntryToken,
-    },
-  );
-  // 站点已经部署完毕后再切换数据库指针；这样不会出现“二维码已经换了，
-  // 但新域名还没有页面”的空窗期。旧站点保留在 Netlify，旧二维码在保留期内
-  // 仍会通过旧 entryToken 找回同一个租户。
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const locked = await client.query(
-      `SELECT * FROM tenant_endpoints WHERE id=$1 AND tenant_id=$2 FOR UPDATE`,
-      [endpointId, tenantId],
-    );
-    const endpoint = locked.rows[0];
-    if (!endpoint) throw new Error('租户用户端入口在更换过程中已被删除。');
-    await client.query(
-      `
-        UPDATE tenant_endpoint_domains
-        SET status='legacy',replaced_at=NOW(),
-            expires_at=CASE
-              WHEN $3::int=0 THEN NULL
-              ELSE NOW()+($3::int*INTERVAL '1 day')
-            END
-        WHERE endpoint_id=$1 AND hostname=$2 AND status='active'
-      `,
-      [endpoint.id, endpoint.hostname, TENANT_ENTRY_LEGACY_DAYS],
-    );
-    await client.query(
-      `
-        UPDATE tenant_endpoints
-        SET hostname=$3,entry_token=$4,netlify_site_id=$5,
-            netlify_status='ready',netlify_error='',
-            rotation_count=rotation_count+1,last_rotated_at=NOW(),updated_at=NOW()
-        WHERE id=$1 AND tenant_id=$2
-      `,
-      [endpoint.id, tenantId, created.hostname, nextEntryToken, created.siteId],
-    );
-    await client.query(
-      `
-        INSERT INTO tenant_endpoint_domains (
-          id,endpoint_id,tenant_id,hostname,entry_token,status
-        ) VALUES ($1,$2,$3,$4,$5,'active')
-      `,
-      [randomUUID(), endpoint.id, tenantId, created.hostname, nextEntryToken],
-    );
-    await client.query('COMMIT');
-    invalidateTenantCaches(tenantId);
-    invalidateApprovedOrigins();
-    return {
-      oldDomain: endpoint.hostname,
-      newDomain: created.hostname,
-      endpoints: await getTenantEndpoints(tenantId),
-    };
-  } catch (error) {
-    await client.query('ROLLBACK').catch(() => {});
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
-async function rotateTenantEndpoint(tenantId, endpointId, client = pool) {
-  if (TENANT_NETLIFY_ENABLED && client === pool) {
-    return rotateTenantNetlifyEndpoint(tenantId, endpointId);
-  }
-  const databaseClient = client === pool ? await pool.connect() : client;
-  const ownsClient = client === pool;
-  try {
-    if (ownsClient) await databaseClient.query('BEGIN');
-    const locked = await databaseClient.query(
-      `
-        SELECT * FROM tenant_endpoints
-        WHERE id=$1 AND tenant_id=$2
-        FOR UPDATE
-      `,
-      [endpointId, tenantId],
-    );
-    const endpoint = locked.rows[0];
-    if (!endpoint) {
-      throw requestError('租户用户端入口不存在。', 404, 'TENANT_ENDPOINT');
-    }
-    const currentSuffix = tenantEntrySuffixForHostname(endpoint.hostname);
-    const currentIndex = Math.max(0, TENANT_ENTRY_DOMAIN_SUFFIXES.indexOf(currentSuffix));
-    let identity = null;
-    for (let attempt = 1; attempt <= 12 && !identity; attempt += 1) {
-      const candidate = newTenantEndpointIdentity(
-        endpoint.slot,
-        currentIndex + attempt,
-      );
-      const collision = await databaseClient.query(
-        `SELECT 1 FROM tenant_endpoint_domains WHERE hostname=$1 OR entry_token=$2 LIMIT 1`,
-        [candidate.hostname, candidate.entryToken],
-      );
-      if (!collision.rows[0]) identity = candidate;
-    }
-    if (!identity) throw new Error('无法分配新的租户入口域名。');
-    await databaseClient.query(
-      `
-        UPDATE tenant_endpoint_domains
-        SET status='legacy',replaced_at=NOW(),
-            expires_at=CASE
-              WHEN $3::int=0 THEN NULL
-              ELSE NOW()+($3::int*INTERVAL '1 day')
-            END
-        WHERE endpoint_id=$1 AND hostname=$2 AND status='active'
-      `,
-      [endpoint.id, endpoint.hostname, TENANT_ENTRY_LEGACY_DAYS],
-    );
-    await databaseClient.query(
-      `
-        UPDATE tenant_endpoints
-        SET hostname=$3,entry_token=$4,rotation_count=rotation_count+1,
-            last_rotated_at=NOW(),updated_at=NOW()
-        WHERE id=$1 AND tenant_id=$2
-      `,
-      [endpoint.id, tenantId, identity.hostname, identity.entryToken],
-    );
-    await databaseClient.query(
-      `
-        INSERT INTO tenant_endpoint_domains (
-          id,endpoint_id,tenant_id,hostname,entry_token,status
-        ) VALUES ($1,$2,$3,$4,$5,'active')
-      `,
-      [randomUUID(), endpoint.id, tenantId, identity.hostname, identity.entryToken],
-    );
-    if (ownsClient) await databaseClient.query('COMMIT');
-    invalidateTenantCaches(tenantId);
-    invalidateApprovedOrigins();
-    return {
-      oldDomain: endpoint.hostname,
-      newDomain: identity.hostname,
-      endpoints: await getTenantEndpoints(tenantId),
-    };
-  } catch (error) {
-    if (ownsClient) await databaseClient.query('ROLLBACK').catch(() => {});
-    throw error;
-  } finally {
-    if (ownsClient) databaseClient.release();
-  }
 }
 
 async function getConfig(tenantId, client = pool) {
@@ -7677,8 +6784,7 @@ async function getConfig(tenantId, client = pool) {
         ft.origin AS frontend_origin,
         ft.netlify_site_id AS frontend_netlify_site_id,
         ft.status AS frontend_template_status,
-        approved.approved_frontends,
-        endpoint_approved.approved_endpoint_frontends
+        approved.approved_frontends
       FROM tenant_config tc
       LEFT JOIN frontend_templates ft ON ft.id = tc.frontend_template_id
       LEFT JOIN LATERAL (
@@ -7714,43 +6820,6 @@ async function getConfig(tenantId, client = pool) {
             )
           )
       ) approved ON TRUE
-      LEFT JOIN LATERAL (
-        SELECT jsonb_agg(
-          jsonb_build_object(
-            'id', endpoint_template.id,
-            'name', endpoint_template.name,
-            'baseUrl', endpoint_template.base_url,
-            'origin', 'https://' || endpoint_domain.hostname,
-            'netlifySiteId', endpoint_template.netlify_site_id,
-            'status', endpoint_template.status
-          ) ORDER BY endpoint_domain.created_at DESC
-        ) AS approved_endpoint_frontends
-        FROM tenant_endpoint_domains endpoint_domain
-        JOIN tenant_endpoints endpoint
-          ON endpoint.id=endpoint_domain.endpoint_id
-        JOIN frontend_templates endpoint_template
-          ON endpoint_template.id=endpoint.frontend_template_id
-        WHERE endpoint_domain.tenant_id=tc.tenant_id
-          AND endpoint.status='active'
-          AND endpoint_domain.status IN ('active','legacy')
-          AND (
-            endpoint_domain.expires_at IS NULL
-            OR endpoint_domain.expires_at>NOW()
-          )
-          AND (
-            endpoint_template.status='enabled'
-            OR (
-              endpoint_template.status='testing'
-              AND EXISTS (
-                SELECT 1
-                FROM jsonb_array_elements_text(
-                  endpoint_template.test_tenant_ids
-                ) allowed(id)
-                WHERE allowed.id=tc.tenant_id::text
-              )
-            )
-          )
-      ) endpoint_approved ON TRUE
       WHERE tc.tenant_id = $1
     `,
     [tenantId],
@@ -7759,16 +6828,8 @@ async function getConfig(tenantId, client = pool) {
     await createTenantConfig(tenantId, client);
     return getConfig(tenantId, client);
   }
-  const approvedFrontendRows = [
-    ...(Array.isArray(result.rows[0].approved_frontends)
-      ? result.rows[0].approved_frontends
-      : []),
-    ...(Array.isArray(result.rows[0].approved_endpoint_frontends)
-      ? result.rows[0].approved_endpoint_frontends
-      : []),
-  ];
-  const approvedFrontends = approvedFrontendRows.length
-    ? approvedFrontendRows
+  const approvedFrontends = Array.isArray(result.rows[0].approved_frontends)
+    ? result.rows[0].approved_frontends
         .map((item) => ({
           id: cleanText(item?.id, 80),
           name: cleanText(item?.name, 80),
@@ -7786,6 +6847,10 @@ async function getConfig(tenantId, client = pool) {
     settings: {
       ...defaultConfig().settings,
       ...(result.rows[0].settings || {}),
+      qrBottomText:
+        result.rows[0].settings?.qrBottomText === LEGACY_QR_BOTTOM_TEXT
+          ? DEFAULT_QR_BOTTOM_TEXT
+          : result.rows[0].settings?.qrBottomText ?? DEFAULT_QR_BOTTOM_TEXT,
       retentionHours: Number(result.rows[0].retention_hours || 24),
       frontendTemplateId:
         result.rows[0].frontend_template_id || DEFAULT_TEMPLATE_ID,
@@ -7952,14 +7017,6 @@ function tenantEntryUrl(settings, publicCode) {
   const url = new URL(base);
   url.searchParams.set('tenant', publicCode);
   return url.toString();
-}
-
-function tenantQrEntryUrl(publicCode) {
-  const base = new URL(QR_ENTRY_BASE);
-  base.pathname = `${base.pathname.replace(/\/+$/, '')}/q/${encodeURIComponent(publicCode)}`;
-  base.search = '';
-  base.hash = '';
-  return base.toString();
 }
 
 async function getPlatformSettings(client = pool) {
@@ -8652,36 +7709,26 @@ function timingSafeTextEqual(a, b) {
 }
 
 function matchAutoReply(config, text) {
-  if (!config.settings?.autoReplyEnabled) return null;
+  if (!config.settings?.autoReplyEnabled) return '';
   const normalized = String(text || '').toLowerCase();
 
   for (const rule of Array.isArray(config.autoReplies) ? config.autoReplies : []) {
-    if (!rule?.enabled || (!rule.replyText && !rule.imageAssetId)) continue;
+    if (!rule?.enabled || !rule.replyText) continue;
     const keywords = Array.isArray(rule.keywords) ? rule.keywords : [];
     if (
       keywords.some((keyword) =>
         normalized.includes(String(keyword || '').toLowerCase()),
       )
     ) {
-      return {
-        text: cleanText(rule.replyText, 4000),
-        imageAssetId: cleanText(rule.imageAssetId, 80),
-      };
+      return cleanText(rule.replyText, 4000);
     }
   }
 
   if (config.settings?.defaultAutoReplyEnabled) {
-    const reply = {
-      text: cleanText(config.settings.defaultAutoReply, 4000),
-      imageAssetId: cleanText(
-        config.settings.defaultAutoReplyImageAssetId,
-        80,
-      ),
-    };
-    if (reply.text || reply.imageAssetId) return reply;
+    return cleanText(config.settings.defaultAutoReply, 4000);
   }
 
-  return null;
+  return '';
 }
 
 async function validateAdminSettings(body, current, tenantId) {
@@ -8692,9 +7739,8 @@ async function validateAdminSettings(body, current, tenantId) {
           id: cleanText(item?.id, 80) || randomUUID(),
           title: cleanText(item?.title, 40) || '快捷语',
           text: cleanText(item?.text, 2000),
-          imageAssetId: cleanText(item?.imageAssetId, 80),
         }))
-        .filter((item) => item.text || item.imageAssetId)
+        .filter((item) => item.text)
     : current.cannedReplies;
 
   const autoReplies = Array.isArray(body.autoReplies)
@@ -8711,48 +7757,12 @@ async function validateAdminSettings(body, current, tenantId) {
                 .slice(0, 30)
             : [],
           replyText: cleanText(item?.replyText, 2000),
-          imageAssetId: cleanText(item?.imageAssetId, 80),
         }))
-        .filter((item) => item.replyText || item.imageAssetId)
+        .filter((item) => item.replyText)
     : current.autoReplies;
 
   const input =
     body.settings && typeof body.settings === 'object' ? body.settings : {};
-  const defaultAutoReplyImageAssetId = cleanText(
-    input.defaultAutoReplyImageAssetId !== undefined
-      ? input.defaultAutoReplyImageAssetId
-      : current.settings.defaultAutoReplyImageAssetId,
-    80,
-  );
-  const replyImageAssetIds = [
-    ...cannedReplies.map((item) => item.imageAssetId),
-    ...autoReplies.map((item) => item.imageAssetId),
-    defaultAutoReplyImageAssetId,
-  ].filter(Boolean);
-  if (replyImageAssetIds.some((assetId) => !isUuid(assetId))) {
-    throw requestError('快捷语或自动回复图片无效。', 400, 'INVALID_REPLY_IMAGE');
-  }
-  const uniqueReplyImageAssetIds = [...new Set(replyImageAssetIds)];
-  if (uniqueReplyImageAssetIds.length) {
-    const assetResult = await pool.query(
-      `
-        SELECT id
-        FROM assets
-        WHERE id = ANY($1::uuid[])
-          AND tenant_id = $2
-          AND kind = 'reply_image'
-          AND mime = 'image/webp'
-      `,
-      [uniqueReplyImageAssetIds, tenantId],
-    );
-    if (assetResult.rows.length !== uniqueReplyImageAssetIds.length) {
-      throw requestError(
-        '快捷语或自动回复图片不存在，或不属于当前租户。',
-        400,
-        'INVALID_REPLY_IMAGE',
-      );
-    }
-  }
   const brandFields = [
     'siteName',
     'welcomeText',
@@ -8883,7 +7893,6 @@ async function validateAdminSettings(body, current, tenantId) {
       input.defaultAutoReply !== undefined
         ? cleanText(input.defaultAutoReply, 2000)
         : current.settings.defaultAutoReply,
-    defaultAutoReplyImageAssetId,
     autoReplyCooldownSeconds: Number.isFinite(cooldownRaw)
       ? Math.min(3600, Math.max(0, cooldownRaw))
       : 20,
@@ -9376,7 +8385,7 @@ function parseMessageInput(body = {}) {
   const text = cleanText(body.text, 4000);
   if (requestedType === 'text') {
     if (!text) throw requestError('消息不能为空。', 400, 'EMPTY_MESSAGE');
-    return { type: 'text', text, attachmentIds: [], assetIds: [] };
+    return { type: 'text', text, attachmentIds: [] };
   }
 
   const inputIds = Array.isArray(body.attachmentIds)
@@ -9385,116 +8394,29 @@ function parseMessageInput(body = {}) {
   const attachmentIds = inputIds
     .map((value) => cleanText(value, 80))
     .filter(Boolean);
-  const inputAssetIds = Array.isArray(body.assetIds)
-    ? body.assetIds
-    : [body.assetId];
-  const assetIds = inputAssetIds
-    .map((value) => cleanText(value, 80))
-    .filter(Boolean);
 
   if (
-    (!attachmentIds.length && !assetIds.length) ||
-    (attachmentIds.length && assetIds.length) ||
+    !attachmentIds.length ||
     attachmentIds.some((id) => !isUuid(id)) ||
-    assetIds.some((id) => !isUuid(id)) ||
-    new Set(attachmentIds).size !== attachmentIds.length ||
-    new Set(assetIds).size !== assetIds.length
+    new Set(attachmentIds).size !== attachmentIds.length
   ) {
     throw requestError('媒体附件无效。', 400, 'INVALID_ATTACHMENT');
   }
-  const mediaCount = attachmentIds.length || assetIds.length;
-  if (assetIds.length && requestedType !== 'image') {
-    throw requestError('预设素材只能作为图片发送。', 400, 'INVALID_ASSET_TYPE');
-  }
-  if (requestedType === 'image' && mediaCount > MAX_ALBUM_IMAGES) {
+  if (requestedType === 'image' && attachmentIds.length > MAX_ALBUM_IMAGES) {
     throw requestError(
       `一次最多发送 ${MAX_ALBUM_IMAGES} 张图片。`,
       400,
       'ALBUM_LIMIT',
     );
   }
-  if (requestedType === 'video' && mediaCount !== 1) {
+  if (requestedType === 'video' && attachmentIds.length !== 1) {
     throw requestError('一次只能发送一个视频。', 400, 'VIDEO_LIMIT');
   }
-  if (requestedType === 'audio' && mediaCount !== 1) {
+  if (requestedType === 'audio' && attachmentIds.length !== 1) {
     throw requestError('一次只能发送一条语音。', 400, 'AUDIO_LIMIT');
   }
 
-  return { type: requestedType, text, attachmentIds, assetIds };
-}
-
-async function lockReplyImageAssets(client, tenantId, assetIds) {
-  const result = await client.query(
-    `
-      SELECT id
-      FROM assets
-      WHERE id = ANY($1::uuid[])
-        AND tenant_id = $2
-        AND kind = 'reply_image'
-        AND mime = 'image/webp'
-      FOR SHARE
-    `,
-    [assetIds, tenantId],
-  );
-  if (result.rows.length !== assetIds.length) {
-    throw requestError(
-      '快捷语或自动回复图片无效，或不属于当前租户。',
-      400,
-      'INVALID_REPLY_IMAGE',
-    );
-  }
-}
-
-async function insertAssetImageMessages(
-  client,
-  conversationId,
-  assetIds,
-  {
-    source = 'manual',
-    text = '',
-    retentionHours = 24,
-    createdAfter = null,
-  } = {},
-) {
-  const albumId = assetIds.length > 1 ? randomUUID() : null;
-  const result = await client.query(
-    `
-      INSERT INTO messages (
-        id, conversation_id, role, source, type, text, asset_id,
-        album_id, album_position, created_at, expires_at
-      )
-      SELECT
-        input.id,$4,'admin',$5,'image',input.body_text,input.asset_id,
-        $6,input.position,
-        COALESCE(
-          $9::timestamptz + ((input.position + 2)::text || ' milliseconds')::interval,
-          NOW()
-        ),
-        COALESCE(
-          $9::timestamptz + ((input.position + 2)::text || ' milliseconds')::interval,
-          NOW()
-        ) + ($7::text || ' hours')::interval
-      FROM unnest(
-        $1::uuid[],$2::uuid[],$3::text[],$8::int[]
-      ) AS input(id,asset_id,body_text,position)
-      RETURNING *
-    `,
-    [
-      assetIds.map(() => randomUUID()),
-      assetIds,
-      assetIds.map((_, index) => index === 0 ? text : ''),
-      conversationId,
-      source,
-      albumId,
-      retentionHours,
-      assetIds.map((_, index) => index),
-      createdAfter,
-    ],
-  );
-  return result.rows.sort(
-    (left, right) =>
-      Number(left.album_position || 0) - Number(right.album_position || 0),
-  );
+  return { type: requestedType, text, attachmentIds };
 }
 
 async function lockPendingAttachments(
@@ -9599,9 +8521,6 @@ async function createUserMessage(
   { includeConversation = true } = {},
 ) {
   const input = parseMessageInput(body);
-  if (input.assetIds.length) {
-    throw requestError('访客不能发送后台预设素材。', 403, 'FORBIDDEN_ASSET');
-  }
   const [config, featureStates] = await Promise.all([
     getConfig(tenantId),
     getTenantFeatureStates(tenantId),
@@ -9678,7 +8597,7 @@ async function createUserMessage(
       )
     ).rows[0];
 
-    let autoReplyRows = [];
+    let autoReplyRow = null;
     if (input.type === 'text') {
       const cooldownSeconds = Math.min(
         3600,
@@ -9690,77 +8609,56 @@ async function createUserMessage(
       const cooldownPassed =
         !lastAutoReplyAt ||
         Date.now() - lastAutoReplyAt >= cooldownSeconds * 1000;
-      const autoReply =
+      const replyText =
         cooldownPassed &&
         featureStates.auto_reply
         ? matchAutoReply(config, input.text)
-        : null;
+        : '';
 
-      if (autoReply) {
-        if (autoReply.text) {
-          const autoResult = await client.query(
-            `
-              INSERT INTO messages (
-                id, conversation_id, role, source, type, text, created_at, expires_at
-              )
-              VALUES (
-                $1,$2,'admin','auto','text',$3,
-                $5::timestamptz + INTERVAL '1 millisecond',
-                $5::timestamptz + INTERVAL '1 millisecond'
-                  + ($4::text || ' hours')::interval
-              )
-              RETURNING *
-            `,
-            [
-              randomUUID(),
-              conversationId,
-              autoReply.text,
-              retentionHours,
-              messageRows.at(-1).created_at,
-            ],
-          );
-          autoReplyRows.push(autoResult.rows[0]);
-        }
-        if (autoReply.imageAssetId) {
-          await lockReplyImageAssets(
-            client,
-            tenantId,
-            [autoReply.imageAssetId],
-          );
-          autoReplyRows.push(...await insertAssetImageMessages(
-            client,
+      if (replyText) {
+        const autoResult = await client.query(
+          `
+            INSERT INTO messages (
+              id, conversation_id, role, source, type, text, created_at, expires_at
+            )
+            VALUES (
+              $1,$2,'admin','auto','text',$3,
+              $5::timestamptz + INTERVAL '1 millisecond',
+              $5::timestamptz + INTERVAL '1 millisecond'
+                + ($4::text || ' hours')::interval
+            )
+            RETURNING *
+          `,
+          [
+            randomUUID(),
             conversationId,
-            [autoReply.imageAssetId],
-            {
-              source: 'auto',
-              retentionHours,
-              createdAfter: messageRows.at(-1).created_at,
-            },
-          ));
-        }
-        if (autoReplyRows.length) {
+            replyText,
+            retentionHours,
+            messageRows.at(-1).created_at,
+          ],
+        );
+        autoReplyRow = autoResult.rows[0];
         updatedConversation = (
           await client.query(
           `
             UPDATE conversations
-            SET unread_user = unread_user + $3::int,
+            SET unread_user = unread_user + 1,
                 last_auto_reply_at = NOW(),
                 updated_at = NOW()
             WHERE id = $1 AND tenant_id = $2
             RETURNING *
           `,
-          [conversationId, tenantId, autoReplyRows.length],
+          [conversationId, tenantId],
           )
         ).rows[0];
-        }
       }
     }
 
     await client.query('COMMIT');
     minuteCounters.messages +=
-      messageRows.length + autoReplyRows.length;
+      messageRows.length + (autoReplyRow ? 1 : 0);
     const messages = messageRows.map(publicMessage);
-    const latestRow = autoReplyRows.at(-1) || messageRows.at(-1);
+    const latestRow = autoReplyRow || messageRows.at(-1);
     const summary = conversationSummary({
       ...updatedConversation,
       latest_id: latestRow?.id,
@@ -9776,12 +8674,10 @@ async function createUserMessage(
           conversation.tenant_id,
         )
       : summary;
-    const publicAutoReplies = autoReplyRows.map(publicMessage);
     return {
       message: messages[0],
       messages,
-      autoReply: publicAutoReplies.at(-1) || null,
-      autoReplies: publicAutoReplies,
+      autoReply: autoReplyRow ? publicMessage(autoReplyRow) : null,
       conversation: publicConversation,
       summary,
     };
@@ -9845,14 +8741,6 @@ async function createAdminMessage(
         [randomUUID(), conversationId, input.text, retentionHours],
       );
       messageRows = [result.rows[0]];
-    } else if (input.assetIds.length) {
-      await lockReplyImageAssets(client, tenantId, input.assetIds);
-      messageRows = await insertAssetImageMessages(
-        client,
-        conversationId,
-        input.assetIds,
-        { text: input.text, retentionHours },
-      );
     } else {
       await lockPendingAttachments(
         client,
@@ -9926,7 +8814,7 @@ async function broadcastMessageResult(
 ) {
   const appended = [
     ...(result.messages || []),
-    ...(result.autoReplies || (result.autoReply ? [result.autoReply] : [])),
+    ...(result.autoReply ? [result.autoReply] : []),
   ];
   for (const message of appended) {
     if (
@@ -10228,7 +9116,6 @@ async function recallAdminMessage(
         SET type = 'text',
             text = '客服已撤回了一条消息',
             attachment_id = NULL,
-            asset_id = NULL,
             album_id = NULL,
             album_position = 0,
             recalled_at = NOW()
@@ -11196,7 +10083,7 @@ function claimTelegramGeneration(callback) {
 
 function telegramGeneratedLicenseText(created) {
   return [
-    '<b>卡密已生成</b>',
+    '<b>普通卡密和管理员超级卡密已生成</b>',
     '你的后台网站是 <b>YKF000.com</b>',
     '为了你的隐私和客户安全',
     '请保护好你的卡密 不要泄露！',
@@ -11204,12 +10091,17 @@ function telegramGeneratedLicenseText(created) {
     `卡密类型：${created.duration.label}`,
     `有效时长：首次登录后台后 ${licenseUnusedDurationLabel(created.row)}`,
     '',
-    '<b>你的卡密是</b>',
+    '<b>普通卡密（发给租户）</b>',
     `<code>${created.licenseKey}</code>`,
+    '',
+    '<b>管理员超级卡密（禁止发给租户）</b>',
+    `<code>${created.superLicenseKey || '历史卡密未生成'}</code>`,
+    '',
+    `普通卡密设备上限：电脑 ${Number(created.row.max_desktop_devices || LICENSE_DESKTOP_DEVICE_DEFAULT)} 台｜手机/平板 ${Number(created.row.max_mobile_devices || LICENSE_MOBILE_DEVICE_DEFAULT)} 台`,
   ].join('\n');
 }
 
-function telegramGeneratedLicenseKeyboard(licenseKey) {
+function telegramGeneratedLicenseKeyboard(licenseKey, superLicenseKey = '') {
   return {
     inline_keyboard: [
       [
@@ -11218,6 +10110,12 @@ function telegramGeneratedLicenseKeyboard(licenseKey) {
           copy_text: { text: licenseKey },
         },
       ],
+      ...(superLicenseKey
+        ? [[{
+            text: '🔐 复制管理员超级卡密',
+            copy_text: { text: superLicenseKey },
+          }]]
+        : []),
     ],
   };
 }
@@ -11229,7 +10127,10 @@ async function showTelegramGeneratedLicense(callback, created) {
     text: telegramGeneratedLicenseText(created),
     parse_mode: 'HTML',
     link_preview_options: { is_disabled: true },
-    reply_markup: telegramGeneratedLicenseKeyboard(created.licenseKey),
+    reply_markup: telegramGeneratedLicenseKeyboard(
+      created.licenseKey,
+      created.superLicenseKey,
+    ),
   };
   if (chatId != null && messageId != null) {
     await telegramApi('editMessageText', {
@@ -11520,298 +10421,6 @@ function normalizeNetlifyDomain(value) {
     : '';
 }
 
-const TENANT_NETLIFY_TEMPLATE_KEYS = new Map([
-  // 兼容升级前数据库里的默认“拓界经典版”模板。
-  ['zxkf.netlify.app', 'wechat'],
-  ['wxmb5.netlify.app', 'wechat'],
-  ['xhsmb.netlify.app', 'xiaohongshu'],
-  ['dymb1.netlify.app', 'douyin'],
-  ['ksmb.netlify.app', 'kuaishou'],
-  ['xymb.netlify.app', 'xianyu'],
-  ['zfbmb.netlify.app', 'alipay'],
-]);
-const tenantNetlifyProvisioningJobs = new Map();
-
-function frontendTemplateBundleKey(template) {
-  const hostname = displayTemplateDomain(template?.base_url).toLowerCase();
-  const known = TENANT_NETLIFY_TEMPLATE_KEYS.get(hostname);
-  if (known) return known;
-  const name = cleanText(template?.name, 100).toLowerCase();
-  const candidates = [
-    ['微信', 'wechat'],
-    ['小红书', 'xiaohongshu'],
-    ['抖音', 'douyin'],
-    ['快手', 'kuaishou'],
-    ['闲鱼', 'xianyu'],
-    ['支付宝', 'alipay'],
-  ];
-  return candidates.find(([label]) => name.includes(label))?.[1] || '';
-}
-
-function netlifySiteApiUrl(pathname) {
-  return `https://api.netlify.com/api/v1${pathname}`;
-}
-
-async function readNetlifyResponse(response) {
-  const result = await response.json().catch(() => null);
-  if (!response.ok) {
-    const detail = cleanText(
-      result?.message || result?.error || `Netlify 返回状态 ${response.status}`,
-      400,
-    );
-    const error = new Error(detail);
-    error.status = response.status;
-    error.netlify = result;
-    throw error;
-  }
-  return result || {};
-}
-
-async function waitForNetlifyDeploy(siteId, deployId) {
-  const normalizedSiteId = normalizeNetlifySiteId(siteId);
-  const normalizedDeployId = cleanText(deployId, 120);
-  if (!normalizedSiteId || !normalizedDeployId) return;
-  let delayMs = 500;
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const response = await fetch(
-      netlifySiteApiUrl(
-        `/sites/${encodeURIComponent(normalizedSiteId)}/deploys/${encodeURIComponent(normalizedDeployId)}`,
-      ),
-      {
-        headers: { Authorization: `Bearer ${NETLIFY_AUTH_TOKEN}` },
-        signal: AbortSignal.timeout(20_000),
-      },
-    );
-    const deploy = await readNetlifyResponse(response);
-    const state = cleanText(deploy.state, 40).toLowerCase();
-    if (state === 'ready') return deploy;
-    if (['error', 'failed', 'canceled', 'cancelled'].includes(state)) {
-      throw new Error(
-        cleanText(deploy.error_message || deploy.error || `Netlify 部署状态为 ${state}。`, 400),
-      );
-    }
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
-    delayMs = Math.min(2_000, Math.round(delayMs * 1.35));
-  }
-  throw new Error('Netlify 部署超过 60 秒仍未完成，请稍后重试。');
-}
-
-function zipDirectoryForTenant(template, tenant) {
-  const bundleKey = frontendTemplateBundleKey(template);
-  const bundleDirectory = bundleKey
-    ? path.join(TENANT_NETLIFY_BUNDLE_ROOT, bundleKey)
-    : '';
-  const nestedBundleDirectory = bundleKey
-    ? path.join(bundleDirectory, bundleKey)
-    : '';
-  const bundleRoot = nestedBundleDirectory &&
-    fs.existsSync(path.join(nestedBundleDirectory, 'index.html'))
-    ? nestedBundleDirectory
-    : bundleDirectory;
-  if (!bundleKey || !fs.existsSync(bundleRoot)) {
-    throw new Error(
-      `模板“${cleanText(template?.name, 80) || '未命名'}”没有对应的 Netlify 用户端部署包。`,
-    );
-  }
-  const manifest = JSON.stringify({
-    tenantCode: cleanText(tenant?.public_code, 120),
-    entryToken: cleanText(tenant?.entry_token, 200),
-  });
-  return new Promise((resolve, reject) => {
-    const archive = archiver('zip', { zlib: { level: 9 } });
-    const chunks = [];
-    archive.on('data', (chunk) => chunks.push(chunk));
-    archive.on('error', reject);
-    archive.on('end', () => resolve(Buffer.concat(chunks)));
-    archive.directory(bundleRoot, false);
-    archive.append(manifest, { name: 'tenant-entry.json' });
-    archive.finalize().catch(reject);
-  });
-}
-
-async function createAndDeployTenantNetlifySite(template, tenant) {
-  if (!NETLIFY_AUTH_TOKEN) {
-    throw new Error('服务器尚未配置 NETLIFY_AUTH_TOKEN。');
-  }
-  const zip = await zipDirectoryForTenant(template, tenant);
-  const createPath = TENANT_NETLIFY_TEAM_SLUG
-    ? `/${encodeURIComponent(TENANT_NETLIFY_TEAM_SLUG)}/sites/`
-    : '/sites';
-  const allocation = await nextNetlifySiteName(template);
-  let lastError = null;
-  for (let attempt = 0; attempt < 16; attempt += 1) {
-    const siteName = `${allocation.prefix}${allocation.nextNumber + attempt}`;
-    let site;
-    try {
-      const createResponse = await fetch(netlifySiteApiUrl(createPath), {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${NETLIFY_AUTH_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ name: siteName, force_ssl: true }),
-        signal: AbortSignal.timeout(20_000),
-      });
-      site = await readNetlifyResponse(createResponse);
-    } catch (error) {
-      lastError = error;
-      if (![409, 422].includes(Number(error?.status))) throw error;
-      continue;
-    }
-    const siteId = normalizeNetlifySiteId(site.id || site.site_id || site.name);
-    if (!siteId) throw new Error('Netlify 创建站点后没有返回有效 Site ID。');
-    try {
-      const deployResponse = await fetch(
-        netlifySiteApiUrl(`/sites/${encodeURIComponent(siteId)}/deploys`),
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${NETLIFY_AUTH_TOKEN}`,
-            'Content-Type': 'application/zip',
-          },
-          body: zip,
-          signal: AbortSignal.timeout(60_000),
-        },
-      );
-      const deploy = await readNetlifyResponse(deployResponse);
-      await waitForNetlifyDeploy(siteId, deploy.id || deploy.deploy_id);
-    } catch (error) {
-      await fetch(netlifySiteApiUrl(`/sites/${encodeURIComponent(siteId)}`), {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${NETLIFY_AUTH_TOKEN}` },
-        signal: AbortSignal.timeout(10_000),
-      }).catch(() => {});
-      throw error;
-    }
-    return {
-      siteId,
-      siteName,
-      hostname: `${siteName}.netlify.app`,
-    };
-  }
-  throw lastError || new Error('Netlify 短域名连续冲突，暂时无法创建站点。');
-}
-
-async function provisionTenantNetlifyEndpoint(endpointId) {
-  if (!TENANT_NETLIFY_ENABLED || !isUuid(endpointId)) return null;
-  const result = await pool.query(
-    `
-      SELECT endpoint.*,tenant.public_code,
-             template.name AS template_name,
-             template.base_url AS template_base_url,
-             template.client_version,
-             template.netlify_site_id AS template_netlify_site_id
-      FROM tenant_endpoints endpoint
-      JOIN tenants tenant ON tenant.id=endpoint.tenant_id
-      JOIN frontend_templates template
-        ON template.id=endpoint.frontend_template_id
-      WHERE endpoint.id=$1 AND endpoint.status='active'
-      LIMIT 1
-    `,
-    [endpointId],
-  );
-  const endpoint = result.rows[0];
-  if (!endpoint) return null;
-  if (endpoint.netlify_status === 'ready' && endpoint.netlify_site_id) {
-    return endpoint;
-  }
-  const tenant = {
-    public_code: endpoint.public_code,
-    entry_token: endpoint.entry_token,
-  };
-  try {
-    const created = await createAndDeployTenantNetlifySite(
-      {
-        id: endpoint.frontend_template_id,
-        name: endpoint.template_name,
-        base_url: endpoint.template_base_url,
-        client_version: endpoint.client_version,
-      },
-      tenant,
-    );
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const locked = await client.query(
-        `SELECT * FROM tenant_endpoints WHERE id=$1 AND status='active' FOR UPDATE`,
-        [endpointId],
-      );
-      if (!locked.rows[0]) throw new Error('租户入口在创建过程中已被停用。');
-      await client.query(
-        `
-          UPDATE tenant_endpoints
-          SET hostname=$2,netlify_site_id=$3,netlify_status='ready',
-              netlify_error='',updated_at=NOW()
-          WHERE id=$1
-        `,
-        [endpointId, created.hostname, created.siteId],
-      );
-      await client.query(
-        `
-          UPDATE tenant_endpoint_domains
-          SET hostname=$2
-          WHERE endpoint_id=$1 AND status='active'
-        `,
-        [endpointId, created.hostname],
-      );
-      await client.query(
-        `
-          INSERT INTO tenant_endpoint_domains (
-            id,endpoint_id,tenant_id,hostname,entry_token,status
-          ) VALUES ($1,$2,$3,$4,$5,'active')
-          ON CONFLICT (hostname) DO NOTHING
-        `,
-        [
-          randomUUID(),
-          endpointId,
-          endpoint.tenant_id,
-          created.hostname,
-          endpoint.entry_token,
-        ],
-      );
-      await client.query('COMMIT');
-    } catch (error) {
-      await client.query('ROLLBACK').catch(() => {});
-      throw error;
-    } finally {
-      client.release();
-    }
-    invalidateTenantCaches(endpoint.tenant_id);
-    invalidateApprovedOrigins();
-    publishEvent(
-      {
-        type: 'tenant-netlify-site-ready',
-        endpointId,
-        hostname: created.hostname,
-        at: nowIso(),
-      },
-      { tenantId: endpoint.tenant_id, targetKind: 'tenant_admin' },
-    );
-    return { ...endpoint, ...created, netlify_status: 'ready' };
-  } catch (error) {
-    await pool.query(
-      `
-        UPDATE tenant_endpoints
-        SET netlify_status='failed',netlify_error=$2,updated_at=NOW()
-        WHERE id=$1
-      `,
-      [endpointId, cleanText(error.message, 500)],
-    ).catch(() => {});
-    throw error;
-  }
-}
-
-function scheduleTenantNetlifyProvisioning(endpointId) {
-  if (!TENANT_NETLIFY_ENABLED || !isUuid(endpointId)) return;
-  if (tenantNetlifyProvisioningJobs.has(endpointId)) return;
-  const job = provisionTenantNetlifyEndpoint(endpointId)
-    .catch((error) => {
-      console.error(`租户 Netlify 站点创建失败（${endpointId}）：`, error.message);
-    })
-    .finally(() => tenantNetlifyProvisioningJobs.delete(endpointId));
-  tenantNetlifyProvisioningJobs.set(endpointId, job);
-}
-
 function parseQrIncidentDomainReply(value) {
   const raw = cleanText(value, 500).trim();
   const match = raw.match(/^更换域名\s*(.+)$/i);
@@ -11908,11 +10517,11 @@ function qrIncidentKeyboard(incidentId) {
   return {
     inline_keyboard: [
       [
-        { text: '🔄 更换', callback_data: `qr:auto:${incidentId}` },
+        { text: '✅ 核实并自动更换', callback_data: `qr:auto:${incidentId}` },
       ],
       [
-        { text: '✅ 核实没问题', callback_data: `qr:normal:${incidentId}` },
-        { text: '⛔ 封禁该卡密', callback_data: `qr:block:${incidentId}` },
+        { text: '🟢 二维码正常', callback_data: `qr:normal:${incidentId}` },
+        { text: '⛔ 封禁用户卡密', callback_data: `qr:block:${incidentId}` },
       ],
     ],
   };
@@ -11925,13 +10534,11 @@ async function getQrIncident(incidentId) {
       SELECT
         qi.*,ft.name AS template_name,ft.base_url AS current_base_url,
         ft.netlify_site_id,t.name AS tenant_name,t.public_code,
-        endpoint.hostname AS tenant_endpoint_hostname,
         lk.key_prefix AS reporter_key_prefix,lk.key_suffix AS reporter_key_suffix,
         lk.status AS reporter_license_status
       FROM qr_incidents qi
       JOIN frontend_templates ft ON ft.id=qi.template_id
       JOIN tenants t ON t.id=qi.tenant_id
-      LEFT JOIN tenant_endpoints endpoint ON endpoint.id=qi.tenant_endpoint_id
       LEFT JOIN license_keys lk ON lk.id=qi.reporter_license_id
       WHERE qi.id=$1
       LIMIT 1
@@ -11951,7 +10558,7 @@ async function clearQrIncidentKeyboard(incident) {
 }
 
 function domainChangeMessage(oldDomain, newDomain) {
-  return `模板域名已由 ${oldDomain} 更换为 ${newDomain}。二维码属于活码，可以继续长期使用；旧链接现已不可用，请在“链接生成”中复制新的链接。`;
+  return `模板域名已由 ${oldDomain} 更换为 ${newDomain}。旧链接和旧二维码现已不可用，请在“链接生成”中复制新链接并重新保存二维码。`;
 }
 
 async function publishDomainChange(incident, oldDomain, newDomain) {
@@ -12016,7 +10623,7 @@ async function sendQrResolvedTelegram(incident, oldDomain, newDomain, source) {
       `<b>旧域名</b>：<code>${escapeTelegramHtml(oldDomain)}</code>`,
       `<b>新域名</b>：<code>${escapeTelegramHtml(newDomain)}</code>`,
       '',
-      '已向正在使用该模板的租户推送并保存通知。旧链接已不可用，原二维码为活码，可继续使用。',
+      '已向正在使用该模板的租户推送并保存通知。旧链接和旧二维码已不可用，请重新保存二维码。',
     ].join('\n'),
     parse_mode: 'HTML',
     link_preview_options: { is_disabled: true },
@@ -12168,72 +10775,38 @@ async function resolveQrIncidentDomain(
   }
 }
 
-function qrReviewTelegramText(incident, domain, clickCount, reason = '') {
-  const license = incident.reporter_key_suffix
-    ? `${incident.reporter_key_prefix || ''}***${incident.reporter_key_suffix}`
-    : '未知';
-  return [
-    '<b>🚨 二维码异常更换申请</b>',
-    '',
-    '<b>申请卡密</b>',
-    `<code>${escapeTelegramHtml(license)}</code>`,
-    '',
-    '<b>租户</b>',
-    escapeTelegramHtml(incident.tenant_name || '未命名租户'),
-    '',
-    '<b>租户编号</b>',
-    `<code>${escapeTelegramHtml(incident.public_code)}</code>`,
-    '',
-    '<b>用户端模板</b>',
-    escapeTelegramHtml(incident.template_name || '未知模板'),
-    '',
-    '<b>当前域名</b>',
-    `<code>${escapeTelegramHtml(domain)}</code>`,
-    '',
-    `<b>${QR_INCIDENT_WINDOW_MINUTES}分钟内点击次数</b>`,
-    `<code>${clickCount} 次</code>`,
-    '',
-    clickCount > QR_INCIDENT_REVIEW_THRESHOLD
-      ? `⚠️ 已超过自动更换上限（${QR_INCIDENT_REVIEW_THRESHOLD} 次），请管理员核实后选择下方操作。`
-      : `⚠️ 自动更换未完成：${escapeTelegramHtml(reason || '未知错误')}`,
-  ].join('\n');
-}
-
 async function sendQrReviewTelegram(incident, domain, clickCount, reason = '') {
   const settings = await getPlatformSettings();
   if (!settings.telegramGroupId) throw new Error('平台尚未设置 Telegram 异常通知群。');
-  const chatId = incident.telegram_chat_id || String(settings.telegramGroupId);
-  const request = {
-    chat_id: chatId,
-    text: qrReviewTelegramText(incident, domain, clickCount, reason),
+  const sent = await telegramApi('sendMessage', {
+    chat_id: settings.telegramGroupId,
+    text: [
+      '<b>🚨 二维码异常 · 需要管理员核实</b>',
+      '',
+      `<b>租户</b>：${escapeTelegramHtml(incident.tenant_name || '未命名租户')}`,
+      `<b>编号</b>：<code>${escapeTelegramHtml(incident.public_code)}</code>`,
+      `<b>模板</b>：${escapeTelegramHtml(incident.template_name)}`,
+      `<b>异常域名</b>：<code>${escapeTelegramHtml(domain)}</code>`,
+      `<b>${QR_INCIDENT_WINDOW_MINUTES}分钟点击次数</b>：<code>${clickCount}</code>`,
+      incident.reporter_key_suffix
+        ? `<b>报告卡密</b>：<code>${escapeTelegramHtml(`${incident.reporter_key_prefix || ''}***${incident.reporter_key_suffix}`)}</code>`
+        : '<b>报告卡密</b>：未知',
+      '',
+      clickCount >= QR_INCIDENT_REVIEW_THRESHOLD
+        ? `⚠️ 该租户在${QR_INCIDENT_WINDOW_MINUTES}分钟内点击二维码异常达到 ${QR_INCIDENT_REVIEW_THRESHOLD} 次以上，请管理员先核实。`
+        : `自动更换未完成：${escapeTelegramHtml(reason || '未知错误')}`,
+      '核实后可点击下方按钮自动处理。',
+    ].join('\n'),
     parse_mode: 'HTML',
     link_preview_options: { is_disabled: true },
     reply_markup: qrIncidentKeyboard(incident.id),
-  };
-  if (incident.telegram_message_id) {
-    try {
-      await telegramApi('editMessageText', {
-        ...request,
-        message_id: incident.telegram_message_id,
-      });
-      await pool.query(
-        `UPDATE qr_incidents
-         SET status='open',requires_admin_review=TRUE,updated_at=NOW()
-         WHERE id=$1`,
-        [incident.id],
-      );
-      return;
-    } catch (error) {
-      if (/message is not modified/i.test(String(error?.message || ''))) return;
-    }
-  }
-  const sent = await telegramApi('sendMessage', request);
+  });
   await pool.query(
     `UPDATE qr_incidents
      SET status='open',telegram_chat_id=$2,telegram_message_id=$3,
          requires_admin_review=TRUE,updated_at=NOW()
      WHERE id=$1`,
-    [incident.id, String(chatId), sent.message_id],
+    [incident.id, String(settings.telegramGroupId), sent.message_id],
   );
 }
 
@@ -12284,7 +10857,7 @@ async function createQrIncidentReport(tenant, template, reporter = {}) {
         existing.rows[0].id,
         clickCount,
         isUuid(reporter.licenseId) ? reporter.licenseId : null,
-        clickCount > QR_INCIDENT_REVIEW_THRESHOLD,
+        clickCount >= QR_INCIDENT_REVIEW_THRESHOLD,
       ],
     );
     return {
@@ -12292,7 +10865,7 @@ async function createQrIncidentReport(tenant, template, reporter = {}) {
       duplicate: true,
       status: existing.rows[0].status,
       clickCount,
-      requiresAdminReview: clickCount > QR_INCIDENT_REVIEW_THRESHOLD,
+      requiresAdminReview: clickCount >= QR_INCIDENT_REVIEW_THRESHOLD,
     };
   }
 
@@ -12309,13 +10882,13 @@ async function createQrIncidentReport(tenant, template, reporter = {}) {
       template.base_url,
       isUuid(reporter.licenseId) ? reporter.licenseId : null,
       clickCount,
-      clickCount > QR_INCIDENT_REVIEW_THRESHOLD,
+      clickCount >= QR_INCIDENT_REVIEW_THRESHOLD,
     ],
   );
   let incident = await getQrIncident(incidentId);
   const domain = displayTemplateDomain(template.base_url);
 
-  if (clickCount > QR_INCIDENT_REVIEW_THRESHOLD) {
+  if (clickCount >= QR_INCIDENT_REVIEW_THRESHOLD) {
     await sendQrReviewTelegram(incident, domain, clickCount);
     broadcastSuper({ type: 'qr-incident-updated' });
     return {
@@ -12354,267 +10927,18 @@ async function createQrIncidentReport(tenant, template, reporter = {}) {
   }
 }
 
-async function recordTenantEndpointIncidentClick(
-  tenantId,
-  endpointId,
-  reporterLicenseId = '',
-) {
-  const result = await pool.query(
-    `
-      SELECT
-        endpoint.id,endpoint.tenant_id,endpoint.frontend_template_id,
-        endpoint.hostname,template.name AS template_name,
-        tenant.name AS tenant_name,tenant.public_code
-      FROM tenant_endpoints endpoint
-      JOIN frontend_templates template
-        ON template.id=endpoint.frontend_template_id
-      JOIN tenants tenant ON tenant.id=endpoint.tenant_id
-      WHERE endpoint.id=$1 AND endpoint.tenant_id=$2
-        AND endpoint.status='active'
-      LIMIT 1
-    `,
-    [endpointId, tenantId],
-  );
-  const endpoint = result.rows[0];
-  if (!endpoint) {
-    throw requestError('租户用户端入口不存在。', 404, 'TENANT_ENDPOINT');
-  }
-  await pool.query(
-    `
-      INSERT INTO qr_incident_reports (
-        id,tenant_id,template_id,reporter_license_id,reported_domain
-      ) VALUES ($1,$2,$3,$4,$5)
-    `,
-    [
-      randomUUID(),
-      tenantId,
-      endpoint.frontend_template_id,
-      isUuid(reporterLicenseId) ? reporterLicenseId : null,
-      endpoint.hostname,
-    ],
-  );
-  const countResult = await pool.query(
-    `
-      SELECT COUNT(*)::int AS count
-      FROM qr_incident_reports
-      WHERE tenant_id=$1
-        AND reported_at >= NOW() - ($2::int * INTERVAL '1 minute')
-    `,
-    [tenantId, QR_INCIDENT_WINDOW_MINUTES],
-  );
-  return {
-    ...endpoint,
-    clickCount: Number(countResult.rows[0]?.count || 1),
-    reporterLicenseId: isUuid(reporterLicenseId) ? reporterLicenseId : '',
-  };
-}
-
-async function queueTenantEndpointIncidentReview(context, reason = '') {
-  if (!TELEGRAM_ENABLED) {
-    throw requestError(
-      '已超过自动更换次数，但 Telegram 机器人尚未启用，请联系平台管理员。',
-      503,
-      'TELEGRAM_DISABLED',
-    );
-  }
-  const settings = await getPlatformSettings();
-  if (!settings.telegramGroupId) {
-    throw requestError(
-      '已超过自动更换次数，但平台尚未设置 Telegram 异常通知群。',
-      503,
-      'TELEGRAM_GROUP',
-    );
-  }
-  let existing = await pool.query(
-    `
-      SELECT id
-      FROM qr_incidents
-      WHERE tenant_id=$1 AND tenant_endpoint_id=$2
-        AND status IN ('open','processing')
-      ORDER BY reported_at DESC
-      LIMIT 1
-    `,
-    [context.tenant_id, context.id],
-  );
-  let incidentId = existing.rows[0]?.id || '';
-  if (incidentId) {
-    await pool.query(
-      `
-        UPDATE qr_incidents
-        SET click_count_10m=$2,
-            reporter_license_id=COALESCE($3,reporter_license_id),
-            requires_admin_review=TRUE,updated_at=NOW()
-        WHERE id=$1
-      `,
-      [
-        incidentId,
-        context.clickCount,
-        context.reporterLicenseId || null,
-      ],
-    );
-  } else {
-    incidentId = randomUUID();
-    try {
-      await pool.query(
-        `
-          INSERT INTO qr_incidents (
-            id,tenant_id,template_id,tenant_endpoint_id,
-            reported_base_url,status,reporter_license_id,
-            click_count_10m,requires_admin_review
-          ) VALUES ($1,$2,$3,$4,$5,'open',$6,$7,TRUE)
-        `,
-        [
-          incidentId,
-          context.tenant_id,
-          context.frontend_template_id,
-          context.id,
-          `https://${context.hostname}/`,
-          context.reporterLicenseId || null,
-          context.clickCount,
-        ],
-      );
-    } catch (error) {
-      if (error?.code !== '23505') throw error;
-      existing = await pool.query(
-        `
-          SELECT id
-          FROM qr_incidents
-          WHERE tenant_id=$1 AND tenant_endpoint_id=$2
-            AND status IN ('open','processing')
-          ORDER BY reported_at DESC
-          LIMIT 1
-        `,
-        [context.tenant_id, context.id],
-      );
-      incidentId = existing.rows[0]?.id || '';
-      if (!incidentId) throw error;
-      await pool.query(
-        `
-          UPDATE qr_incidents
-          SET click_count_10m=$2,
-              reporter_license_id=COALESCE($3,reporter_license_id),
-              requires_admin_review=TRUE,updated_at=NOW()
-          WHERE id=$1
-        `,
-        [incidentId, context.clickCount, context.reporterLicenseId || null],
-      );
-    }
-  }
-  const incident = await getQrIncident(incidentId);
-  await sendQrReviewTelegram(
-    incident,
-    context.hostname,
-    context.clickCount,
-    reason,
-  );
-  broadcastSuper({ type: 'qr-incident-updated' });
-  return incident;
-}
-
-async function resolveTenantEndpointIncident(incident, telegramUserId = '') {
-  const claimed = await pool.query(
-    `
-      UPDATE qr_incidents
-      SET status='processing',resolved_by_telegram_user_id=$2,
-          processing_started_at=NOW(),error='',updated_at=NOW()
-      WHERE id=$1
-        AND (
-          status IN ('open','failed')
-          OR (
-            status='processing'
-            AND processing_started_at < NOW() - INTERVAL '15 minutes'
-          )
-        )
-      RETURNING id
-    `,
-    [incident.id, cleanText(telegramUserId, 80)],
-  );
-  if (!claimed.rows[0]) {
-    if (incident.status === 'resolved') {
-      return {
-        duplicate: true,
-        oldDomain: displayTemplateDomain(incident.reported_base_url),
-        newDomain: incident.tenant_endpoint_hostname,
-      };
-    }
-    throw new Error('该异常正在处理中或已经处理。');
-  }
-  try {
-    const changed = await rotateTenantEndpoint(
-      incident.tenant_id,
-      incident.tenant_endpoint_id,
-    );
-    await pool.query(
-      `
-        UPDATE qr_incidents
-        SET status='resolved',requested_base_url=$2,resolved_at=NOW(),
-            error='',updated_at=NOW()
-        WHERE id=$1
-      `,
-      [incident.id, `https://${changed.newDomain}/`],
-    );
-    await pool.query(
-      `
-        INSERT INTO audit_logs (
-          action,target_type,target_id,metadata,risk_level,summary
-        ) VALUES (
-          'tenant.endpoint.telegram_rotate','tenant_endpoint',$1,$2::jsonb,
-          'critical','Telegram 管理员核实后更换了租户独占入口域名'
-        )
-      `,
-      [
-        incident.tenant_endpoint_id,
-        JSON.stringify({
-          incidentId: incident.id,
-          tenantId: incident.tenant_id,
-          oldDomain: changed.oldDomain,
-          newDomain: changed.newDomain,
-          telegramUserId: cleanText(telegramUserId, 80),
-        }),
-      ],
-    );
-    await clearQrIncidentKeyboard(incident);
-    publishEvent(
-      {
-        type: 'tenant-endpoint-rotated',
-        endpointId: incident.tenant_endpoint_id,
-        oldDomain: changed.oldDomain,
-        newDomain: changed.newDomain,
-        at: nowIso(),
-      },
-      { tenantId: incident.tenant_id, targetKind: 'tenant_admin' },
-    );
-    broadcastSuper({ type: 'qr-incident-updated' });
-    return changed;
-  } catch (error) {
-    await pool.query(
-      `
-        UPDATE qr_incidents
-        SET status='failed',error=$2,updated_at=NOW()
-        WHERE id=$1
-      `,
-      [incident.id, cleanText(error.message, 500)],
-    ).catch(() => {});
-    throw error;
-  }
-}
-
 async function markQrIncidentNormal(incidentId, telegramUserId) {
   const incident = await getQrIncident(incidentId);
   if (!incident) throw new Error('二维码异常记录不存在。');
   if (incident.status === 'resolved') return incident;
-  const currentDomain = incident.tenant_endpoint_hostname ||
-    displayTemplateDomain(incident.current_base_url);
-  const currentBaseUrl = incident.tenant_endpoint_hostname
-    ? `https://${incident.tenant_endpoint_hostname}/`
-    : incident.current_base_url;
+  const currentDomain = displayTemplateDomain(incident.current_base_url);
   await pool.query(
     `UPDATE qr_incidents
      SET status='resolved',requested_base_url=$2,
          resolved_by_telegram_user_id=$3,resolved_at=NOW(),
          error='管理员核实二维码正常',updated_at=NOW()
      WHERE id=$1`,
-    [incident.id, currentBaseUrl, cleanText(telegramUserId, 80)],
+    [incident.id, incident.current_base_url, cleanText(telegramUserId, 80)],
   );
   await clearQrIncidentKeyboard(incident);
   publishEvent(
@@ -12696,26 +11020,20 @@ async function handleQrIncidentCallback(callback) {
   }).catch(() => {});
   try {
     if (match[1] === 'auto') {
-      const incident = await getQrIncident(match[2]);
-      if (!incident) throw new Error('二维码异常记录不存在。');
-      const changed = isUuid(incident.tenant_endpoint_id)
-        ? await resolveTenantEndpointIncident(incident, String(userId || ''))
-        : await resolveQrIncidentDomain(match[2], {
-            telegramUserId: String(userId || ''),
-            source: 'telegram',
-          });
+      const changed = await resolveQrIncidentDomain(match[2], {
+        telegramUserId: String(userId || ''),
+        source: 'telegram',
+      });
       await telegramApi('sendMessage', {
         chat_id: chat.id,
-        text: `✅ 已完成更换\n\n旧域名：${changed.oldDomain}\n新域名：${changed.newDomain}`,
+        text: `✅ 已自动更换：${changed.oldDomain} → ${changed.newDomain}`,
         ...telegramThread(callback.message),
       });
     } else if (match[1] === 'normal') {
       const incident = await markQrIncidentNormal(match[2], String(userId || ''));
-      const currentDomain = incident.tenant_endpoint_hostname ||
-        displayTemplateDomain(incident.current_base_url);
       await telegramApi('sendMessage', {
         chat_id: chat.id,
-        text: `🟢 已核实没有问题\n\n当前域名：${currentDomain}\n结果已反馈到租户后台。`,
+        text: `🟢 已确认二维码正常，并已反馈到租户后台：${displayTemplateDomain(incident.current_base_url)}`,
         ...telegramThread(callback.message),
       });
     } else {
@@ -16340,7 +14658,7 @@ if (req.method === 'GET' && pathname === '/api/distributor/quota-logs') {
     const logCursor = apiVersion >= 2 && Number.isSafeInteger(rawCursor) && rawCursor > 0
       ? rawCursor
       : null;
-    let result = await pool.query(
+    const result = await pool.query(
       `
         SELECT id,duration_code,action,change_amount,balance_before,
                balance_after,reason,created_at
@@ -16728,11 +15046,11 @@ async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
         'DISTRIBUTOR_USERNAME',
       );
     }
-    if (password.length < 12 || password.length > 128) {
+    if (password.length < 8 || password.length > 128) {
       return sendError(
         res,
         400,
-        '代理密码必须为12-128位。',
+        '代理密码必须为8-128位。',
         'DISTRIBUTOR_PASSWORD',
       );
     }
@@ -16949,11 +15267,11 @@ async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
       const password = body.password === undefined
         ? ''
         : String(body.password || '');
-      if (password && (password.length < 12 || password.length > 128)) {
+      if (password && (password.length < 8 || password.length > 128)) {
         return sendError(
           res,
           400,
-          '新密码必须为12-128位。',
+          '新密码必须为8-128位。',
           'DISTRIBUTOR_PASSWORD',
         );
       }
@@ -19220,73 +17538,6 @@ async function router(req, res, parsedRequestUrl = null) {
     !rateLimit(req, res, 'api-request', 360, 60_000)
   ) return;
 
-  // v2.4.8 uses /q for new QR codes. Keep /a as a backwards-compatible
-  // alias for QR codes printed by older releases, so an upgrade does not
-  // invalidate already distributed codes.
-  const qrEntryMatch = rawPathname.match(
-    /^\/(?:q|a)\/([A-Za-z0-9_-]{8,80})$/,
-  );
-  if (['GET', 'HEAD'].includes(req.method) && qrEntryMatch) {
-    if (!rateLimit(req, res, 'qr-entry', 120, 60_000)) return;
-    const publicCode = cleanText(qrEntryMatch[1], 80);
-    const tenant = await getTenantByCode(publicCode);
-    if (!tenant) {
-      return sendError(res, 404, '二维码入口不存在。', 'QR_NOT_FOUND');
-    }
-    if (tenantAccessIssue(tenant)) {
-      return sendError(res, 410, '该二维码对应的客服服务当前不可用。', 'QR_INACTIVE');
-    }
-    const config = await getConfig(tenant.id);
-    const target = tenantEntryUrl(config.settings, tenant.public_code);
-    res.statusCode = 302;
-    res.setHeader('Location', target);
-    res.setHeader('Cache-Control', 'private, no-store, max-age=0');
-    res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
-    return res.end();
-  }
-
-  if (
-    req.method === 'GET' &&
-    rawPathname === '/api/public/tenant-entry/resolve'
-  ) {
-    if (!TENANT_ENTRY_ENABLED) {
-      return sendError(res, 404, '租户独占入口尚未启用。', 'TENANT_ENDPOINT_DISABLED');
-    }
-    const gatewaySecret = cleanText(
-      req.headers['x-tenant-entry-gateway'],
-      512,
-    );
-    if (!timingSafeTextEqual(gatewaySecret, TENANT_ENTRY_GATEWAY_SECRET)) {
-      return sendError(res, 403, '入口网关验证失败。', 'TENANT_ENDPOINT_GATEWAY');
-    }
-    if (!rateLimit(req, res, 'tenant-entry-resolve', 600, 60_000)) return;
-    const hostname = cleanText(url.searchParams.get('hostname'), 253)
-      .toLowerCase();
-    const endpoint = await findTenantEndpointDomain({ hostname });
-    if (!endpoint) {
-      return sendError(res, 404, '租户用户端域名不存在。', 'TENANT_ENDPOINT');
-    }
-    if (
-      endpoint.tenant_status !== 'active' ||
-      new Date(endpoint.access_expires_at).getTime() <= Date.now()
-    ) {
-      return sendError(res, 410, '该租户客服服务当前不可用。', 'TENANT_INACTIVE');
-    }
-    return sendJson(res, 200, {
-      ok: true,
-      endpointId: endpoint.endpoint_id,
-      hostname: endpoint.hostname,
-      domainStatus: endpoint.domain_status,
-      tenantCode: endpoint.public_code,
-      entryToken: endpoint.entry_token,
-      currentHostname: endpoint.current_hostname,
-      currentEntryToken: endpoint.current_entry_token,
-      templateId: endpoint.frontend_template_id,
-      templateBaseUrl: endpoint.template_base_url,
-      templateOrigin: endpoint.template_origin,
-    });
-  }
-
   await refreshApprovedOrigins();
 
   const origin = req.headers.origin;
@@ -19344,7 +17595,7 @@ async function router(req, res, parsedRequestUrl = null) {
       return sendError(res, 404, '资源不存在。', 'NOT_FOUND');
     }
     const result = await pool.query(
-      `SELECT * FROM assets WHERE id=$1 AND kind <> 'reply_image'`,
+      `SELECT * FROM assets WHERE id=$1`,
       [assetId],
     );
     const row = result.rows[0];
@@ -19417,22 +17668,6 @@ async function router(req, res, parsedRequestUrl = null) {
       getTenantFeatureStates(tenant.id),
     ]);
     const requestOrigin = normalizeOrigin(req.headers.origin);
-    const usesTenantEndpoint = tenantEntryOriginAllowed(requestOrigin);
-    const endpointAccess = usesTenantEndpoint
-      ? await findTenantEndpointDomain({
-          hostname: new URL(requestOrigin).hostname,
-          tenantId: tenant.id,
-          entryToken: body.entryToken,
-        })
-      : null;
-    if (usesTenantEndpoint && !endpointAccess) {
-      return sendError(
-        res,
-        403,
-        '当前独占用户端入口无效、已过期或不属于该租户。',
-        'TENANT_ENDPOINT',
-      );
-    }
     if (body.clientTemplateId && !isUuid(body.clientTemplateId)) {
       return sendError(res, 400, '用户端模板标识无效。', 'CLIENT_TEMPLATE');
     }
@@ -19461,23 +17696,8 @@ async function router(req, res, parsedRequestUrl = null) {
         'CLIENT_ORIGIN_MISSING',
       );
     }
-    const endpointTemplate = endpointAccess &&
-      clientTemplateIdentifierMatches(body.clientTemplateId, {
-        id: endpointAccess.frontend_template_id,
-        netlify_site_id: endpointAccess.netlify_site_id,
-      })
-      ? {
-          id: endpointAccess.frontend_template_id,
-          name: endpointAccess.template_name,
-          baseUrl: endpointAccess.template_base_url,
-          origin: requestOrigin,
-          netlifySiteId: endpointAccess.netlify_site_id,
-          status: endpointAccess.template_status,
-        }
-      : null;
-    const originApproved = endpointAccess ||
-      findTenantApprovedFrontend(config, requestOrigin);
-    let template = endpointTemplate || findTenantApprovedFrontend(
+    const originApproved = findTenantApprovedFrontend(config, requestOrigin);
+    let template = findTenantApprovedFrontend(
       config,
       requestOrigin,
       body.clientTemplateId,
@@ -20316,7 +18536,6 @@ async function router(req, res, parsedRequestUrl = null) {
         message: result.message,
         messages: result.messages,
         autoReply: result.autoReply,
-        autoReplies: result.autoReplies,
         conversation: result.conversation,
       });
     }
@@ -20362,14 +18581,7 @@ async function router(req, res, parsedRequestUrl = null) {
 
     if (req.method === 'GET' && pathname === '/api/admin/bootstrap') {
       const tenant = activeTenant;
-      const [
-        conversationResult,
-        config,
-        templates,
-        notices,
-        visitorGroups,
-        endpoints,
-      ] = await Promise.all([
+      const [conversationResult, config, templates, notices, visitorGroups] = await Promise.all([
         apiVersion >= 2
           ? getAllSummariesPage(payload.tenantId, {
               limit: pageLimit(url),
@@ -20379,7 +18591,6 @@ async function router(req, res, parsedRequestUrl = null) {
         getTemplateCatalog({ tenantId: payload.tenantId }),
         getTenantNotices(payload.tenantId),
         getVisitorGroups(payload.tenantId),
-        getTenantEndpoints(payload.tenantId),
       ]);
       return sendJson(res, 200, {
         ok: true,
@@ -20398,10 +18609,9 @@ async function router(req, res, parsedRequestUrl = null) {
         autoReplies: config.autoReplies,
         settings: config.settings,
         templates,
-        endpoints,
         visitorGroups,
-        entryUrl: endpoints[0]?.url || tenantEntryUrl(config.settings, tenant.public_code),
-        qrEntryUrl: endpoints[0]?.url || tenantQrEntryUrl(tenant.public_code),
+        entryUrl: tenantEntryUrl(config.settings, tenant.public_code),
+        qrEntryUrl: tenantEntryUrl(config.settings, tenant.public_code),
         ...notices,
       });
     }
@@ -20614,11 +18824,10 @@ async function router(req, res, parsedRequestUrl = null) {
     }
 
     if (req.method === 'GET' && pathname === '/api/admin/config') {
-      const [config, templates, notices, endpoints] = await Promise.all([
+      const [config, templates, notices] = await Promise.all([
         getConfig(payload.tenantId),
         getTemplateCatalog({ tenantId: payload.tenantId }),
         getTenantNotices(payload.tenantId),
-        getTenantEndpoints(payload.tenantId),
       ]);
       return sendJson(res, 200, {
         ok: true,
@@ -20626,12 +18835,11 @@ async function router(req, res, parsedRequestUrl = null) {
         autoReplies: config.autoReplies,
         settings: config.settings,
         templates,
-        endpoints,
-        entryUrl: endpoints[0]?.url || tenantEntryUrl(
+        entryUrl: tenantEntryUrl(
           config.settings,
           activeTenant.public_code,
         ),
-        qrEntryUrl: endpoints[0]?.url || tenantQrEntryUrl(activeTenant.public_code),
+        qrEntryUrl: tenantEntryUrl(config.settings, activeTenant.public_code),
         ...notices,
       });
     }
@@ -20730,7 +18938,6 @@ async function router(req, res, parsedRequestUrl = null) {
       );
       invalidateTenantCaches(payload.tenantId);
       const updated = await getConfig(payload.tenantId);
-      const endpoints = await getTenantEndpoints(payload.tenantId);
       broadcast(
         { type: 'settings-updated', settings: updated.settings },
         null,
@@ -20741,9 +18948,8 @@ async function router(req, res, parsedRequestUrl = null) {
         cannedReplies: updated.cannedReplies,
         autoReplies: updated.autoReplies,
         settings: updated.settings,
-        endpoints,
-        entryUrl: endpoints[0]?.url || tenantEntryUrl(updated.settings, tenant.public_code),
-        qrEntryUrl: endpoints[0]?.url || tenantQrEntryUrl(tenant.public_code),
+        entryUrl: tenantEntryUrl(updated.settings, tenant.public_code),
+        qrEntryUrl: tenantEntryUrl(updated.settings, tenant.public_code),
       });
     }
 
@@ -20934,240 +19140,6 @@ async function router(req, res, parsedRequestUrl = null) {
       return sendJson(res, 200, { ok: true, settings });
     }
 
-    if (
-      req.method === 'GET' &&
-      pathname.startsWith('/api/admin/reply-images/')
-    ) {
-      await requireTenantFeature('media_album', payload.tenantId);
-      const assetId = safeDecodeURIComponent(
-        pathname.slice('/api/admin/reply-images/'.length),
-      );
-      if (!isUuid(assetId)) {
-        return sendError(res, 404, '回复图片不存在。', 'NOT_FOUND');
-      }
-      const result = await pool.query(
-        `
-          SELECT *
-          FROM assets
-          WHERE id=$1 AND tenant_id=$2 AND kind='reply_image'
-        `,
-        [assetId, payload.tenantId],
-      );
-      const row = result.rows[0];
-      if (!row) return sendError(res, 404, '回复图片不存在。', 'NOT_FOUND');
-      const data = await readStoredRow(row);
-      if (!Buffer.isBuffer(data)) {
-        return sendError(res, 404, '回复图片不存在。', 'NOT_FOUND');
-      }
-      res.statusCode = 200;
-      res.setHeader('Content-Type', row.mime);
-      res.setHeader('Content-Length', String(data.length));
-      res.setHeader('Cache-Control', 'private, max-age=300');
-      res.setHeader('Content-Disposition', 'inline; filename="reply-image.webp"');
-      return res.end(data);
-    }
-
-    if (req.method === 'POST' && pathname === '/api/admin/reply-images') {
-      await requireTenantFeature('media_album', payload.tenantId);
-      if (
-        !rateLimit(
-          req,
-          res,
-          'tenant-reply-image-upload',
-          30,
-          10 * 60_000,
-          payload.tenantId,
-          { tenantId: payload.tenantId, licenseId: payload.licenseId },
-        )
-      ) return;
-      const data = await prepareImageUpload(req, {
-        maxBytes: MAX_IMAGE_BYTES,
-        width: 1600,
-        height: 1600,
-        fit: 'inside',
-      });
-      const asset = await saveAsset({
-        tenantId: payload.tenantId,
-        kind: 'reply_image',
-        filename: 'reply-image.webp',
-        mime: 'image/webp',
-        data,
-      });
-      await writeTenantAudit(req, payload, 'tenant.reply-image.upload', {
-        targetType: 'asset',
-        targetId: asset.id,
-      }).catch(() => {});
-      return sendJson(res, 201, {
-        ok: true,
-        assetId: asset.id,
-      });
-    }
-
-    if (req.method === 'GET' && pathname === '/api/admin/endpoints') {
-      return sendJson(res, 200, {
-        ok: true,
-        endpoints: await getTenantEndpoints(payload.tenantId),
-      });
-    }
-
-    const endpointIncidentMatch = pathname.match(
-      /^\/api\/admin\/endpoints\/([0-9a-f-]{36})\/incident$/i,
-    );
-    if (req.method === 'POST' && endpointIncidentMatch) {
-      if (
-        !rateLimit(
-          req,
-          res,
-          'tenant-endpoint-incident',
-          100,
-          10 * 60_000,
-          payload.tenantId,
-        )
-      ) return;
-      const endpointId = endpointIncidentMatch[1];
-      if (!isUuid(endpointId)) {
-        return sendError(res, 400, '租户用户端入口无效。', 'TENANT_ENDPOINT');
-      }
-      const context = await recordTenantEndpointIncidentClick(
-        payload.tenantId,
-        endpointId,
-        payload.licenseId,
-      );
-      if (context.clickCount > QR_INCIDENT_REVIEW_THRESHOLD) {
-        const incident = await queueTenantEndpointIncidentReview(context);
-        return sendJson(res, 202, {
-          ok: true,
-          status: 'review',
-          requiresAdminReview: true,
-          incidentId: incident.id,
-          clickCount: context.clickCount,
-          endpoints: await getTenantEndpoints(payload.tenantId),
-        });
-      }
-      let changed;
-      try {
-        changed = await rotateTenantEndpoint(payload.tenantId, endpointId);
-      } catch (error) {
-        const incident = await queueTenantEndpointIncidentReview(context, error.message);
-        return sendJson(res, 202, {
-          ok: true,
-          status: 'review',
-          requiresAdminReview: true,
-          incidentId: incident.id,
-          clickCount: context.clickCount,
-          endpoints: await getTenantEndpoints(payload.tenantId),
-        });
-      }
-      await writeTenantAudit(req, payload, 'tenant.endpoint.rotate', {
-        targetType: 'tenant_endpoint',
-        targetId: endpointId,
-        riskLevel: 'high',
-        metadata: {
-          oldDomain: changed.oldDomain,
-          newDomain: changed.newDomain,
-          clickCount: context.clickCount,
-        },
-      }).catch(() => {});
-      publishEvent(
-        {
-          type: 'tenant-endpoint-rotated',
-          endpointId,
-          oldDomain: changed.oldDomain,
-          newDomain: changed.newDomain,
-          at: nowIso(),
-        },
-        { tenantId: payload.tenantId, targetKind: 'tenant_admin' },
-      );
-      return sendJson(res, 201, {
-        ok: true,
-        status: 'resolved',
-        requiresAdminReview: false,
-        clickCount: context.clickCount,
-        oldDomain: changed.oldDomain,
-        newDomain: changed.newDomain,
-        endpoints: changed.endpoints,
-      });
-    }
-
-    const endpointQrMatch = pathname.match(
-      /^\/api\/admin\/endpoints\/([0-9a-f-]{36})\/qr$/i,
-    );
-    if (req.method === 'GET' && endpointQrMatch) {
-      if (
-        !rateLimit(
-          req,
-          res,
-          'tenant-endpoint-qr-render',
-          90,
-          60_000,
-          payload.tenantId,
-        )
-      ) return;
-      const endpointId = endpointQrMatch[1];
-      const endpoints = await getTenantEndpoints(payload.tenantId);
-      const endpoint = endpoints.find((item) => item.id === endpointId);
-      if (!endpoint) {
-        return sendError(res, 404, '租户用户端入口不存在。', 'TENANT_ENDPOINT');
-      }
-      if (!endpoint.url) {
-        return sendError(
-          res,
-          409,
-          endpoint.netlifyError || '独占 Netlify 站点正在创建，请稍后刷新。',
-          'TENANT_NETLIFY_PROVISIONING',
-        );
-      }
-      const config = await getConfig(payload.tenantId);
-      const plainQr = url.searchParams.get('plain') === '1';
-      const topText = plainQr ? '' : config.settings.qrTopText || '';
-      const bottomText = plainQr
-        ? ''
-        : config.settings.qrBottomText !== undefined
-          ? config.settings.qrBottomText
-          : DEFAULT_QR_BOTTOM_TEXT;
-      const cacheHash = createHash('sha256').update(JSON.stringify([
-        endpoint.url,
-        plainQr,
-        topText,
-        bottomText,
-        config.settings.qrLogoAssetId || '',
-      ])).digest('base64url');
-      const qrCacheKey = `${payload.tenantId}:${endpoint.id}:${cacheHash}`;
-      let image = cacheGet(tenantQrImageCache, qrCacheKey);
-      if (!image) {
-        const logoData = await readTenantQrLogo(
-          payload.tenantId,
-          config.settings.qrLogoAssetId,
-        ).catch(() => null);
-        image = await buildTenantQrImage(endpoint.url, {
-          topText,
-          bottomText,
-          logoData,
-        });
-        makeRoomInExpiringMap(
-          tenantQrImageCache,
-          MAX_TENANT_QR_CACHE,
-          Date.now(),
-          (item) => item.expiresAt,
-        );
-        cacheSet(
-          tenantQrImageCache,
-          qrCacheKey,
-          image,
-          TENANT_QR_CACHE_MS,
-        );
-      }
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'image/png');
-      res.setHeader('Content-Length', String(image.length));
-      res.setHeader('Cache-Control', 'no-store');
-      res.setHeader(
-        'Content-Disposition',
-        `inline; filename="tenant-entry-${endpoint.slot}.png"`,
-      );
-      return res.end(image);
-    }
-
     if (req.method === 'POST' && pathname === '/api/admin/qr-incident') {
       if (
         !rateLimit(
@@ -21265,8 +19237,9 @@ async function router(req, res, parsedRequestUrl = null) {
         )
       ) return;
       const config = await getConfig(payload.tenantId);
-      // 活码只保存稳定跳转入口；模板预览与后续换域名不会改变二维码内容。
-      const entryUrl = tenantQrEntryUrl(activeTenant.public_code);
+      // 二维码直接编码当前模板的共享 Netlify 域名，并用 tenant 参数识别租户。
+      // 模板或域名变更后必须重新生成二维码，避免继续指向旧站点。
+      const entryUrl = tenantEntryUrl(config.settings, activeTenant.public_code);
       // plain=1 只返回二维码主体（仍保留租户上传的中心图片）。
       // 新版租户后台会在浏览器 Canvas 中绘制中文文字，避免服务器缺少中文字体时出现方框乱码。
       const plainQr = url.searchParams.get('plain') === '1';
@@ -21919,7 +19892,7 @@ async function router(req, res, parsedRequestUrl = null) {
     if (!isUuid(attachmentId)) {
       return sendError(res, 404, '媒体不存在。', 'NOT_FOUND');
     }
-    let result = await pool.query(
+    const result = await pool.query(
       `
         SELECT
           a.*,
@@ -21937,43 +19910,7 @@ async function router(req, res, parsedRequestUrl = null) {
       `,
       [attachmentId],
     );
-    let row = result.rows[0];
-    if (!row && ['user', 'tenant_admin'].includes(payload.kind)) {
-      const scopeId = payload.kind === 'user'
-        ? payload.conversationId
-        : payload.tenantId;
-      if (isUuid(scopeId)) {
-        result = await pool.query(
-          `
-            SELECT
-              a.*,
-              m.conversation_id,
-              c.visitor_key_hash,
-              c.tenant_id,
-              c.visitor_name,
-              c.status,
-              c.unread_admin,
-              c.unread_user,
-              c.created_at AS conversation_created_at,
-              c.updated_at AS conversation_updated_at
-            FROM assets a
-            JOIN messages m ON m.asset_id = a.id
-            JOIN conversations c ON c.id = m.conversation_id
-            WHERE a.id = $1
-              AND a.kind = 'reply_image'
-              AND m.recalled_at IS NULL
-              AND (
-                ($2 = 'user' AND m.conversation_id = $3)
-                OR ($2 = 'tenant_admin' AND c.tenant_id = $3)
-              )
-            ORDER BY m.created_at DESC
-            LIMIT 1
-          `,
-          [attachmentId, payload.kind, scopeId],
-        );
-        row = result.rows[0];
-      }
-    }
+    const row = result.rows[0];
     if (!row) return sendError(res, 404, '媒体不存在。', 'NOT_FOUND');
 
     const conversationForAuth = {

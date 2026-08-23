@@ -22,7 +22,6 @@
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1097.0",
-    "archiver": "^7.0.1",
     "pg": "^8.22.0",
     "qrcode": "^1.5.4",
     "sharp": "^0.35.3",
@@ -34,8 +33,5 @@
     "postcss": "^8.5.26",
     "terser": "^5.49.2",
     "vite": "^7.3.6"
-  },
-  "overrides": {
-    "nanoid": "^3.3.18"
   }
 }

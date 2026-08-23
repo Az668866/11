@@ -19,26 +19,6 @@ services:
         sync: false
       - key: PUBLIC_API_BASE
         value: https://api.ykf000.com
-      - key: QR_ENTRY_BASE
-        # 只用于扫码入口；请把 go.ykf000.com 换成你已在 DNS/Render/Cloudflare
-        # 配好的长期域名。API 仍然使用上面的 api.ykf000.com。
-        value: https://go.ykf000.com
-      - key: TENANT_ENTRY_ENABLED
-        value: "false"
-      - key: TENANT_ENTRY_DOMAIN_SUFFIXES
-        value: ykf000.com,netlify.app
-      - key: TENANT_ENTRY_GATEWAY_SECRET
-        sync: false
-      - key: TENANT_ENTRY_LEGACY_DAYS
-        value: 30
-      - key: TENANT_NETLIFY_ENABLED
-        value: "false"
-      - key: TENANT_NETLIFY_TEAM_SLUG
-        sync: false
-      - key: TENANT_NETLIFY_NAME_LENGTH
-        value: 4
-      - key: TENANT_NETLIFY_BUNDLE_ROOT
-        value: tenant-site-bundles
       - key: APP_VERSION
         value: 2.4.8
       - key: SUPPORT_TELEGRAM
@@ -88,7 +68,7 @@ services:
       - key: QR_INCIDENT_WINDOW_MINUTES
         value: 10
       - key: QR_INCIDENT_REVIEW_THRESHOLD
-        value: 10
+        value: 3
       - key: ANOMALY_VISITOR_IP_10M
         value: 12
       - key: ANOMALY_VISITOR_TENANT_10M
