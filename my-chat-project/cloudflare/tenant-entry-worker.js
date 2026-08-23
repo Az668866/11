@@ -61,7 +61,15 @@ async function resolveUpstream(hostname, env) {
     env.BACKEND_API_BASE || env.BACKEND_BASE_URL,
   );
   const secret = String(env.TENANT_ENTRY_GATEWAY_SECRET || '');
-  if (!backendBaseUrl || secret.length < 32) return '';
+  if (!backendBaseUrl || secret.length < 32) {
+    console.error(JSON.stringify({
+      event: 'tenant_entry_gateway_config_invalid',
+      backendConfigured: Boolean(backendBaseUrl),
+      secretConfigured: secret.length >= 32,
+      secretLength: secret.length,
+    }));
+    return '';
+  }
 
   const resolverUrl = new URL('/api/public/tenant-entry/resolve', backendBaseUrl);
   resolverUrl.searchParams.set('host', hostname);
@@ -73,13 +81,24 @@ async function resolveUpstream(hostname, env) {
         Accept: 'application/json',
         'X-Tenant-Entry-Gateway-Secret': secret,
       },
-      redirect: 'error',
+      redirect: 'manual',
     });
     if (response.ok) {
       const result = await response.json();
       upstreamBaseUrl = normalizeBaseUrl(result?.upstreamBaseUrl);
+    } else {
+      console.error(JSON.stringify({
+        event: 'tenant_entry_resolver_rejected',
+        hostname,
+        status: response.status,
+      }));
     }
-  } catch {
+  } catch (error) {
+    console.error(JSON.stringify({
+      event: 'tenant_entry_resolver_fetch_failed',
+      hostname,
+      message: String(error?.message || error || 'unknown').slice(0, 200),
+    }));
     upstreamBaseUrl = '';
   }
   resolverCache.set(hostname, {
@@ -153,7 +172,12 @@ export default {
     try {
       const response = await fetch(upstreamRequest(request, upstreamBaseUrl));
       return rewriteResponse(response, upstreamBaseUrl, incomingUrl.origin);
-    } catch {
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: 'tenant_entry_upstream_fetch_failed',
+        hostname,
+        message: String(error?.message || error || 'unknown').slice(0, 200),
+      }));
       return unavailableResponse();
     }
   },
