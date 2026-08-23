@@ -16,9 +16,14 @@ function normalizeBaseUrl(value) {
   }
 }
 
-function shouldBypass(hostname) {
-  const firstLabel = hostname.split('.')[0];
-  return new Set(['api', 'go', 'www']).has(firstLabel);
+function shouldBypass(hostname, env) {
+  const reserved = String(
+    env.RESERVED_HOSTS || 'api.ykf000.com,go.ykf000.com,www.ykf000.com,ykf000.com',
+  )
+    .split(',')
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean);
+  return reserved.includes(hostname);
 }
 
 function unavailableResponse() {
@@ -52,7 +57,9 @@ async function resolveUpstream(hostname, env) {
   const cached = resolverCache.get(hostname);
   if (cached && cached.expiresAt > now) return cached.value;
 
-  const backendBaseUrl = normalizeBaseUrl(env.BACKEND_BASE_URL);
+  const backendBaseUrl = normalizeBaseUrl(
+    env.BACKEND_API_BASE || env.BACKEND_BASE_URL,
+  );
   const secret = String(env.TENANT_ENTRY_GATEWAY_SECRET || '');
   if (!backendBaseUrl || secret.length < 32) return '';
 
@@ -138,7 +145,7 @@ export default {
   async fetch(request, env) {
     const incomingUrl = new URL(request.url);
     const hostname = incomingUrl.hostname.toLowerCase();
-    if (shouldBypass(hostname)) return fetch(request);
+    if (shouldBypass(hostname, env)) return fetch(request);
 
     const upstreamBaseUrl = await resolveUpstream(hostname, env);
     if (!upstreamBaseUrl) return unavailableResponse();
