@@ -1046,16 +1046,23 @@ async function initDatabase() {
     `);
     if (TENANT_ENTRY_ENABLED) {
       const entryBackfill = await client.query(`
-        SELECT id,base_url
+        SELECT id,base_url,entry_host
         FROM frontend_templates
-        WHERE entry_host=''
       `);
       for (const row of entryBackfill.rows) {
         const entryHost = tenantEntryHostFromNetlifyUrl(row.base_url);
         if (!entryHost) continue;
+        const currentEntryHost = String(row.entry_host || '')
+          .trim()
+          .toLowerCase();
+        if (currentEntryHost === entryHost) continue;
+        if (
+          currentEntryHost &&
+          !isManagedTenantEntryHost(currentEntryHost, row.base_url)
+        ) continue;
         await client.query(
-          `UPDATE frontend_templates SET entry_host=$2 WHERE id=$1 AND entry_host=''`,
-          [row.id, entryHost],
+          `UPDATE frontend_templates SET entry_host=$2 WHERE id=$1 AND entry_host=$3`,
+          [row.id, entryHost, row.entry_host || ''],
         );
       }
     }
@@ -10670,8 +10677,7 @@ function normalizeTenantEntryHost(value) {
     : '';
 }
 
-function tenantEntryHostFromNetlifyUrl(value) {
-  if (!TENANT_ENTRY_ENABLED || !TENANT_ENTRY_DOMAIN_SUFFIXES.length) return '';
+function netlifySiteLabel(value) {
   let parsed;
   try {
     parsed = new URL(value);
@@ -10680,7 +10686,36 @@ function tenantEntryHostFromNetlifyUrl(value) {
   }
   const netlifyDomain = normalizeNetlifyDomain(parsed.hostname);
   if (!netlifyDomain) return '';
-  const label = netlifyDomain.slice(0, -'.netlify.app'.length);
+  return netlifyDomain.slice(0, -'.netlify.app'.length);
+}
+
+function tenantEntryHostLabel(value) {
+  let host = String(value || '').trim().toLowerCase();
+  if (/^https?:\/\//i.test(host)) {
+    try {
+      host = new URL(host).hostname.toLowerCase();
+    } catch {
+      return '';
+    }
+  } else {
+    host = host.replace(/[\/?#].*$/, '').replace(/\.+$/, '');
+  }
+  if (!/^(?=.{1,253}$)[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/.test(host)) {
+    return '';
+  }
+  return host.split('.')[0] || '';
+}
+
+function isManagedTenantEntryHost(value, baseUrl) {
+  const entryLabel = tenantEntryHostLabel(value);
+  const siteLabel = netlifySiteLabel(baseUrl);
+  return Boolean(entryLabel && siteLabel && entryLabel === siteLabel);
+}
+
+function tenantEntryHostFromNetlifyUrl(value) {
+  if (!TENANT_ENTRY_ENABLED || !TENANT_ENTRY_DOMAIN_SUFFIXES.length) return '';
+  const label = netlifySiteLabel(value);
+  if (!label) return '';
   return normalizeTenantEntryHost(
     `${label}.${TENANT_ENTRY_DOMAIN_SUFFIXES[0]}`,
   );
