@@ -11428,15 +11428,18 @@ async function switchTenantEntryRootDomain(
         action,target_type,target_id,metadata,risk_level,summary
       ) VALUES (
         'tenant_entry.root_domain_switch','tenant_entry_root_domain',
-        NULL,$1::jsonb,'critical','Telegram 管理员切换了客服入口根域名'
+        $1,$2::jsonb,'critical','Telegram 管理员切换了客服入口根域名'
       )`,
-      [JSON.stringify({
-        requestId,
-        previousDomain,
+      [
         domain,
-        telegramUserId: cleanText(telegramUserId, 80),
-        templateCount: changes.length,
-      })],
+        JSON.stringify({
+          requestId,
+          previousDomain,
+          domain,
+          telegramUserId: cleanText(telegramUserId, 80),
+          templateCount: changes.length,
+        }),
+      ],
     );
     await client.query('COMMIT');
   } catch (error) {
