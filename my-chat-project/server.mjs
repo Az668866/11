@@ -1993,9 +1993,16 @@ async function initDatabase() {
     await client.query(`
       ALTER TABLE messages
       ADD CONSTRAINT messages_check CHECK (
-        (type = 'text' AND attachment_id IS NULL AND asset_id IS NULL AND length(text) > 0)
+        (
+          type = 'text'
+          AND attachment_id IS NULL
+          AND asset_id IS NULL
+          AND length(text) > 0
+        )
         OR
         (
+          recalled_at IS NULL
+          AND
           type IN ('image','video','audio')
           AND ((attachment_id IS NOT NULL)::int + (asset_id IS NOT NULL)::int) = 1
         )
@@ -2123,6 +2130,7 @@ async function initDatabase() {
           WHERE conrelid = 'messages'::regclass
             AND conname = 'messages_check'
             AND pg_get_constraintdef(oid) LIKE '%recalled_at%'
+            AND pg_get_constraintdef(oid) LIKE '%asset_id%'
         ) THEN
           ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_check;
           ALTER TABLE messages
@@ -2131,6 +2139,7 @@ async function initDatabase() {
                 recalled_at IS NOT NULL
                 AND type = 'text'
                 AND attachment_id IS NULL
+                AND asset_id IS NULL
                 AND length(text) > 0
               )
               OR
@@ -2138,13 +2147,14 @@ async function initDatabase() {
                 recalled_at IS NULL
                 AND type = 'text'
                 AND attachment_id IS NULL
+                AND asset_id IS NULL
                 AND length(text) > 0
               )
               OR
               (
                 recalled_at IS NULL
                 AND type IN ('image','video','audio')
-                AND attachment_id IS NOT NULL
+                AND ((attachment_id IS NOT NULL)::int + (asset_id IS NOT NULL)::int) = 1
               )
             );
         END IF;
