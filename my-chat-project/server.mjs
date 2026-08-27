@@ -1153,38 +1153,6 @@ async function initDatabase() {
       ON frontend_template_entry_aliases (template_id)
     `);
     await client.query(`
-      CREATE TABLE IF NOT EXISTS tenant_template_domains (
-        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        template_id UUID NOT NULL REFERENCES frontend_templates(id) ON DELETE CASCADE,
-        hostname TEXT NOT NULL CHECK (hostname=LOWER(hostname)),
-        label TEXT NOT NULL,
-        root_domain TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (tenant_id,template_id)
-      )
-    `);
-    await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS tenant_template_domains_hostname_idx
-      ON tenant_template_domains (LOWER(hostname))
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS tenant_template_domains_template_idx
-      ON tenant_template_domains (template_id,tenant_id)
-    `);
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS tenant_template_domain_aliases (
-        hostname TEXT PRIMARY KEY CHECK (hostname=LOWER(hostname)),
-        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        template_id UUID NOT NULL REFERENCES frontend_templates(id) ON DELETE CASCADE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
-    `);
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS tenant_template_domain_aliases_owner_idx
-      ON tenant_template_domain_aliases (tenant_id,template_id)
-    `);
-    await client.query(`
       CREATE TABLE IF NOT EXISTS tenant_entry_domain_switch_requests (
         id UUID PRIMARY KEY,
         domain TEXT NOT NULL,
@@ -1835,15 +1803,14 @@ async function initDatabase() {
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS push_subscriptions (
-        endpoint TEXT NOT NULL,
+        endpoint TEXT PRIMARY KEY,
         tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
         conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
         p256dh TEXT NOT NULL,
         auth TEXT NOT NULL,
         user_agent TEXT NOT NULL DEFAULT '',
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (endpoint,tenant_id,conversation_id)
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
     await client.query(`
@@ -1965,12 +1932,6 @@ async function initDatabase() {
     await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS recalled_at TIMESTAMPTZ`);
     await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`);
     await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS asset_id UUID REFERENCES assets(id) ON DELETE RESTRICT`);
-    await client.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_request_id TEXT NOT NULL DEFAULT ''`);
-    await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS messages_client_request_unique_idx
-      ON messages (conversation_id,role,client_request_id,album_position)
-      WHERE client_request_id <> '' AND source='manual'
-    `);
     await client.query(`ALTER TABLE attachments DROP CONSTRAINT IF EXISTS attachments_mime_check`);
     await client.query(`
       ALTER TABLE attachments
@@ -2301,30 +2262,8 @@ async function initDatabase() {
         last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         handled_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (endpoint, tenant_id, conversation_id)
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
-    `);
-    await client.query(`
-      DO $$
-      DECLARE primary_column_count INTEGER;
-      BEGIN
-        SELECT COUNT(*)::int INTO primary_column_count
-        FROM information_schema.table_constraints constraints
-        JOIN information_schema.key_column_usage columns
-          ON columns.constraint_name=constraints.constraint_name
-         AND columns.constraint_schema=constraints.constraint_schema
-        WHERE constraints.table_schema=current_schema()
-          AND constraints.table_name='push_subscriptions'
-          AND constraints.constraint_type='PRIMARY KEY';
-        IF primary_column_count <> 3 THEN
-          ALTER TABLE push_subscriptions
-            DROP CONSTRAINT IF EXISTS push_subscriptions_pkey;
-          ALTER TABLE push_subscriptions
-            ADD CONSTRAINT push_subscriptions_pkey
-            PRIMARY KEY (endpoint,tenant_id,conversation_id);
-        END IF;
-      END $$
     `);
     await client.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS security_events_open_fingerprint_idx
@@ -4458,16 +4397,6 @@ async function refreshApprovedOrigins(force = false) {
       UNION ALL
       SELECT '' AS origin,aliases.hostname AS entry_host
       FROM frontend_template_entry_aliases aliases
-      JOIN frontend_templates templates ON templates.id=aliases.template_id
-      WHERE templates.status IN ('testing','enabled')
-      UNION ALL
-      SELECT '' AS origin,domains.hostname AS entry_host
-      FROM tenant_template_domains domains
-      JOIN frontend_templates templates ON templates.id=domains.template_id
-      WHERE templates.status IN ('testing','enabled')
-      UNION ALL
-      SELECT '' AS origin,aliases.hostname AS entry_host
-      FROM tenant_template_domain_aliases aliases
       JOIN frontend_templates templates ON templates.id=aliases.template_id
       WHERE templates.status IN ('testing','enabled')
     `);
@@ -6904,12 +6833,16 @@ async function savePushSubscription(payload, body, req) {
       INSERT INTO push_subscriptions (
         endpoint,tenant_id,conversation_id,p256dh,auth,user_agent
       ) VALUES ($1,$2,$3,$4,$5,$6)
-      ON CONFLICT (endpoint,tenant_id,conversation_id) DO UPDATE SET
+      ON CONFLICT (endpoint) DO UPDATE SET
+        tenant_id=EXCLUDED.tenant_id,
+        conversation_id=EXCLUDED.conversation_id,
         p256dh=EXCLUDED.p256dh,
         auth=EXCLUDED.auth,
         user_agent=EXCLUDED.user_agent,
         updated_at=NOW()
-      WHERE push_subscriptions.p256dh IS DISTINCT FROM EXCLUDED.p256dh
+      WHERE push_subscriptions.tenant_id IS DISTINCT FROM EXCLUDED.tenant_id
+         OR push_subscriptions.conversation_id IS DISTINCT FROM EXCLUDED.conversation_id
+         OR push_subscriptions.p256dh IS DISTINCT FROM EXCLUDED.p256dh
          OR push_subscriptions.auth IS DISTINCT FROM EXCLUDED.auth
          OR push_subscriptions.user_agent IS DISTINCT FROM EXCLUDED.user_agent
          OR push_subscriptions.updated_at < NOW() - INTERVAL '7 days'
@@ -7028,118 +6961,6 @@ async function rememberTenantFrontendTemplate(
   );
 }
 
-function tenantTemplateShortPrefix(template = {}) {
-  const source = `${template.name || ''} ${template.base_url || template.baseUrl || ''}`;
-  return ([
-    [/企业微信|微信企业|微信|wecom|weixin/i, 'wxmb'],
-    [/小红书|xiaohongshu|xhs/i, 'xhsmb'],
-    [/抖音|douyin|tiktok/i, 'dymb'],
-    [/快手|kuaishou|kwai/i, 'ksmb'],
-    [/闲鱼|xianyu/i, 'xymb'],
-    [/支付宝|alipay/i, 'zfbmb'],
-    [/拼多多|pinduoduo|pdd/i, 'pddmb'],
-    [/淘宝|taobao/i, 'tbmb'],
-    [/qq/i, 'qqmb'],
-    [/经典|default|zxkf/i, 'kfmb'],
-  ].find(([pattern]) => pattern.test(source))?.[1] || 'kfmb');
-}
-
-function tenantTemplateDomainUrl(hostname) {
-  const normalized = normalizeTenantEntryHost(hostname);
-  return normalized ? `https://${normalized}/` : '';
-}
-
-async function ensureTenantTemplateDomain(
-  client,
-  tenantId,
-  templateId,
-) {
-  if (!TENANT_ENTRY_ENABLED || !isUuid(tenantId) || !isUuid(templateId)) {
-    return null;
-  }
-  const existing = await client.query(
-    `SELECT * FROM tenant_template_domains
-     WHERE tenant_id=$1 AND template_id=$2`,
-    [tenantId, templateId],
-  );
-  if (existing.rows[0]) return existing.rows[0];
-  const rootDomain = normalizeTenantDomainSuffix(
-    activeTenantEntryRootDomain || TENANT_ENTRY_DOMAIN_SUFFIXES[0],
-  );
-  if (!rootDomain) return null;
-  const templateResult = await client.query(
-    `SELECT id,name,base_url FROM frontend_templates WHERE id=$1`,
-    [templateId],
-  );
-  const template = templateResult.rows[0];
-  if (!template) return null;
-  const prefix = tenantTemplateShortPrefix(template);
-  const firstSuffix = 10 + (randomBytes(1)[0] % 90);
-  for (let offset = 0; offset < 90; offset += 1) {
-    const suffix = 10 + ((firstSuffix - 10 + offset) % 90);
-    const label = `${prefix}${suffix}`;
-    const hostname = normalizeTenantEntryHost(`${label}.${rootDomain}`);
-    if (!hostname) continue;
-    const inserted = await client.query(
-      `INSERT INTO tenant_template_domains (
-         tenant_id,template_id,hostname,label,root_domain
-       )
-       SELECT $1,$2,$3,$4,$5
-       WHERE NOT EXISTS (
-         SELECT 1 FROM frontend_templates WHERE entry_host=$3
-         UNION ALL
-         SELECT 1 FROM frontend_template_entry_aliases WHERE hostname=$3
-         UNION ALL
-         SELECT 1 FROM tenant_template_domain_aliases WHERE hostname=$3
-       )
-       ON CONFLICT DO NOTHING
-       RETURNING *`,
-      [tenantId, templateId, hostname, label, rootDomain],
-    );
-    if (inserted.rows[0]) return inserted.rows[0];
-    const concurrent = await client.query(
-      `SELECT * FROM tenant_template_domains
-       WHERE tenant_id=$1 AND template_id=$2`,
-      [tenantId, templateId],
-    );
-    if (concurrent.rows[0]) return concurrent.rows[0];
-  }
-  throw requestError(
-    `模板“${cleanText(template.name, 80) || '用户端'}”的短域名号码已用尽。`,
-    409,
-    'TENANT_DOMAIN_EXHAUSTED',
-  );
-}
-
-async function ensureTenantTemplateDomains(tenantId, client = pool) {
-  if (!TENANT_ENTRY_ENABLED || !isUuid(tenantId)) return new Map();
-  const templates = await client.query(
-    `SELECT DISTINCT template_id
-     FROM (
-       SELECT frontend_template_id AS template_id
-       FROM tenant_config
-       WHERE tenant_id=$1 AND frontend_template_id IS NOT NULL
-       UNION
-       SELECT template_id FROM tenant_frontend_templates WHERE tenant_id=$1
-       UNION
-       SELECT id AS template_id FROM frontend_templates
-       WHERE status IN ('enabled','testing')
-     ) available
-     WHERE template_id IS NOT NULL`,
-    [tenantId],
-  );
-  const result = new Map();
-  for (const row of templates.rows) {
-    const domain = await ensureTenantTemplateDomain(
-      client,
-      tenantId,
-      row.template_id,
-    );
-    if (domain) result.set(domain.template_id, domain);
-  }
-  return result;
-}
-
 async function createTenantConfig(tenantId, client = pool) {
   const defaults = defaultConfig();
   await client.query(
@@ -7176,20 +6997,6 @@ async function getConfig(tenantId, client = pool) {
   if (client === pool) {
     const cached = cacheGet(tenantConfigCache, tenantId);
     if (cached) return cached;
-  }
-  const tenantDomains = await ensureTenantTemplateDomains(tenantId, client);
-  const tenantAliasRows = TENANT_ENTRY_ENABLED
-    ? await client.query(
-        `SELECT template_id,hostname FROM tenant_template_domain_aliases
-         WHERE tenant_id=$1`,
-        [tenantId],
-      )
-    : { rows: [] };
-  const tenantAliases = new Map();
-  for (const row of tenantAliasRows.rows) {
-    const aliases = tenantAliases.get(row.template_id) || [];
-    aliases.push(row.hostname);
-    tenantAliases.set(row.template_id, aliases);
   }
   const result = await client.query(
     `
@@ -7273,28 +7080,10 @@ async function getConfig(tenantId, client = pool) {
         }))
         .filter((item) => isUuid(item.id) && item.origin)
     : [];
-  const approvedWithTenantDomains = approvedFrontends.map((item) => {
-    const domain = tenantDomains.get(item.id);
-    return {
-      ...item,
-      entryHost: normalizeTenantEntryHost(domain?.hostname) || item.entryHost,
-      entryAliases: [
-        ...new Set([
-          ...item.entryAliases,
-          ...(tenantAliases.get(item.id) || []),
-        ].map((host) => normalizeTenantEntryHost(host)).filter(Boolean)),
-      ],
-      tenantDomain: Boolean(domain),
-    };
-  });
-  const currentTemplateId =
-    result.rows[0].frontend_template_id || DEFAULT_TEMPLATE_ID;
-  const currentDomain = tenantDomains.get(currentTemplateId);
-  const currentDomainUrl = tenantTemplateDomainUrl(currentDomain?.hostname);
   const config = {
     cannedReplies: result.rows[0].canned_replies || [],
     autoReplies: result.rows[0].auto_replies || [],
-    approvedFrontends: approvedWithTenantDomains,
+    approvedFrontends,
     settings: {
       ...defaultConfig().settings,
       ...(result.rows[0].settings || {}),
@@ -7303,16 +7092,16 @@ async function getConfig(tenantId, client = pool) {
           ? DEFAULT_QR_BOTTOM_TEXT
           : result.rows[0].settings?.qrBottomText ?? DEFAULT_QR_BOTTOM_TEXT,
       retentionHours: Number(result.rows[0].retention_hours || 24),
-      frontendTemplateId: currentTemplateId,
+      frontendTemplateId:
+        result.rows[0].frontend_template_id || DEFAULT_TEMPLATE_ID,
       frontendTemplateName:
         result.rows[0].frontend_template_name || '拓界经典版',
-      frontendBaseUrl: currentDomainUrl ||
+      frontendBaseUrl:
         result.rows[0].frontend_base_url || DEFAULT_USER_SITE_URL,
-      frontendOrigin: normalizeOrigin(currentDomainUrl) ||
+      frontendOrigin:
         result.rows[0].frontend_origin || new URL(DEFAULT_USER_SITE_URL).origin,
-      frontendEntryHost: normalizeTenantEntryHost(currentDomain?.hostname) ||
+      frontendEntryHost:
         normalizeTenantEntryHost(result.rows[0].frontend_entry_host),
-      frontendTenantDomain: Boolean(currentDomain),
     },
   };
   return client === pool
@@ -7374,9 +7163,6 @@ async function getTemplateCatalog(
   client = pool,
 ) {
   const isSuper = audience === 'super';
-  const tenantDomains = isSuper
-    ? new Map()
-    : await ensureTenantTemplateDomains(tenantId, client);
   const result = await client.query(
     `
       SELECT
@@ -7450,10 +7236,7 @@ async function getTemplateCatalog(
       // 超级后台可点击链接。管理员修正数据库记录后会自动重新出现。
       return [];
     }
-    const tenantDomain = tenantDomains.get(row.id);
-    const entryHost = normalizeTenantEntryHost(tenantDomain?.hostname) ||
-      normalizeTenantEntryHost(row.entry_host);
-    const entryUrl = tenantEntryBaseUrl(entryHost);
+    const entryUrl = tenantEntryBaseUrl(row.entry_host);
     const catalogUrl = !isSuper && entryUrl ? entryUrl : baseUrl;
     return [{
       id: row.id,
@@ -7462,8 +7245,7 @@ async function getTemplateCatalog(
       displayUrl: catalogUrl.replace(/^https:\/\//i, '').replace(/\/$/, ''),
       origin: new URL(catalogUrl).origin,
       entryUrl,
-      entryHost,
-      tenantDomain: Boolean(tenantDomain),
+      entryHost: normalizeTenantEntryHost(row.entry_host),
       ...(isSuper
         ? { netlifySiteId: row.netlify_site_id || '' }
         : { netlifyReady: Boolean(row.netlify_site_id && NETLIFY_AUTH_TOKEN) }),
@@ -7491,9 +7273,7 @@ function tenantEntryUrl(settings, publicCode) {
   const base = tenantEntryBaseUrl(settings?.frontendEntryHost) ||
     settings?.frontendBaseUrl || DEFAULT_USER_SITE_URL;
   const url = new URL(base);
-  if (!settings?.frontendTenantDomain) {
-    url.searchParams.set('tenant', publicCode);
-  }
+  url.searchParams.set('tenant', publicCode);
   return url.toString();
 }
 
@@ -7850,17 +7630,6 @@ async function getPublicConversation(id, client = pool, tenantId) {
     messages: messagesResult.rows.map(publicMessage),
     calls,
   };
-}
-
-async function requireAnyTenantFeature(codes, tenantId, client = pool) {
-  for (const code of codes) {
-    if (await tenantFeatureEnabled(code, tenantId, client)) return;
-  }
-  throw requestError(
-    '此功能当前未向该租户开放。',
-    403,
-    'FEATURE_DISABLED',
-  );
 }
 
 async function getConversationMessagePage(
@@ -8918,25 +8687,11 @@ function parseMessageInput(body = {}) {
   if (!['text', 'image', 'video', 'audio'].includes(requestedType)) {
     throw requestError('消息类型无效。', 400, 'INVALID_MESSAGE_TYPE');
   }
-  const suppliedClientRequestId = cleanText(body.clientRequestId, 128);
-  if (
-    suppliedClientRequestId &&
-    !/^[A-Za-z0-9_-]{16,128}$/.test(suppliedClientRequestId)
-  ) {
-    throw requestError(
-      '消息请求编号无效，请刷新页面后重试。',
-      400,
-      'INVALID_MESSAGE_REQUEST_ID',
-    );
-  }
-  const clientRequestId = suppliedClientRequestId || randomUUID();
 
   const text = cleanText(body.text, 4000);
   if (requestedType === 'text') {
     if (!text) throw requestError('消息不能为空。', 400, 'EMPTY_MESSAGE');
-    return {
-      type: 'text', text, attachmentIds: [], assetIds: [], clientRequestId,
-    };
+    return { type: 'text', text, attachmentIds: [], assetIds: [] };
   }
 
   const inputIds = Array.isArray(body.attachmentIds)
@@ -8980,38 +8735,7 @@ function parseMessageInput(body = {}) {
     throw requestError('一次只能发送一条语音。', 400, 'AUDIO_LIMIT');
   }
 
-  return { type: requestedType, text, attachmentIds, assetIds, clientRequestId };
-}
-
-async function findManualMessageReplay(
-  client,
-  conversationId,
-  role,
-  clientRequestId,
-) {
-  const result = await client.query(
-    `SELECT * FROM messages
-     WHERE conversation_id=$1 AND role=$2 AND source='manual'
-       AND client_request_id=$3
-     ORDER BY album_position,created_at,id`,
-    [conversationId, role, clientRequestId],
-  );
-  return result.rows;
-}
-
-async function findAutomaticMessageReplay(
-  client,
-  conversationId,
-  clientRequestId,
-) {
-  const result = await client.query(
-    `SELECT * FROM messages
-     WHERE conversation_id=$1 AND role='admin' AND source='auto'
-       AND client_request_id=$2
-     ORDER BY created_at,album_position,id`,
-    [conversationId, clientRequestId],
-  );
-  return result.rows;
+  return { type: requestedType, text, attachmentIds, assetIds };
 }
 
 async function lockReplyImageAssets(client, tenantId, assetIds) {
@@ -9045,7 +8769,6 @@ async function insertAssetImageMessages(
     text = '',
     retentionHours = 24,
     createdAfter = null,
-    clientRequestId = '',
   } = {},
 ) {
   const albumId = assetIds.length > 1 ? randomUUID() : null;
@@ -9053,11 +8776,11 @@ async function insertAssetImageMessages(
     `
       INSERT INTO messages (
         id, conversation_id, role, source, type, text, asset_id,
-        album_id, album_position, client_request_id, created_at, expires_at
+        album_id, album_position, created_at, expires_at
       )
       SELECT
         input.id,$4,'admin',$5,'image',input.body_text,input.asset_id,
-        $6,input.position,$10,
+        $6,input.position,
         COALESCE(
           $9::timestamptz + ((input.position + 2)::text || ' milliseconds')::interval,
           NOW()
@@ -9081,7 +8804,6 @@ async function insertAssetImageMessages(
       retentionHours,
       assetIds.map((_, index) => index),
       createdAfter,
-      clientRequestId,
     ],
   );
   return result.rows.sort(
@@ -9136,7 +8858,6 @@ async function insertMediaMessages(
   text,
   attachmentIds,
   retentionHours,
-  clientRequestId,
 ) {
   const albumId =
     type === 'image' && attachmentIds.length > 1 ? randomUUID() : null;
@@ -9149,11 +8870,11 @@ async function insertMediaMessages(
     `
       INSERT INTO messages (
         id, conversation_id, role, source, type, text, attachment_id,
-        album_id, album_position, client_request_id, expires_at
+        album_id, album_position, expires_at
       )
       SELECT
         input.id,$5,$6,'manual',$7,input.body_text,input.attachment_id,
-        $8,input.position,$10,NOW() + ($9::text || ' hours')::interval
+        $8,input.position,NOW() + ($9::text || ' hours')::interval
       FROM unnest(
         $1::uuid[],$2::uuid[],$3::text[],$4::int[]
       ) AS input(id,attachment_id,body_text,position)
@@ -9169,7 +8890,6 @@ async function insertMediaMessages(
       type,
       albumId,
       retentionHours,
-      clientRequestId,
     ],
   );
   await client.query(
@@ -9226,65 +8946,20 @@ async function createUserMessage(
       throw requestError('此会话已结束。', 409, 'CLOSED');
     }
 
-    const replayRows = await findManualMessageReplay(
-      client,
-      conversationId,
-      'user',
-      input.clientRequestId,
-    );
-    if (replayRows.length) {
-      const replayAutoReplyRows = await findAutomaticMessageReplay(
-        client,
-        conversationId,
-        input.clientRequestId,
-      );
-      await client.query('COMMIT');
-      const messages = replayRows.map(publicMessage);
-      const autoReplies = replayAutoReplyRows.map(publicMessage);
-      const latestRow = replayAutoReplyRows.at(-1) || replayRows.at(-1);
-      const replaySummary = conversationSummary({
-        ...conversation,
-        latest_id: latestRow?.id,
-        latest_type: latestRow?.type,
-        latest_text: latestRow?.text,
-        latest_role: latestRow?.role,
-        latest_created_at: latestRow?.created_at,
-      });
-      const publicConversation = includeConversation
-        ? await getPublicConversation(conversationId, pool, tenantId)
-        : replaySummary;
-      return {
-        message: messages[0],
-        messages,
-        autoReply: autoReplies[0] || null,
-        autoReplies,
-        conversation: publicConversation,
-        summary: includeConversation ? publicConversation : replaySummary,
-        idempotentReplay: true,
-      };
-    }
-
     let messageRows;
     if (input.type === 'text') {
       const result = await client.query(
         `
           INSERT INTO messages (
-            id, conversation_id, role, source, type, text,
-            client_request_id, expires_at
+            id, conversation_id, role, source, type, text, expires_at
           )
           VALUES (
-            $1,$2,'user','manual','text',$3,$5,
+            $1,$2,'user','manual','text',$3,
             NOW() + ($4::text || ' hours')::interval
           )
           RETURNING *
         `,
-        [
-          randomUUID(),
-          conversationId,
-          input.text,
-          retentionHours,
-          input.clientRequestId,
-        ],
+        [randomUUID(), conversationId, input.text, retentionHours],
       );
       messageRows = [result.rows[0]];
     } else {
@@ -9303,7 +8978,6 @@ async function createUserMessage(
         input.text,
         input.attachmentIds,
         retentionHours,
-        input.clientRequestId,
       );
     }
 
@@ -9311,11 +8985,11 @@ async function createUserMessage(
       await client.query(
       `
         UPDATE conversations
-        SET unread_admin = unread_admin + $3::int, updated_at = NOW()
+        SET unread_admin = unread_admin + 1, updated_at = NOW()
         WHERE id = $1 AND tenant_id = $2
         RETURNING *
       `,
-      [conversationId, tenantId, messageRows.length],
+      [conversationId, tenantId],
       )
     ).rows[0];
 
@@ -9342,11 +9016,10 @@ async function createUserMessage(
           const autoResult = await client.query(
             `
               INSERT INTO messages (
-                id, conversation_id, role, source, type, text,
-                client_request_id, created_at, expires_at
+                id, conversation_id, role, source, type, text, created_at, expires_at
               )
               VALUES (
-                $1,$2,'admin','auto','text',$3,$6,
+                $1,$2,'admin','auto','text',$3,
                 $5::timestamptz + INTERVAL '1 millisecond',
                 $5::timestamptz + INTERVAL '1 millisecond'
                   + ($4::text || ' hours')::interval
@@ -9359,7 +9032,6 @@ async function createUserMessage(
               autoReply.text,
               retentionHours,
               messageRows.at(-1).created_at,
-              input.clientRequestId,
             ],
           );
           autoReplyRows.push(autoResult.rows[0]);
@@ -9378,7 +9050,6 @@ async function createUserMessage(
               source: 'auto',
               retentionHours,
               createdAfter: messageRows.at(-1).created_at,
-              clientRequestId: input.clientRequestId,
             },
           ));
         }
@@ -9472,57 +9143,20 @@ async function createAdminMessage(
       throw requestError('此会话已结束。', 409, 'CLOSED');
     }
 
-    const replayRows = await findManualMessageReplay(
-      client,
-      conversationId,
-      'admin',
-      input.clientRequestId,
-    );
-    if (replayRows.length) {
-      await client.query('COMMIT');
-      const messages = replayRows.map(publicMessage);
-      const latestRow = replayRows.at(-1);
-      const replaySummary = conversationSummary({
-        ...conversation,
-        latest_id: latestRow?.id,
-        latest_type: latestRow?.type,
-        latest_text: latestRow?.text,
-        latest_role: latestRow?.role,
-        latest_created_at: latestRow?.created_at,
-      });
-      const publicConversation = includeConversation
-        ? await getPublicConversation(conversationId, pool, tenantId)
-        : replaySummary;
-      return {
-        message: messages[0],
-        messages,
-        conversation: publicConversation,
-        summary: includeConversation ? publicConversation : replaySummary,
-        idempotentReplay: true,
-      };
-    }
-
     let messageRows;
     if (input.type === 'text') {
       const result = await client.query(
         `
           INSERT INTO messages (
-            id, conversation_id, role, source, type, text,
-            client_request_id, expires_at
+            id, conversation_id, role, source, type, text, expires_at
           )
           VALUES (
-            $1,$2,'admin','manual','text',$3,$5,
+            $1,$2,'admin','manual','text',$3,
             NOW() + ($4::text || ' hours')::interval
           )
           RETURNING *
         `,
-        [
-          randomUUID(),
-          conversationId,
-          input.text,
-          retentionHours,
-          input.clientRequestId,
-        ],
+        [randomUUID(), conversationId, input.text, retentionHours],
       );
       messageRows = [result.rows[0]];
     } else if (input.assetIds.length) {
@@ -9531,11 +9165,7 @@ async function createAdminMessage(
         client,
         conversationId,
         input.assetIds,
-        {
-          text: input.text,
-          retentionHours,
-          clientRequestId: input.clientRequestId,
-        },
+        { text: input.text, retentionHours },
       );
     } else {
       await lockPendingAttachments(
@@ -9553,7 +9183,6 @@ async function createAdminMessage(
         input.text,
         input.attachmentIds,
         retentionHours,
-        input.clientRequestId,
       );
     }
 
@@ -9611,13 +9240,7 @@ async function broadcastMessageResult(
 ) {
   const appended = [
     ...(result.messages || []),
-    ...(
-      Array.isArray(result.autoReplies)
-        ? result.autoReplies
-        : result.autoReply
-          ? [result.autoReply]
-          : []
-    ),
+    ...(result.autoReply ? [result.autoReply] : []),
   ];
   for (const message of appended) {
     if (
@@ -11675,27 +11298,15 @@ async function smokeTestTenantEntryHosts(changes) {
         signal: AbortSignal.timeout(20_000),
       },
     );
-    const contentType = String(response.headers.get('content-type') || '')
-      .toLowerCase();
-    if (
-      response.status !== 200 ||
-      !contentType.includes('text/html')
-    ) {
+    if (response.status >= 500) {
       throw new Error(`${change.newHost} HTTPS 验收失败（${response.status}）。`);
     }
-    const html = await response.text();
-    if (
-      !/<html[\s>]/i.test(html) ||
-      !/tuojie-template-(?:id|name)|notificationSettingsButton|在线客服/i.test(html)
-    ) {
-      throw new Error(`${change.newHost} 返回的不是客服模板页面。`);
-    }
+    await response.body?.cancel().catch(() => {});
   }
 }
 
 async function restoreTenantEntryRootDomainSwitch(
   changes,
-  tenantChanges,
   previousDomain,
   targetDomain,
 ) {
@@ -11709,19 +11320,6 @@ async function restoreTenantEntryRootDomainSwitch(
       await client.query(
         `UPDATE frontend_templates SET entry_host=$2,updated_at=NOW() WHERE id=$1`,
         [change.templateId, change.oldHost],
-      );
-    }
-    for (const change of tenantChanges) {
-      await client.query(
-        `UPDATE tenant_template_domains
-         SET hostname=$3,root_domain=$4,updated_at=NOW()
-         WHERE tenant_id=$1 AND template_id=$2`,
-        [
-          change.tenantId,
-          change.templateId,
-          change.oldHost,
-          previousDomain,
-        ],
       );
     }
     await client.query(
@@ -11765,7 +11363,6 @@ async function switchTenantEntryRootDomain(
 
   const client = await pool.connect();
   let changes = [];
-  let tenantChanges = [];
   let previousDomain = '';
   try {
     await client.query('BEGIN');
@@ -11814,54 +11411,6 @@ async function switchTenantEntryRootDomain(
         [change.templateId, change.newHost],
       );
     }
-    const tenantDomains = await client.query(`
-      SELECT domains.*,templates.name AS template_name,
-             templates.status AS template_status
-      FROM tenant_template_domains domains
-      JOIN frontend_templates templates ON templates.id=domains.template_id
-      ORDER BY domains.created_at
-      FOR UPDATE OF domains
-    `);
-    for (const tenantDomain of tenantDomains.rows) {
-      const oldHost = normalizeTenantEntryHost(tenantDomain.hostname);
-      const label = tenantEntryHostLabel(tenantDomain.label || oldHost);
-      const newHost = normalizeTenantEntryHost(`${label}.${domain}`);
-      if (!oldHost || !label || !newHost) {
-        throw new Error('租户模板短域名无法生成新的入口地址。');
-      }
-      await client.query(
-        `INSERT INTO tenant_template_domain_aliases (
-           hostname,tenant_id,template_id
-         ) VALUES ($1,$2,$3)
-         ON CONFLICT (hostname) DO NOTHING`,
-        [oldHost, tenantDomain.tenant_id, tenantDomain.template_id],
-      );
-      const aliasOwner = await client.query(
-        `SELECT tenant_id,template_id FROM tenant_template_domain_aliases
-         WHERE hostname=$1`,
-        [oldHost],
-      );
-      if (
-        aliasOwner.rows[0]?.tenant_id !== tenantDomain.tenant_id ||
-        aliasOwner.rows[0]?.template_id !== tenantDomain.template_id
-      ) {
-        throw new Error(`历史短域名 ${oldHost} 归属冲突。`);
-      }
-      await client.query(
-        `UPDATE tenant_template_domains
-         SET hostname=$3,root_domain=$4,updated_at=NOW()
-         WHERE tenant_id=$1 AND template_id=$2`,
-        [tenantDomain.tenant_id, tenantDomain.template_id, newHost, domain],
-      );
-      tenantChanges.push({
-        tenantId: tenantDomain.tenant_id,
-        templateId: tenantDomain.template_id,
-        templateName: tenantDomain.template_name,
-        status: tenantDomain.template_status,
-        oldHost,
-        newHost,
-      });
-    }
     await client.query(
       `UPDATE tenant_entry_root_domains
        SET status='historical',last_error='',updated_at=NOW()
@@ -11879,16 +11428,18 @@ async function switchTenantEntryRootDomain(
         action,target_type,target_id,metadata,risk_level,summary
       ) VALUES (
         'tenant_entry.root_domain_switch','tenant_entry_root_domain',
-        $2,$1::jsonb,'critical','Telegram 管理员切换了客服入口根域名'
+        $1,$2::jsonb,'critical','Telegram 管理员切换了客服入口根域名'
       )`,
-      [JSON.stringify({
-        requestId,
-        previousDomain,
+      [
         domain,
-        telegramUserId: cleanText(telegramUserId, 80),
-        templateCount: changes.length,
-        tenantTemplateDomainCount: tenantChanges.length,
-      }), domain],
+        JSON.stringify({
+          requestId,
+          previousDomain,
+          domain,
+          telegramUserId: cleanText(telegramUserId, 80),
+          templateCount: changes.length,
+        }),
+      ],
     );
     await client.query('COMMIT');
   } catch (error) {
@@ -11904,14 +11455,10 @@ async function switchTenantEntryRootDomain(
   invalidateApprovedOrigins();
   try {
     await refreshApprovedOrigins(true);
-    const tenantSmokeSample = tenantChanges
-      .filter((item) => ['testing', 'enabled'].includes(item.status))
-      .slice(0, 20);
-    await smokeTestTenantEntryHosts([...changes, ...tenantSmokeSample]);
+    await smokeTestTenantEntryHosts(changes);
   } catch (error) {
     await restoreTenantEntryRootDomainSwitch(
       changes,
-      tenantChanges,
       previousDomain,
       domain,
     );
@@ -11922,13 +11469,7 @@ async function switchTenantEntryRootDomain(
     { targetKind: 'tenant_admin' },
   );
   broadcastSuper({ type: 'frontend_catalog_updated' });
-  return {
-    duplicate: false,
-    previousDomain,
-    domain,
-    changes,
-    tenantChanges,
-  };
+  return { duplicate: false, previousDomain, domain, changes };
 }
 
 async function handleTenantEntryDomainCallback(callback) {
@@ -12293,14 +11834,6 @@ async function assertTemplateEntryHostAvailable(
         SELECT template_id
         FROM frontend_template_entry_aliases
         WHERE hostname=$1 AND template_id<>$2
-        UNION ALL
-        SELECT template_id
-        FROM tenant_template_domains
-        WHERE hostname=$1
-        UNION ALL
-        SELECT template_id
-        FROM tenant_template_domain_aliases
-        WHERE hostname=$1
       ) conflicts
       LIMIT 1
     `,
@@ -12343,31 +11876,19 @@ async function resolveTenantEntryUpstream(value, client = pool) {
   const result = await client.query(
     `
       WITH matched AS (
-        SELECT tenant_id,template_id,0 AS priority
-        FROM tenant_template_domains
-        WHERE hostname=$1
-        UNION ALL
-        SELECT tenant_id,template_id,0 AS priority
-        FROM tenant_template_domain_aliases
-        WHERE hostname=$1
-        UNION ALL
-        SELECT NULL::uuid AS tenant_id,id AS template_id,1 AS priority
+        SELECT id AS template_id
         FROM frontend_templates
         WHERE entry_host=$1
         UNION ALL
-        SELECT NULL::uuid AS tenant_id,template_id,1 AS priority
+        SELECT template_id
         FROM frontend_template_entry_aliases
         WHERE hostname=$1
+        LIMIT 1
       )
-      SELECT templates.base_url,templates.origin,
-             tenants.public_code AS tenant_code,
-             tenants.status AS tenant_status,
-             tenants.access_expires_at
+      SELECT templates.base_url,templates.origin
       FROM matched
       JOIN frontend_templates templates ON templates.id=matched.template_id
-      LEFT JOIN tenants ON tenants.id=matched.tenant_id
       WHERE templates.status IN ('testing','enabled')
-      ORDER BY matched.priority
       LIMIT 1
     `,
     [entryHost],
@@ -12383,10 +11904,6 @@ async function resolveTenantEntryUpstream(value, client = pool) {
     }
     return null;
   }
-  if (row.tenant_code && tenantAccessIssue({
-    status: row.tenant_status,
-    access_expires_at: row.access_expires_at,
-  })) return null;
   let target;
   try {
     target = parseTemplateFetchTarget(row.base_url);
@@ -12407,7 +11924,6 @@ async function resolveTenantEntryUpstream(value, client = pool) {
   const resolved = {
     entryHost,
     upstreamBaseUrl: target.toString(),
-    tenantCode: cleanText(row.tenant_code, 120),
   };
   if (client === pool) {
     cacheTenantEntryResolution(
@@ -20531,7 +20047,6 @@ async function router(req, res, parsedRequestUrl = null) {
         message: result.message,
         messages: result.messages,
         autoReply: result.autoReply,
-        autoReplies: result.autoReplies || (result.autoReply ? [result.autoReply] : []),
         conversation: result.conversation,
       });
     }
@@ -21140,10 +20655,7 @@ async function router(req, res, parsedRequestUrl = null) {
       req.method === 'GET' &&
       pathname.startsWith('/api/admin/reply-images/')
     ) {
-      await requireAnyTenantFeature(
-        ['auto_reply', 'media_album'],
-        payload.tenantId,
-      );
+      await requireTenantFeature('media_album', payload.tenantId);
       const assetId = safeDecodeURIComponent(
         pathname.slice('/api/admin/reply-images/'.length),
       );
@@ -21173,10 +20685,7 @@ async function router(req, res, parsedRequestUrl = null) {
     }
 
     if (req.method === 'POST' && pathname === '/api/admin/reply-images') {
-      await requireAnyTenantFeature(
-        ['auto_reply', 'media_album'],
-        payload.tenantId,
-      );
+      await requireTenantFeature('media_album', payload.tenantId);
       if (
         !rateLimit(
           req,
