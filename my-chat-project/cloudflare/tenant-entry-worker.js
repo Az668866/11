@@ -24,7 +24,7 @@ function normalizeBaseUrl(value) {
     parsed.hash = '';
     return parsed.toString();
   } catch {
-    return '';
+    return null;
   }
 }
 
@@ -85,7 +85,7 @@ async function resolveUpstream(hostname, env) {
 
   const resolverUrl = new URL('/api/public/tenant-entry/resolve', backendBaseUrl);
   resolverUrl.searchParams.set('host', hostname);
-  let upstreamBaseUrl = '';
+  let resolution = null;
   try {
     const response = await fetch(resolverUrl, {
       method: 'GET',
@@ -97,7 +97,13 @@ async function resolveUpstream(hostname, env) {
     });
     if (response.ok) {
       const result = await response.json();
-      upstreamBaseUrl = normalizeBaseUrl(result?.upstreamBaseUrl);
+      const upstreamBaseUrl = normalizeBaseUrl(result?.upstreamBaseUrl);
+      if (upstreamBaseUrl) {
+        resolution = {
+          upstreamBaseUrl,
+          tenantCode: String(result?.tenantCode || '').trim(),
+        };
+      }
     } else {
       console.error(JSON.stringify({
         event: 'tenant_entry_resolver_rejected',
@@ -111,22 +117,25 @@ async function resolveUpstream(hostname, env) {
       hostname,
       message: String(error?.message || error || 'unknown').slice(0, 200),
     }));
-    upstreamBaseUrl = '';
+    resolution = null;
   }
   makeResolverCacheRoom(now);
   resolverCache.set(hostname, {
-    value: upstreamBaseUrl,
-    expiresAt: now + (upstreamBaseUrl ? RESOLVER_CACHE_MS : NEGATIVE_CACHE_MS),
+    value: resolution,
+    expiresAt: now + (resolution ? RESOLVER_CACHE_MS : NEGATIVE_CACHE_MS),
   });
-  return upstreamBaseUrl;
+  return resolution;
 }
 
-function upstreamRequest(request, upstreamBaseUrl) {
+function upstreamRequest(request, resolution) {
   const incomingUrl = new URL(request.url);
-  const targetUrl = new URL(upstreamBaseUrl);
+  const targetUrl = new URL(resolution.upstreamBaseUrl);
   const basePath = targetUrl.pathname.replace(/\/+$/, '');
   targetUrl.pathname = `${basePath}${incomingUrl.pathname}` || '/';
   targetUrl.search = incomingUrl.search;
+  if (resolution.tenantCode && !targetUrl.searchParams.has('tenant')) {
+    targetUrl.searchParams.set('tenant', resolution.tenantCode);
+  }
   targetUrl.hash = '';
 
   const headers = new Headers(request.headers);
@@ -146,12 +155,12 @@ function upstreamRequest(request, upstreamBaseUrl) {
   });
 }
 
-function rewriteResponse(response, upstreamBaseUrl, publicOrigin) {
+function rewriteResponse(response, resolution, publicOrigin) {
   const headers = new Headers(response.headers);
   const location = headers.get('Location');
   if (location) {
     try {
-      const upstreamOrigin = new URL(upstreamBaseUrl).origin;
+      const upstreamOrigin = new URL(resolution.upstreamBaseUrl).origin;
       const redirectUrl = new URL(location, upstreamOrigin);
       if (redirectUrl.origin === upstreamOrigin) {
         headers.set(
@@ -166,6 +175,15 @@ function rewriteResponse(response, upstreamBaseUrl, publicOrigin) {
   headers.set('Strict-Transport-Security', 'max-age=31536000');
   headers.set('X-Content-Type-Options', 'nosniff');
   headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  if (
+    resolution.tenantCode &&
+    String(headers.get('Content-Type') || '').toLowerCase().includes('text/html')
+  ) {
+    headers.append(
+      'Set-Cookie',
+      `tuojie_tenant=${encodeURIComponent(resolution.tenantCode)}; Path=/; Secure; SameSite=Lax`,
+    );
+  }
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -179,12 +197,12 @@ export default {
     const hostname = incomingUrl.hostname.toLowerCase();
     if (shouldBypass(hostname, env)) return fetch(request);
 
-    const upstreamBaseUrl = await resolveUpstream(hostname, env);
-    if (!upstreamBaseUrl) return unavailableResponse();
+    const resolution = await resolveUpstream(hostname, env);
+    if (!resolution) return unavailableResponse();
 
     try {
-      const response = await fetch(upstreamRequest(request, upstreamBaseUrl));
-      return rewriteResponse(response, upstreamBaseUrl, incomingUrl.origin);
+      const response = await fetch(upstreamRequest(request, resolution));
+      return rewriteResponse(response, resolution, incomingUrl.origin);
     } catch (error) {
       console.error(JSON.stringify({
         event: 'tenant_entry_upstream_fetch_failed',
