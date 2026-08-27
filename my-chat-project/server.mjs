@@ -9351,82 +9351,92 @@ async function createUserMessage(
 
     let autoReplyRows = [];
     if (input.type === 'text') {
-      const cooldownSeconds = Math.min(
-        3600,
-        Math.max(0, Number(config.settings.autoReplyCooldownSeconds ?? 20)),
-      );
-      const lastAutoReplyAt = conversation.last_auto_reply_at
-        ? new Date(conversation.last_auto_reply_at).getTime()
-        : 0;
-      const cooldownPassed =
-        !lastAutoReplyAt ||
-        Date.now() - lastAutoReplyAt >= cooldownSeconds * 1000;
-      const autoReply =
-        cooldownPassed &&
-        featureStates.auto_reply
-        ? matchAutoReply(config, input.text)
-        : null;
+      const conversationBeforeAutoReply = updatedConversation;
+      await client.query('SAVEPOINT automatic_reply');
+      try {
+        const cooldownSeconds = Math.min(
+          3600,
+          Math.max(0, Number(config.settings.autoReplyCooldownSeconds ?? 20)),
+        );
+        const lastAutoReplyAt = conversation.last_auto_reply_at
+          ? new Date(conversation.last_auto_reply_at).getTime()
+          : 0;
+        const cooldownPassed =
+          !lastAutoReplyAt ||
+          Date.now() - lastAutoReplyAt >= cooldownSeconds * 1000;
+        const autoReply =
+          cooldownPassed && featureStates.auto_reply
+            ? matchAutoReply(config, input.text)
+            : null;
 
-      if (autoReply) {
-        if (autoReply.text) {
-          const autoResult = await client.query(
-            `
-              INSERT INTO messages (
-                id, conversation_id, role, source, type, text,
-                client_request_id, created_at, expires_at
-              )
-              VALUES (
-                $1,$2,'admin','auto','text',$3,$6,
-                $5::timestamptz + INTERVAL '1 millisecond',
-                $5::timestamptz + INTERVAL '1 millisecond'
-                  + ($4::text || ' hours')::interval
-              )
-              RETURNING *
-            `,
-            [
-              randomUUID(),
+        if (autoReply) {
+          if (autoReply.text) {
+            const autoResult = await client.query(
+              `
+                INSERT INTO messages (
+                  id, conversation_id, role, source, type, text,
+                  client_request_id, created_at, expires_at
+                )
+                VALUES (
+                  $1,$2,'admin','auto','text',$3,$6,
+                  $5::timestamptz + INTERVAL '1 millisecond',
+                  $5::timestamptz + INTERVAL '1 millisecond'
+                    + ($4::text || ' hours')::interval
+                )
+                RETURNING *
+              `,
+              [
+                randomUUID(),
+                conversationId,
+                autoReply.text,
+                retentionHours,
+                messageRows.at(-1).created_at,
+                input.clientRequestId,
+              ],
+            );
+            autoReplyRows.push(autoResult.rows[0]);
+          }
+          if (autoReply.imageAssetId) {
+            await lockReplyImageAssets(
+              client,
+              tenantId,
+              [autoReply.imageAssetId],
+            );
+            autoReplyRows.push(...await insertAssetImageMessages(
+              client,
               conversationId,
-              autoReply.text,
-              retentionHours,
-              messageRows.at(-1).created_at,
-              input.clientRequestId,
-            ],
-          );
-          autoReplyRows.push(autoResult.rows[0]);
+              [autoReply.imageAssetId],
+              {
+                source: 'auto',
+                retentionHours,
+                createdAfter: messageRows.at(-1).created_at,
+                clientRequestId: input.clientRequestId,
+              },
+            ));
+          }
+          if (autoReplyRows.length) {
+            updatedConversation = (
+              await client.query(
+                `
+                  UPDATE conversations
+                  SET unread_user = unread_user + $3::int,
+                      last_auto_reply_at = NOW(),
+                      updated_at = NOW()
+                  WHERE id = $1 AND tenant_id = $2
+                  RETURNING *
+                `,
+                [conversationId, tenantId, autoReplyRows.length],
+              )
+            ).rows[0];
+          }
         }
-        if (autoReply.imageAssetId) {
-          await lockReplyImageAssets(
-            client,
-            tenantId,
-            [autoReply.imageAssetId],
-          );
-          autoReplyRows.push(...await insertAssetImageMessages(
-            client,
-            conversationId,
-            [autoReply.imageAssetId],
-            {
-              source: 'auto',
-              retentionHours,
-              createdAfter: messageRows.at(-1).created_at,
-              clientRequestId: input.clientRequestId,
-            },
-          ));
-        }
-        if (autoReplyRows.length) {
-          updatedConversation = (
-            await client.query(
-            `
-              UPDATE conversations
-              SET unread_user = unread_user + $3::int,
-                  last_auto_reply_at = NOW(),
-                  updated_at = NOW()
-              WHERE id = $1 AND tenant_id = $2
-              RETURNING *
-            `,
-            [conversationId, tenantId, autoReplyRows.length],
-            )
-          ).rows[0];
-        }
+        await client.query('RELEASE SAVEPOINT automatic_reply');
+      } catch (error) {
+        await client.query('ROLLBACK TO SAVEPOINT automatic_reply');
+        await client.query('RELEASE SAVEPOINT automatic_reply');
+        autoReplyRows = [];
+        updatedConversation = conversationBeforeAutoReply;
+        console.error('自动回复生成失败，访客消息已保留：', error.message);
       }
     }
 
@@ -11674,7 +11684,7 @@ async function createTenantEntryDomainSwitchRequest(message, domain) {
       `<b>通配 DNS</b>：${inspection.dnsReady ? '✅ 已解析' : '🛠 将自动创建'}`,
       `<b>Worker 路由</b>：${inspection.routeReady ? '✅ 已绑定' : '🛠 将自动绑定'}`,
       '',
-      '确认后系统会配置缺少的项目、更新全部模板入口并逐个验收。全部成功后才完成切换；失败会恢复原域名。',
+      '确认后系统会配置缺少的项目，并一次性更新全部模板入口。新版入口会逐个验收；旧版页面异常只会提示警告，不再让全部模板一起回滚。',
       '',
       '旧域名会作为历史入口永久保留，旧二维码和聊天记录不会失效。',
     ].join('\n'),
@@ -11693,34 +11703,59 @@ async function createTenantEntryDomainSwitchRequest(message, domain) {
 }
 
 async function smokeTestTenantEntryHosts(changes) {
-  for (const change of changes.filter((item) =>
-    ['testing', 'enabled'].includes(item.status),
-  )) {
-    const response = await fetch(
-      `https://${change.newHost}/?tenant=domain-switch-smoke`,
-      {
-        method: 'GET',
-        redirect: 'manual',
-        headers: { 'User-Agent': 'Tuojie-Domain-Switch-Smoke/2.4.8' },
-        signal: AbortSignal.timeout(20_000),
-      },
-    );
-    const contentType = String(response.headers.get('content-type') || '')
-      .toLowerCase();
-    if (
-      response.status !== 200 ||
-      !contentType.includes('text/html')
-    ) {
-      throw new Error(`${change.newHost} HTTPS 验收失败（${response.status}）。`);
-    }
-    const html = await response.text();
-    if (
-      !/<html[\s>]/i.test(html) ||
-      !/tuojie-template-(?:id|name)|notificationSettingsButton|在线客服/i.test(html)
-    ) {
-      throw new Error(`${change.newHost} 返回的不是客服模板页面。`);
+  const candidates = [];
+  const seenHosts = new Set();
+  for (const change of changes) {
+    if (!['testing', 'enabled'].includes(change.status)) continue;
+    const host = normalizeTenantEntryHost(change.newHost);
+    if (!host || seenHosts.has(host)) continue;
+    seenHosts.add(host);
+    candidates.push({ ...change, newHost: host });
+  }
+  const result = { tested: candidates.length, passed: 0, warnings: [] };
+  for (const change of candidates) {
+    try {
+      const response = await fetch(
+        `https://${change.newHost}/?tenant=domain-switch-smoke`,
+        {
+          method: 'GET',
+          redirect: 'manual',
+          headers: { 'User-Agent': 'Tuojie-Domain-Switch-Smoke/2.4.8' },
+          signal: AbortSignal.timeout(20_000),
+        },
+      );
+      const contentType = String(response.headers.get('content-type') || '')
+        .toLowerCase();
+      if (
+        response.status !== 200 ||
+        !contentType.includes('text/html')
+      ) {
+        throw new Error(`HTTPS 验收失败（${response.status}）。`);
+      }
+      const html = await response.text();
+      if (
+        !/<html[\s>]/i.test(html) ||
+        !/tuojie-template-(?:id|name)|notificationSettingsButton|在线客服/i.test(html)
+      ) {
+        throw new Error('返回的不是新版客服模板页面。');
+      }
+      result.passed += 1;
+    } catch (error) {
+      result.warnings.push({
+        host: change.newHost,
+        templateName: cleanText(change.templateName, 120),
+        reason: cleanText(error?.message || '入口验收失败。', 300),
+      });
     }
   }
+  if (candidates.length > 0 && result.passed === 0) {
+    const first = result.warnings[0];
+    throw new Error(
+      `新域名入口验收全部失败（共 ${candidates.length} 个）` +
+      `${first ? `：${first.host} ${first.reason}` : '。'}`,
+    );
+  }
+  return result;
 }
 
 async function restoreTenantEntryRootDomainSwitch(
@@ -11932,12 +11967,16 @@ async function switchTenantEntryRootDomain(
   invalidateTenantCaches();
   invalidateTenantEntryCaches();
   invalidateApprovedOrigins();
+  let smokeResult = { tested: 0, passed: 0, warnings: [] };
   try {
     await refreshApprovedOrigins(true);
     const tenantSmokeSample = tenantChanges
       .filter((item) => ['testing', 'enabled'].includes(item.status))
       .slice(0, 20);
-    await smokeTestTenantEntryHosts([...changes, ...tenantSmokeSample]);
+    smokeResult = await smokeTestTenantEntryHosts([
+      ...changes,
+      ...tenantSmokeSample,
+    ]);
   } catch (error) {
     await restoreTenantEntryRootDomainSwitch(
       changes,
@@ -11958,6 +11997,7 @@ async function switchTenantEntryRootDomain(
     domain,
     changes,
     tenantChanges,
+    smokeResult,
   };
 }
 
@@ -12045,10 +12085,13 @@ async function handleTenantEntryDomainCallback(callback) {
         `<b>原域名</b>：<code>${escapeTelegramHtml(result.previousDomain)}</code>`,
         `<b>新域名</b>：<code>${escapeTelegramHtml(result.domain)}</code>`,
         `<b>模板数量</b>：${result.changes.length} 个`,
+        `<b>入口验收</b>：${result.smokeResult.passed}/${result.smokeResult.tested} 个新版页面通过`,
         '',
         '✅ 通配 DNS 已就绪',
         '✅ Worker 路由已就绪',
-        '✅ HTTPS 与模板入口已验收',
+        result.smokeResult.warnings.length
+          ? `⚠️ ${result.smokeResult.warnings.length} 个旧版入口页面异常，但全部模板域名已经切换`
+          : '✅ HTTPS 与模板入口已验收',
         '✅ 新生成链接已使用新域名',
         '✅ 旧链接、旧二维码和原聊天记录继续有效',
       ].join('\n'),
