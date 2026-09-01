@@ -337,6 +337,11 @@ const WEBRTC_TURN_USERNAME = String(
 const WEBRTC_TURN_CREDENTIAL = String(
   process.env.WEBRTC_TURN_CREDENTIAL || '',
 );
+const WEBRTC_RELAY_MODE = ['always', 'auto', 'off'].includes(
+  String(process.env.WEBRTC_RELAY_MODE || 'always').trim().toLowerCase(),
+)
+  ? String(process.env.WEBRTC_RELAY_MODE || 'always').trim().toLowerCase()
+  : 'always';
 const CLOUDFLARE_TURN_KEY_ID = String(
   process.env.CLOUDFLARE_TURN_KEY_ID || '',
 ).trim();
@@ -5985,6 +5990,7 @@ function staticRealtimeConfig() {
   }
   return {
     iceServers,
+    relayMode: WEBRTC_RELAY_MODE,
     turnConfigured: Boolean(WEBRTC_TURN_URLS.length && WEBRTC_TURN_USERNAME && WEBRTC_TURN_CREDENTIAL),
     turnProvider: WEBRTC_TURN_URLS.length && WEBRTC_TURN_USERNAME && WEBRTC_TURN_CREDENTIAL
       ? 'static'

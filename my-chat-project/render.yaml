@@ -129,6 +129,8 @@ services:
         sync: false
       - key: CLOUDFLARE_TURN_TTL_SECONDS
         value: 86400
+      - key: WEBRTC_RELAY_MODE
+        value: always
       - key: WEBRTC_STUN_URLS
         value: stun:stun.cloudflare.com:3478
       - key: CALL_RING_TIMEOUT_SECONDS
