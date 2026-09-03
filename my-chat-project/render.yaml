@@ -73,6 +73,8 @@ services:
         value: 100
       - key: MAX_FILES_PER_MESSAGE
         value: 10
+      - key: MAX_FILE_BROADCAST_RECIPIENTS
+        value: 100
       - key: FILE_UPLOAD_URL_TTL_SECONDS
         value: 300
       - key: FILE_DOWNLOAD_URL_TTL_SECONDS

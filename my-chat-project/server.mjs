@@ -263,6 +263,9 @@ const MAX_FILE_BYTES =
 const MAX_FILES_PER_MESSAGE = Math.trunc(
   envNumber('MAX_FILES_PER_MESSAGE', 10, 1, 10),
 );
+const MAX_FILE_BROADCAST_RECIPIENTS = Math.trunc(
+  envNumber('MAX_FILE_BROADCAST_RECIPIENTS', 100, 2, 500),
+);
 const FILE_UPLOAD_URL_TTL_SECONDS = Math.trunc(
   envNumber('FILE_UPLOAD_URL_TTL_SECONDS', 300, 60, 900),
 );
@@ -5616,8 +5619,18 @@ async function queueObjectDeletes(objectKeys, client = pool) {
   await client.query(
     `
       INSERT INTO r2_delete_queue (object_key)
-      SELECT object_key
+      SELECT queued.object_key
       FROM unnest($1::text[]) AS queued(object_key)
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM attachments a
+        WHERE a.storage='r2' AND a.object_key=queued.object_key
+      )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM assets a
+          WHERE a.storage='r2' AND a.object_key=queued.object_key
+        )
       ON CONFLICT (object_key) DO NOTHING
     `,
     [unique],
@@ -5626,6 +5639,19 @@ async function queueObjectDeletes(objectKeys, client = pool) {
 
 async function processObjectDeleteQueue(limit = 50) {
   if (!R2_ENABLED) return;
+  await pool.query(`
+    DELETE FROM r2_delete_queue queued
+    WHERE EXISTS (
+      SELECT 1
+      FROM attachments a
+      WHERE a.storage='r2' AND a.object_key=queued.object_key
+    )
+       OR EXISTS (
+         SELECT 1
+         FROM assets a
+         WHERE a.storage='r2' AND a.object_key=queued.object_key
+       )
+  `);
   const result = await pool.query(
     `
       SELECT id, object_key, attempts
@@ -9462,6 +9488,7 @@ async function lockPendingAttachments(
       );
     }
   }
+  return attachmentIds.map((id) => byId.get(id));
 }
 
 async function insertMediaMessages(
@@ -9951,6 +9978,291 @@ async function createAdminMessage(
       messages,
       conversation: publicConversation,
       summary,
+    };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function createAdminFileBroadcast(body, tenantId) {
+  const input = parseMessageInput({ ...body, type: 'file' });
+  if (input.assetIds.length) {
+    throw requestError('批量发送只支持已上传的文件。', 400, 'INVALID_ATTACHMENT');
+  }
+  const conversationIds = Array.isArray(body?.conversationIds)
+    ? [...new Set(
+        body.conversationIds
+          .map((value) => cleanText(value, 80))
+          .filter(Boolean),
+      )]
+    : [];
+  if (
+    conversationIds.length < 2 ||
+    conversationIds.length > MAX_FILE_BROADCAST_RECIPIENTS ||
+    conversationIds.some((id) => !isUuid(id))
+  ) {
+    throw requestError(
+      `批量发送请选择 2-${MAX_FILE_BROADCAST_RECIPIENTS} 个进行中的会话。`,
+      400,
+      'FILE_BROADCAST_RECIPIENTS',
+    );
+  }
+  const sourceConversationId = cleanText(body?.sourceConversationId, 80);
+  if (
+    !isUuid(sourceConversationId) ||
+    !conversationIds.includes(sourceConversationId)
+  ) {
+    throw requestError(
+      '文件上传会话不在接收列表中，请重新选择后发送。',
+      400,
+      'FILE_BROADCAST_SOURCE',
+    );
+  }
+
+  const [config, featureStates] = await Promise.all([
+    getConfig(tenantId),
+    getTenantFeatureStates(tenantId),
+  ]);
+  if (!featureStates.media_album) {
+    throw requestError(
+      '文件功能当前未向该租户开放。',
+      403,
+      'FEATURE_DISABLED',
+    );
+  }
+  const retentionHours = Number(config.settings.retentionHours || 24);
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+    const conversationResult = await client.query(
+      `
+        SELECT *
+        FROM conversations
+        WHERE tenant_id=$1 AND id=ANY($2::uuid[])
+        ORDER BY id
+        FOR UPDATE
+      `,
+      [tenantId, conversationIds],
+    );
+    if (conversationResult.rows.length !== conversationIds.length) {
+      throw requestError(
+        '部分会话不存在或不属于当前商家。',
+        404,
+        'FILE_BROADCAST_CONVERSATION',
+      );
+    }
+    if (conversationResult.rows.some((row) => row.status !== 'open')) {
+      throw requestError(
+        '接收列表中包含已结束的会话，请取消选择后重试。',
+        409,
+        'FILE_BROADCAST_CLOSED',
+      );
+    }
+
+    const replayResult = await client.query(
+      `
+        SELECT
+          m.*,
+          a.filename AS attachment_filename,
+          a.mime AS attachment_mime,
+          a.size AS attachment_size
+        FROM messages m
+        LEFT JOIN attachments a ON a.id=m.attachment_id
+        WHERE m.conversation_id=ANY($1::uuid[])
+          AND m.role='admin'
+          AND m.source='manual'
+          AND m.client_request_id=$2
+        ORDER BY m.conversation_id,m.album_position,m.created_at,m.id
+      `,
+      [conversationIds, input.clientRequestId],
+    );
+    const expectedMessages = conversationIds.length * input.attachmentIds.length;
+    if (replayResult.rows.length) {
+      if (replayResult.rows.length !== expectedMessages) {
+        throw requestError(
+          '批量发送状态不完整，请刷新后台后再试。',
+          409,
+          'FILE_BROADCAST_REPLAY_MISMATCH',
+        );
+      }
+      await client.query('COMMIT');
+      const conversationsById = new Map(
+        conversationResult.rows.map((row) => [row.id, row]),
+      );
+      const rowsByConversation = new Map();
+      for (const row of replayResult.rows) {
+        const rows = rowsByConversation.get(row.conversation_id) || [];
+        rows.push(row);
+        rowsByConversation.set(row.conversation_id, rows);
+      }
+      return {
+        idempotentReplay: true,
+        results: conversationIds.map((conversationId) => {
+          const rows = rowsByConversation.get(conversationId) || [];
+          const latest = rows.at(-1);
+          return {
+            conversationId,
+            messages: rows.map(publicMessage),
+            summary: conversationSummary({
+              ...conversationsById.get(conversationId),
+              latest_id: latest?.id,
+              latest_type: latest?.type,
+              latest_text: latest?.text,
+              latest_role: latest?.role,
+              latest_created_at: latest?.created_at,
+            }),
+          };
+        }),
+      };
+    }
+
+    const sourceAttachments = await lockPendingAttachments(
+      client,
+      sourceConversationId,
+      'admin',
+      'file',
+      input.attachmentIds,
+    );
+    const attachmentRecords = [];
+    for (const conversationId of conversationIds) {
+      for (const source of sourceAttachments) {
+        attachmentRecords.push({
+          id:
+            conversationId === sourceConversationId
+              ? source.id
+              : randomUUID(),
+          conversationId,
+          filename: source.filename,
+          mime: source.mime,
+          size: Number(source.size),
+          objectKey: source.object_key,
+        });
+      }
+    }
+    const clones = attachmentRecords.filter(
+      (record) => record.conversationId !== sourceConversationId,
+    );
+    if (clones.length) {
+      await client.query(
+        `
+          INSERT INTO attachments (
+            id,conversation_id,filename,mime,size,uploader,data,
+            storage,object_key,expires_at
+          )
+          SELECT
+            input.id,input.conversation_id,input.filename,input.mime,
+            input.size,'admin',NULL,'r2',input.object_key,
+            NOW() + ($7::text || ' hours')::interval
+          FROM unnest(
+            $1::uuid[],$2::uuid[],$3::text[],$4::text[],$5::int[],$6::text[]
+          ) AS input(id,conversation_id,filename,mime,size,object_key)
+        `,
+        [
+          clones.map((record) => record.id),
+          clones.map((record) => record.conversationId),
+          clones.map((record) => record.filename),
+          clones.map((record) => record.mime),
+          clones.map((record) => record.size),
+          clones.map((record) => record.objectKey),
+          retentionHours,
+        ],
+      );
+    }
+
+    const messageRecords = attachmentRecords.map((attachment, index) => ({
+      id: randomUUID(),
+      conversationId: attachment.conversationId,
+      attachmentId: attachment.id,
+      position: index % input.attachmentIds.length,
+    }));
+    const insertedMessages = await client.query(
+      `
+        WITH inserted AS (
+          INSERT INTO messages (
+            id,conversation_id,role,source,type,text,attachment_id,
+            album_position,client_request_id,created_at,expires_at
+          )
+          SELECT
+            input.id,input.conversation_id,'admin','manual','file','',
+            input.attachment_id,input.position,$5,
+            NOW() + ((input.position + 1)::text || ' milliseconds')::interval,
+            NOW() + ((input.position + 1)::text || ' milliseconds')::interval
+              + ($6::text || ' hours')::interval
+          FROM unnest(
+            $1::uuid[],$2::uuid[],$3::uuid[],$4::int[]
+          ) AS input(id,conversation_id,attachment_id,position)
+          RETURNING *
+        )
+        SELECT
+          inserted.*,
+          a.filename AS attachment_filename,
+          a.mime AS attachment_mime,
+          a.size AS attachment_size
+        FROM inserted
+        LEFT JOIN attachments a ON a.id=inserted.attachment_id
+        ORDER BY inserted.conversation_id,inserted.album_position
+      `,
+      [
+        messageRecords.map((record) => record.id),
+        messageRecords.map((record) => record.conversationId),
+        messageRecords.map((record) => record.attachmentId),
+        messageRecords.map((record) => record.position),
+        input.clientRequestId,
+        retentionHours,
+      ],
+    );
+    await client.query(
+      `
+        UPDATE attachments
+        SET linked_at=NOW(),
+            expires_at=NOW() + ($2::text || ' hours')::interval
+        WHERE id=ANY($1::uuid[])
+      `,
+      [attachmentRecords.map((record) => record.id), retentionHours],
+    );
+    const updatedConversations = await client.query(
+      `
+        UPDATE conversations
+        SET unread_user=unread_user + $3::int,
+            updated_at=NOW()
+        WHERE tenant_id=$1 AND id=ANY($2::uuid[])
+        RETURNING *
+      `,
+      [tenantId, conversationIds, input.attachmentIds.length],
+    );
+    await client.query('COMMIT');
+
+    minuteCounters.messages += insertedMessages.rows.length;
+    const conversationsById = new Map(
+      updatedConversations.rows.map((row) => [row.id, row]),
+    );
+    const rowsByConversation = new Map();
+    for (const row of insertedMessages.rows) {
+      const rows = rowsByConversation.get(row.conversation_id) || [];
+      rows.push(row);
+      rowsByConversation.set(row.conversation_id, rows);
+    }
+    return {
+      results: conversationIds.map((conversationId) => {
+        const rows = rowsByConversation.get(conversationId) || [];
+        const latest = rows.at(-1);
+        return {
+          conversationId,
+          messages: rows.map(publicMessage),
+          summary: conversationSummary({
+            ...conversationsById.get(conversationId),
+            latest_id: latest?.id,
+            latest_type: latest?.type,
+            latest_text: latest?.text,
+            latest_role: latest?.role,
+            latest_created_at: latest?.created_at,
+          }),
+        };
+      }),
     };
   } catch (error) {
     await client.query('ROLLBACK');
@@ -21741,6 +22053,39 @@ async function router(req, res, parsedRequestUrl = null) {
         ...(await getTenantNotices(payload.tenantId)),
       });
     }
+    if (req.method === 'POST' && pathname === '/api/admin/file-broadcasts') {
+      if (
+        !rateLimit(
+          req,
+          res,
+          'admin-file-broadcast',
+          20,
+          60_000,
+          payload.tenantId,
+        )
+      ) return;
+      const body = await readJson(req, 256 * 1024);
+      const result = await createAdminFileBroadcast(body, payload.tenantId);
+      for (const item of result.results) {
+        await broadcastMessageResult(
+          {
+            messages: item.messages,
+            summary: item.summary,
+            conversation: item.summary,
+          },
+          'admin-file-broadcast',
+          item.conversationId,
+          payload.tenantId,
+          apiVersion,
+        );
+      }
+      return sendJson(res, 201, {
+        ok: true,
+        recipientCount: result.results.length,
+        idempotentReplay: Boolean(result.idempotentReplay),
+        results: result.results,
+      });
+    }
     const announcementRead = pathname.match(
       /^\/api\/admin\/announcements\/([0-9a-f-]+)\/read$/i,
     );
@@ -22074,13 +22419,13 @@ async function router(req, res, parsedRequestUrl = null) {
             `,
             [conversationId],
           );
-          await queueObjectDeletes(
-            stored.rows.map((row) => row.object_key),
-            databaseClient,
-          );
           await databaseClient.query(
             `DELETE FROM conversations WHERE id=$1 AND tenant_id=$2`,
             [conversationId, payload.tenantId],
+          );
+          await queueObjectDeletes(
+            stored.rows.map((row) => row.object_key),
+            databaseClient,
           );
           await databaseClient.query('COMMIT');
         } catch (error) {
