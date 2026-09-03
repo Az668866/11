@@ -17,9 +17,11 @@ import {
 import {
   DeleteObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import pg from 'pg';
 import QRCode from 'qrcode';
 import sharp from 'sharp';
@@ -256,6 +258,17 @@ const MAX_VIDEO_BYTES =
   envNumber('MAX_VIDEO_MB', 25, 1, 50) * 1024 * 1024;
 const MAX_AUDIO_BYTES =
   envNumber('MAX_AUDIO_MB', 12, 1, 30) * 1024 * 1024;
+const MAX_FILE_BYTES =
+  envNumber('MAX_FILE_MB', 100, 1, 200) * 1024 * 1024;
+const MAX_FILES_PER_MESSAGE = Math.trunc(
+  envNumber('MAX_FILES_PER_MESSAGE', 10, 1, 10),
+);
+const FILE_UPLOAD_URL_TTL_SECONDS = Math.trunc(
+  envNumber('FILE_UPLOAD_URL_TTL_SECONDS', 300, 60, 900),
+);
+const FILE_DOWNLOAD_URL_TTL_SECONDS = Math.trunc(
+  envNumber('FILE_DOWNLOAD_URL_TTL_SECONDS', 300, 60, 900),
+);
 const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
 const MAX_QR_LOGO_BYTES = 3 * 1024 * 1024;
 const MAX_COVER_BYTES = 5 * 1024 * 1024;
@@ -555,6 +568,30 @@ const ALLOWED_AUDIO_TYPES = new Set([
   'audio/mpeg',
   'audio/wav',
 ]);
+const CHAT_FILE_TYPES = Object.freeze({
+  apk: { mime: 'application/vnd.android.package-archive', label: 'Android 安装包' },
+  pdf: { mime: 'application/pdf', label: 'PDF 文档' },
+  doc: { mime: 'application/msword', label: 'Word 文档' },
+  docx: { mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', label: 'Word 文档' },
+  xls: { mime: 'application/vnd.ms-excel', label: 'Excel 表格' },
+  xlsx: { mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', label: 'Excel 表格' },
+  ppt: { mime: 'application/vnd.ms-powerpoint', label: 'PowerPoint 演示文稿' },
+  pptx: { mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', label: 'PowerPoint 演示文稿' },
+  txt: { mime: 'text/plain', label: '文本文件' },
+  log: { mime: 'text/plain', label: '日志文件' },
+  csv: { mime: 'text/csv', label: 'CSV 表格' },
+  md: { mime: 'text/markdown', label: 'Markdown 文档' },
+  json: { mime: 'application/json', label: 'JSON 文件' },
+  xml: { mime: 'application/xml', label: 'XML 文件' },
+  zip: { mime: 'application/zip', label: 'ZIP 压缩包' },
+  rar: { mime: 'application/vnd.rar', label: 'RAR 压缩包' },
+  '7z': { mime: 'application/x-7z-compressed', label: '7Z 压缩包' },
+  gz: { mime: 'application/gzip', label: 'GZIP 压缩包' },
+  tar: { mime: 'application/x-tar', label: 'TAR 压缩包' },
+});
+const ALLOWED_FILE_TYPES = new Set(
+  Object.values(CHAT_FILE_TYPES).map((item) => item.mime),
+);
 const DEFAULT_USER_SITE_URL = 'https://zxkf.netlify.app/';
 const DEFAULT_TEMPLATE_ID = '11111111-1111-4111-8111-111111111111';
 const RETENTION_OPTIONS = new Set([1, 6, 12, 24, 72, 168, 240, 360]);
@@ -1930,7 +1967,14 @@ async function initDatabase() {
         mime TEXT NOT NULL CHECK (mime IN (
           'image/jpeg','image/png','image/webp','image/gif',
           'video/mp4','video/webm','video/quicktime',
-          'audio/webm','audio/ogg','audio/mp4','audio/mpeg','audio/wav'
+          'audio/webm','audio/ogg','audio/mp4','audio/mpeg','audio/wav',
+          'application/vnd.android.package-archive','application/pdf',
+          'application/msword','application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          'application/vnd.ms-excel','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          'application/vnd.ms-powerpoint','application/vnd.openxmlformats-officedocument.presentationml.presentation',
+          'text/plain','text/csv','text/markdown','application/json','application/xml',
+          'application/zip','application/vnd.rar','application/x-7z-compressed',
+          'application/gzip','application/x-tar'
         )),
         size INTEGER NOT NULL CHECK (size > 0),
         uploader TEXT NOT NULL CHECK (uploader IN ('user','admin')),
@@ -1950,7 +1994,7 @@ async function initDatabase() {
         conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
         role TEXT NOT NULL CHECK (role IN ('user','admin')),
         source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual','auto')),
-        type TEXT NOT NULL CHECK (type IN ('text','image','video','audio')),
+        type TEXT NOT NULL CHECK (type IN ('text','image','video','audio','file')),
         text TEXT NOT NULL DEFAULT '',
         attachment_id UUID UNIQUE REFERENCES attachments(id) ON DELETE CASCADE,
         asset_id UUID REFERENCES assets(id) ON DELETE RESTRICT,
@@ -1961,7 +2005,7 @@ async function initDatabase() {
           (type = 'text' AND attachment_id IS NULL AND asset_id IS NULL AND length(text) > 0)
           OR
           (
-            type IN ('image','video','audio')
+            type IN ('image','video','audio','file')
             AND ((attachment_id IS NOT NULL)::int + (asset_id IS NOT NULL)::int) = 1
           )
         )
@@ -1986,13 +2030,20 @@ async function initDatabase() {
       ADD CONSTRAINT attachments_mime_check CHECK (mime IN (
         'image/jpeg','image/png','image/webp','image/gif',
         'video/mp4','video/webm','video/quicktime',
-        'audio/webm','audio/ogg','audio/mp4','audio/mpeg','audio/wav'
+        'audio/webm','audio/ogg','audio/mp4','audio/mpeg','audio/wav',
+        'application/vnd.android.package-archive','application/pdf',
+        'application/msword','application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'application/vnd.ms-excel','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'application/vnd.ms-powerpoint','application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        'text/plain','text/csv','text/markdown','application/json','application/xml',
+        'application/zip','application/vnd.rar','application/x-7z-compressed',
+        'application/gzip','application/x-tar'
       ))
     `);
     await client.query(`ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_type_check`);
     await client.query(`
       ALTER TABLE messages
-      ADD CONSTRAINT messages_type_check CHECK (type IN ('text','image','video','audio'))
+      ADD CONSTRAINT messages_type_check CHECK (type IN ('text','image','video','audio','file'))
     `);
     await client.query(`ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_check`);
     await client.query(`
@@ -2008,7 +2059,7 @@ async function initDatabase() {
         (
           recalled_at IS NULL
           AND
-          type IN ('image','video','audio')
+          type IN ('image','video','audio','file')
           AND ((attachment_id IS NOT NULL)::int + (asset_id IS NOT NULL)::int) = 1
         )
       )
@@ -2105,14 +2156,22 @@ async function initDatabase() {
           FROM pg_constraint
           WHERE conrelid = 'attachments'::regclass
             AND conname = 'attachments_mime_check'
-            AND pg_get_constraintdef(oid) LIKE '%video/mp4%'
+            AND pg_get_constraintdef(oid) LIKE '%application/vnd.android.package-archive%'
         ) THEN
           ALTER TABLE attachments
             DROP CONSTRAINT IF EXISTS attachments_mime_check;
           ALTER TABLE attachments
             ADD CONSTRAINT attachments_mime_check CHECK (mime IN (
               'image/jpeg','image/png','image/webp','image/gif',
-              'video/mp4','video/webm','video/quicktime'
+              'video/mp4','video/webm','video/quicktime',
+              'audio/webm','audio/ogg','audio/mp4','audio/mpeg','audio/wav',
+              'application/vnd.android.package-archive','application/pdf',
+              'application/msword','application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+              'application/vnd.ms-excel','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+              'application/vnd.ms-powerpoint','application/vnd.openxmlformats-officedocument.presentationml.presentation',
+              'text/plain','text/csv','text/markdown','application/json','application/xml',
+              'application/zip','application/vnd.rar','application/x-7z-compressed',
+              'application/gzip','application/x-tar'
             ));
         END IF;
 
@@ -2121,12 +2180,12 @@ async function initDatabase() {
           FROM pg_constraint
           WHERE conrelid = 'messages'::regclass
             AND conname = 'messages_type_check'
-            AND pg_get_constraintdef(oid) LIKE '%video%'
+            AND pg_get_constraintdef(oid) LIKE '%file%'
         ) THEN
           ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_type_check;
           ALTER TABLE messages
             ADD CONSTRAINT messages_type_check
-            CHECK (type IN ('text','image','video'));
+            CHECK (type IN ('text','image','video','audio','file'));
         END IF;
 
         IF NOT EXISTS (
@@ -2136,6 +2195,7 @@ async function initDatabase() {
             AND conname = 'messages_check'
             AND pg_get_constraintdef(oid) LIKE '%recalled_at%'
             AND pg_get_constraintdef(oid) LIKE '%asset_id%'
+            AND pg_get_constraintdef(oid) LIKE '%file%'
         ) THEN
           ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_check;
           ALTER TABLE messages
@@ -2158,7 +2218,7 @@ async function initDatabase() {
               OR
               (
                 recalled_at IS NULL
-                AND type IN ('image','video','audio')
+                AND type IN ('image','video','audio','file')
                 AND ((attachment_id IS NOT NULL)::int + (asset_id IS NOT NULL)::int) = 1
               )
             );
@@ -4631,6 +4691,49 @@ function safeFilename(value) {
   );
 }
 
+function chatFileDefinition(filename, size) {
+  const safeName = safeFilename(filename || 'file');
+  const extension = safeName.toLowerCase().match(/\.([a-z0-9]{1,10})$/)?.[1] || '';
+  const definition = CHAT_FILE_TYPES[extension];
+  if (!definition) {
+    throw requestError(
+      '暂不支持此文件类型。支持 APK、文档、表格、文本和常用压缩包。',
+      415,
+      'FILE_TYPE',
+    );
+  }
+  const bytes = Math.trunc(Number(size));
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    throw requestError('文件内容为空。', 400, 'EMPTY_FILE');
+  }
+  if (bytes > MAX_FILE_BYTES) {
+    throw requestError(
+      `单个文件不能超过 ${Math.round(MAX_FILE_BYTES / 1024 / 1024)}MB。`,
+      413,
+      'FILE_TOO_LARGE',
+    );
+  }
+  return {
+    filename: safeName,
+    extension,
+    mime: definition.mime,
+    label: definition.label,
+    size: bytes,
+  };
+}
+
+function attachmentContentDisposition(filename) {
+  const safeName = safeFilename(filename || 'download');
+  const asciiName = safeName
+    .replace(/[^\x20-\x7E]/g, '_')
+    .replace(/["\\]/g, '_') || 'download';
+  const encoded = encodeURIComponent(safeName).replace(
+    /[!'()*]/g,
+    (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+  return `attachment; filename="${asciiName}"; filename*=UTF-8''${encoded}`;
+}
+
 function normalizeIp(value) {
   let ip = String(value || '').trim();
   if (ip.startsWith('[') && ip.includes(']')) ip = ip.slice(1, ip.indexOf(']'));
@@ -5584,6 +5687,39 @@ function mediaObjectKey(tenantId, conversationId, attachmentId, mime) {
   return `chat/${tenantId}/${conversationId}/${attachmentId}.${extension}`;
 }
 
+function fileObjectKey(tenantId, conversationId, attachmentId, extension) {
+  return `chat-files/${tenantId}/${conversationId}/${attachmentId}.${extension}`;
+}
+
+async function signedFileUploadUrl(objectKey, mime) {
+  if (!R2_ENABLED) return '';
+  return getSignedUrl(
+    r2,
+    new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: objectKey,
+      ContentType: mime,
+      CacheControl: 'private, no-store',
+    }),
+    { expiresIn: FILE_UPLOAD_URL_TTL_SECONDS },
+  );
+}
+
+async function signedFileDownloadUrl(row) {
+  if (!R2_ENABLED || row?.storage !== 'r2' || !row?.object_key) return '';
+  return getSignedUrl(
+    r2,
+    new GetObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: row.object_key,
+      ResponseContentType: row.mime,
+      ResponseContentDisposition: attachmentContentDisposition(row.filename),
+      ResponseCacheControl: 'private, no-store',
+    }),
+    { expiresIn: FILE_DOWNLOAD_URL_TTL_SECONDS },
+  );
+}
+
 async function saveAsset({
   tenantId = null,
   kind,
@@ -5940,6 +6076,15 @@ function publicMessage(row) {
     type: row.type,
     text: row.text || '',
     attachmentId: row.attachment_id || row.asset_id || null,
+    attachment:
+      row.attachment_id && row.attachment_filename
+        ? {
+            id: row.attachment_id,
+            filename: row.attachment_filename,
+            mime: row.attachment_mime || 'application/octet-stream',
+            size: Number(row.attachment_size || 0),
+          }
+        : null,
     assetId: row.asset_id || null,
     albumId: row.album_id || null,
     albumPosition: Number(row.album_position || 0),
@@ -7022,8 +7167,10 @@ function conversationSummary(row) {
             ? row.latest_text || '[图片]'
             : row.latest_type === 'video'
               ? row.latest_text || '[视频]'
-              : row.latest_type === 'audio'
-                ? row.latest_text || '[语音]'
+            : row.latest_type === 'audio'
+              ? row.latest_text || '[语音]'
+              : row.latest_type === 'file'
+                ? row.latest_text || '[文件]'
                 : row.latest_text || '',
         role: row.latest_role,
         createdAt: new Date(row.latest_created_at).toISOString(),
@@ -7871,8 +8018,13 @@ async function getPublicConversation(id, client = pool, tenantId) {
         FROM recent
         WHERE album_id IS NOT NULL
       )
-      SELECT m.*
+      SELECT
+        m.*,
+        a.filename AS attachment_filename,
+        a.mime AS attachment_mime,
+        a.size AS attachment_size
       FROM messages m
+      LEFT JOIN attachments a ON a.id=m.attachment_id
       WHERE m.conversation_id = $1
         AND (
           m.id IN (SELECT id FROM recent)
@@ -7948,8 +8100,12 @@ async function getConversationMessagePage(
       )
       SELECT
         m.*,
+        a.filename AS attachment_filename,
+        a.mime AS attachment_mime,
+        a.size AS attachment_size,
         ((SELECT COUNT(*) FROM page_base) > $2)::boolean AS _has_more
       FROM messages m
+      LEFT JOIN attachments a ON a.id=m.attachment_id
       WHERE m.conversation_id=$1
         AND (
           m.id IN (SELECT id FROM chosen)
@@ -8773,6 +8929,96 @@ setInterval(() => {
   }
 }, 20_000).unref();
 
+async function handleFileUploadInit(req, res, payload, conversation) {
+  if (payload.kind !== 'tenant_admin') {
+    return sendError(res, 403, '只有商家客服可以发送文件。', 'FILE_UPLOAD_FORBIDDEN');
+  }
+  if (conversation.status === 'closed') {
+    return sendError(res, 409, '此会话已结束。', 'CLOSED');
+  }
+  await requireTenantFeature('media_album', payload.tenantId);
+  if (!R2_ENABLED) {
+    return sendError(
+      res,
+      503,
+      '文件存储尚未配置，请联系管理员。',
+      'FILE_STORAGE_UNAVAILABLE',
+    );
+  }
+
+  const rateIdentity = `${payload.tenantId}:${conversation.id}`;
+  if (!rateLimit(req, res, 'file-upload-init', 20, 60_000, rateIdentity, {
+    tenantId: payload.tenantId,
+    conversationId: conversation.id,
+  })) return;
+
+  const body = await readJson(req, 64 * 1024);
+  const files = Array.isArray(body.files) ? body.files : [];
+  if (!files.length || files.length > MAX_FILES_PER_MESSAGE) {
+    return sendError(
+      res,
+      400,
+      `一次可以发送 1-${MAX_FILES_PER_MESSAGE} 个文件。`,
+      'FILE_COUNT',
+    );
+  }
+
+  const records = files.map((file) => {
+    const definition = chatFileDefinition(file?.name, file?.size);
+    const id = randomUUID();
+    return {
+      id,
+      ...definition,
+      objectKey: fileObjectKey(
+        payload.tenantId,
+        conversation.id,
+        id,
+        definition.extension,
+      ),
+    };
+  });
+  const uploadUrls = await Promise.all(
+    records.map((record) => signedFileUploadUrl(record.objectKey, record.mime)),
+  );
+  const result = await pool.query(
+    `
+      INSERT INTO attachments (
+        id, conversation_id, filename, mime, size, uploader, data,
+        storage, object_key, expires_at
+      )
+      SELECT
+        input.id,$6,input.filename,input.mime,input.size,'admin',NULL,
+        'r2',input.object_key,NOW() + INTERVAL '10 minutes'
+      FROM unnest(
+        $1::uuid[],$2::text[],$3::text[],$4::int[],$5::text[]
+      ) AS input(id,filename,mime,size,object_key)
+      RETURNING id,conversation_id,filename,mime,size,uploader,created_at
+    `,
+    [
+      records.map((record) => record.id),
+      records.map((record) => record.filename),
+      records.map((record) => record.mime),
+      records.map((record) => record.size),
+      records.map((record) => record.objectKey),
+      conversation.id,
+    ],
+  );
+  const rowsById = new Map(result.rows.map((row) => [row.id, row]));
+  return sendJson(res, 201, {
+    ok: true,
+    uploads: records.map((record, index) => ({
+      attachment: publicAttachment(rowsById.get(record.id)),
+      label: record.label,
+      uploadUrl: uploadUrls[index],
+      headers: {
+        'Content-Type': record.mime,
+        'Cache-Control': 'private, no-store',
+      },
+    })),
+    expiresIn: FILE_UPLOAD_URL_TTL_SECONDS,
+  });
+}
+
 async function handleUpload(req, res, payload, conversation) {
   if (conversation.status === 'closed') {
     return sendError(res, 409, '此会话已结束。', 'CLOSED');
@@ -8961,7 +9207,7 @@ function requestError(message, statusCode, code) {
 
 function parseMessageInput(body = {}) {
   const requestedType = cleanText(body.type, 20) || 'text';
-  if (!['text', 'image', 'video', 'audio'].includes(requestedType)) {
+  if (!['text', 'image', 'video', 'audio', 'file'].includes(requestedType)) {
     throw requestError('消息类型无效。', 400, 'INVALID_MESSAGE_TYPE');
   }
   const suppliedClientRequestId = cleanText(body.clientRequestId, 128);
@@ -9025,6 +9271,13 @@ function parseMessageInput(body = {}) {
   if (requestedType === 'audio' && mediaCount !== 1) {
     throw requestError('一次只能发送一条语音。', 400, 'AUDIO_LIMIT');
   }
+  if (requestedType === 'file' && mediaCount > MAX_FILES_PER_MESSAGE) {
+    throw requestError(
+      `一次最多发送 ${MAX_FILES_PER_MESSAGE} 个文件。`,
+      400,
+      'FILE_LIMIT',
+    );
+  }
 
   return { type: requestedType, text, attachmentIds, assetIds, clientRequestId };
 }
@@ -9036,10 +9289,16 @@ async function findManualMessageReplay(
   clientRequestId,
 ) {
   const result = await client.query(
-    `SELECT * FROM messages
-     WHERE conversation_id=$1 AND role=$2 AND source='manual'
-       AND client_request_id=$3
-     ORDER BY album_position,created_at,id`,
+    `SELECT
+       m.*,
+       a.filename AS attachment_filename,
+       a.mime AS attachment_mime,
+       a.size AS attachment_size
+     FROM messages m
+     LEFT JOIN attachments a ON a.id=m.attachment_id
+     WHERE m.conversation_id=$1 AND m.role=$2 AND m.source='manual'
+       AND m.client_request_id=$3
+     ORDER BY m.album_position,m.created_at,m.id`,
     [conversationId, role, clientRequestId],
   );
   return result.rows;
@@ -9145,7 +9404,7 @@ async function lockPendingAttachments(
 ) {
   const result = await client.query(
     `
-      SELECT id, mime
+      SELECT id,filename,mime,size,storage,object_key
       FROM attachments
       WHERE id = ANY($1::uuid[])
         AND conversation_id = $2
@@ -9167,10 +9426,41 @@ async function lockPendingAttachments(
     const mime = byId.get(id)?.mime;
     if (type === 'image') return ALLOWED_IMAGE_TYPES.has(mime);
     if (type === 'video') return ALLOWED_VIDEO_TYPES.has(mime);
-    return ALLOWED_AUDIO_TYPES.has(mime);
+    if (type === 'audio') return ALLOWED_AUDIO_TYPES.has(mime);
+    return (
+      uploader === 'admin' &&
+      ALLOWED_FILE_TYPES.has(mime) &&
+      byId.get(id)?.storage === 'r2' &&
+      Boolean(byId.get(id)?.object_key)
+    );
   });
   if (!valid) {
     throw requestError('媒体附件类型不匹配。', 400, 'INVALID_ATTACHMENT_TYPE');
+  }
+  if (type === 'file') {
+    try {
+      await Promise.all(result.rows.map(async (row) => {
+        const stored = await r2.send(
+          new HeadObjectCommand({ Bucket: R2_BUCKET, Key: row.object_key }),
+        );
+        const storedMime = String(stored.ContentType || '')
+          .split(';')[0]
+          .trim()
+          .toLowerCase();
+        if (
+          Number(stored.ContentLength) !== Number(row.size) ||
+          storedMime !== row.mime
+        ) {
+          throw new Error('uploaded file metadata mismatch');
+        }
+      }));
+    } catch {
+      throw requestError(
+        '文件尚未上传完成或内容不完整，请重新发送。',
+        409,
+        'FILE_UPLOAD_INCOMPLETE',
+      );
+    }
   }
 }
 
@@ -9193,17 +9483,26 @@ async function insertMediaMessages(
   const positions = attachmentIds.map((_, index) => index);
   const result = await client.query(
     `
-      INSERT INTO messages (
-        id, conversation_id, role, source, type, text, attachment_id,
-        album_id, album_position, client_request_id, expires_at
+      WITH inserted AS (
+        INSERT INTO messages (
+          id, conversation_id, role, source, type, text, attachment_id,
+          album_id, album_position, client_request_id, expires_at
+        )
+        SELECT
+          input.id,$5,$6,'manual',$7,input.body_text,input.attachment_id,
+          $8,input.position,$10,NOW() + ($9::text || ' hours')::interval
+        FROM unnest(
+          $1::uuid[],$2::uuid[],$3::text[],$4::int[]
+        ) AS input(id,attachment_id,body_text,position)
+        RETURNING *
       )
       SELECT
-        input.id,$5,$6,'manual',$7,input.body_text,input.attachment_id,
-        $8,input.position,$10,NOW() + ($9::text || ' hours')::interval
-      FROM unnest(
-        $1::uuid[],$2::uuid[],$3::text[],$4::int[]
-      ) AS input(id,attachment_id,body_text,position)
-      RETURNING *
+        inserted.*,
+        a.filename AS attachment_filename,
+        a.mime AS attachment_mime,
+        a.size AS attachment_size
+      FROM inserted
+      LEFT JOIN attachments a ON a.id=inserted.attachment_id
     `,
     [
       messageIds,
@@ -9240,6 +9539,9 @@ async function createUserMessage(
   { includeConversation = true } = {},
 ) {
   const input = parseMessageInput(body);
+  if (input.type === 'file') {
+    throw requestError('访客不能向商家发送普通文件。', 403, 'FILE_UPLOAD_FORBIDDEN');
+  }
   if (input.assetIds.length) {
     throw requestError('访客不能发送后台预设素材。', 403, 'FORBIDDEN_ASSET');
   }
@@ -10943,7 +11245,7 @@ function claimTelegramGeneration(callback) {
 
 function telegramGeneratedLicenseText(created) {
   return [
-    '<b>普通卡密和管理员超级卡密已生成</b>',
+    '<b>卡密已生成！</b>',
     '你的后台网站是 <b>YKF000.com</b>',
     '为了你的隐私和客户安全',
     '请保护好你的卡密 不要泄露！',
@@ -10951,17 +11253,12 @@ function telegramGeneratedLicenseText(created) {
     `卡密类型：${created.duration.label}`,
     `有效时长：首次登录后台后 ${licenseUnusedDurationLabel(created.row)}`,
     '',
-    '<b>普通卡密（发给租户）</b>',
+    '<b>你的卡密是（点击即可复制）</b>',
     `<code>${created.licenseKey}</code>`,
-    '',
-    '<b>管理员超级卡密（禁止发给租户）</b>',
-    `<code>${created.superLicenseKey || '历史卡密未生成'}</code>`,
-    '',
-    `普通卡密设备上限：电脑 ${Number(created.row.max_desktop_devices || LICENSE_DESKTOP_DEVICE_DEFAULT)} 台｜手机/平板 ${Number(created.row.max_mobile_devices || LICENSE_MOBILE_DEVICE_DEFAULT)} 台`,
   ].join('\n');
 }
 
-function telegramGeneratedLicenseKeyboard(licenseKey, superLicenseKey = '') {
+function telegramGeneratedLicenseKeyboard(licenseKey) {
   return {
     inline_keyboard: [
       [
@@ -10970,12 +11267,6 @@ function telegramGeneratedLicenseKeyboard(licenseKey, superLicenseKey = '') {
           copy_text: { text: licenseKey },
         },
       ],
-      ...(superLicenseKey
-        ? [[{
-            text: '🔐 复制管理员超级卡密',
-            copy_text: { text: superLicenseKey },
-          }]]
-        : []),
     ],
   };
 }
@@ -10987,10 +11278,7 @@ async function showTelegramGeneratedLicense(callback, created) {
     text: telegramGeneratedLicenseText(created),
     parse_mode: 'HTML',
     link_preview_options: { is_disabled: true },
-    reply_markup: telegramGeneratedLicenseKeyboard(
-      created.licenseKey,
-      created.superLicenseKey,
-    ),
+    reply_markup: telegramGeneratedLicenseKeyboard(created.licenseKey),
   };
   if (chatId != null && messageId != null) {
     await telegramApi('editMessageText', {
@@ -11205,7 +11493,6 @@ async function sendAllLicenses(chatId, message, requestedPage = 1) {
       ), page_rows AS (
         SELECT
           id,key_prefix,key_suffix,duration_code,duration_days,
-          super_key_suffix,
           status,telegram_user_id,telegram_username,telegram_display_name,
           activated_at,expires_at,revoked_at,created_at
         FROM license_keys
@@ -11237,7 +11524,6 @@ async function sendAllLicenses(chatId, message, requestedPage = 1) {
         : formatTelegramDate(row.expires_at);
     lines.push(
       `${offset + index + 1}. ${licenseHint(row)} · ${telegramLicenseStatus(row)}`,
-      `管理员超级卡密：${superLicenseHint(row) || '历史卡密未生成'}`,
       `生成者：${telegramLicenseCreator(row)}`,
       `生成：${formatTelegramDate(row.created_at)}｜到期：${expiry}`,
       ...(row.revoked_at
@@ -13046,7 +13332,7 @@ async function handleQrIncidentCallback(callback) {
       const incident = await blockQrIncidentReporter(match[2], String(userId || ''));
       await telegramApi('sendMessage', {
         chat_id: chat.id,
-        text: `⛔ 已封禁报告普通卡密，管理员超级卡密仍可使用：${incident.public_code}`,
+        text: `⛔ 已封禁报告卡密：${incident.public_code}`,
         ...telegramThread(callback.message),
       });
     }
@@ -13227,7 +13513,7 @@ async function handleSecurityEventCallback(callback) {
       } finally {
         client.release();
       }
-      resultText = `⛔ 已封禁普通卡密 ${event.key_prefix || 'VIP'}-***-${event.key_suffix || '?????'}${disconnectedTenantId ? '，并中断该普通卡密后台会话；管理员超级卡密仍可使用' : ''}。`;
+      resultText = `⛔ 已封禁卡密 ${event.key_prefix || 'VIP'}-***-${event.key_suffix || '?????'}${disconnectedTenantId ? '，并中断该卡密后台会话' : ''}。`;
     } else if (match[1] === 'ip') {
       if (!securityIpBlockable(event.ip_address)) {
         throw new Error(
@@ -13653,7 +13939,7 @@ async function processTelegramUpdate(update) {
               revokedTenantId = row.tenant_id;
               revokedLicenseId = row.id;
             }
-            text = `✅ 已禁用普通卡密：${displayKey}\n管理员超级卡密仍可登录。`;
+            text = `✅ 已禁用卡密：${displayKey}`;
           }
         }
         await client.query('COMMIT');
@@ -21554,7 +21840,7 @@ async function router(req, res, parsedRequestUrl = null) {
     }
 
     const match = pathname.match(
-      /^\/api\/admin\/conversations\/([^/]+)(?:\/(messages|uploads|read|call))?$/,
+      /^\/api\/admin\/conversations\/([^/]+)(?:\/(messages|uploads|file-uploads|read|call))?$/,
     );
 
     if (match) {
@@ -21998,6 +22284,10 @@ async function router(req, res, parsedRequestUrl = null) {
         return handleUpload(req, res, payload, conversation);
       }
 
+      if (req.method === 'POST' && action === 'file-uploads') {
+        return handleFileUploadInit(req, res, payload, conversation);
+      }
+
       if (req.method === 'POST' && action === 'messages') {
         if (
           !rateLimit(
@@ -22031,6 +22321,98 @@ async function router(req, res, parsedRequestUrl = null) {
         });
       }
     }
+  }
+
+  const fileDownloadMatch = pathname.match(
+    /^\/api\/files\/([0-9a-f-]+)\/download$/i,
+  );
+  if (req.method === 'GET' && fileDownloadMatch) {
+    const payload = authenticate(req);
+    if (!payload) {
+      return sendError(res, 401, '没有权限下载文件。', 'AUTH');
+    }
+    if (
+      payload.kind === 'user' &&
+      await rejectInvalidUserTokenOrigin(req, res, payload, pathname)
+    ) return;
+    if (!['user', 'tenant_admin'].includes(payload.kind)) {
+      return sendError(res, 403, '没有权限下载文件。', 'FORBIDDEN');
+    }
+    const attachmentId = fileDownloadMatch[1];
+    if (!isUuid(attachmentId)) {
+      return sendError(res, 404, '文件不存在。', 'NOT_FOUND');
+    }
+    const result = await pool.query(
+      `
+        SELECT
+          a.*,
+          c.visitor_key_hash,
+          c.tenant_id
+        FROM attachments a
+        JOIN messages m ON m.attachment_id=a.id
+        JOIN conversations c ON c.id=a.conversation_id
+        WHERE a.id=$1
+          AND a.storage='r2'
+          AND a.linked_at IS NOT NULL
+          AND m.type='file'
+          AND m.recalled_at IS NULL
+        LIMIT 1
+      `,
+      [attachmentId],
+    );
+    const row = result.rows[0];
+    if (!row) return sendError(res, 404, '文件不存在。', 'NOT_FOUND');
+    if (!authorizeConversation(payload, {
+      id: row.conversation_id,
+      tenant_id: row.tenant_id,
+      visitor_key_hash: row.visitor_key_hash,
+    })) {
+      return sendError(res, 403, '没有权限下载文件。', 'FORBIDDEN');
+    }
+    const tenant = payload.kind === 'tenant_admin'
+      ? await getTenantForAdminToken(payload)
+      : await getTenantById(row.tenant_id);
+    if (!tenant && payload.kind === 'tenant_admin') {
+      const tenantState = await getTenantById(payload.tenantId);
+      if (tenantAccessIssue(tenantState) === 'LICENSE_REVOKED') {
+        return sendTenantAccessError(res, tenantState, 'admin');
+      }
+      return sendError(res, 401, '后台登录已失效。', 'LICENSE_REPLACED');
+    }
+    if (tenantAccessIssue(tenant)) {
+      return sendTenantAccessError(
+        res,
+        tenant,
+        payload.kind === 'tenant_admin' ? 'admin' : 'user',
+      );
+    }
+    if (!rateLimit(
+      req,
+      res,
+      'file-download-url',
+      60,
+      60_000,
+      `${payload.kind}:${payload.tenantId}:${attachmentId}`,
+    )) return;
+    const downloadUrl = await signedFileDownloadUrl(row);
+    if (!downloadUrl) {
+      return sendError(
+        res,
+        503,
+        '文件存储暂时不可用。',
+        'FILE_STORAGE_UNAVAILABLE',
+      );
+    }
+    return sendJson(res, 200, {
+      ok: true,
+      downloadUrl,
+      filename: row.filename,
+      mime: row.mime,
+      size: Number(row.size),
+      expiresAt: new Date(
+        Date.now() + FILE_DOWNLOAD_URL_TTL_SECONDS * 1000,
+      ).toISOString(),
+    });
   }
 
   if (req.method === 'GET' && pathname.startsWith('/api/media/')) {
