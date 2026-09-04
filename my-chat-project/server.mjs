@@ -9045,6 +9045,107 @@ async function handleFileUploadInit(req, res, payload, conversation) {
   });
 }
 
+async function handleFileUploadProxy(
+  req,
+  res,
+  payload,
+  conversation,
+  attachmentId,
+) {
+  if (payload.kind !== 'tenant_admin') {
+    return sendError(res, 403, '只有商家客服可以发送文件。', 'FILE_UPLOAD_FORBIDDEN');
+  }
+  if (conversation.status === 'closed') {
+    return sendError(res, 409, '此会话已结束。', 'CLOSED');
+  }
+  await requireTenantFeature('media_album', payload.tenantId);
+  if (!R2_ENABLED) {
+    return sendError(
+      res,
+      503,
+      '文件存储尚未配置，请联系管理员。',
+      'FILE_STORAGE_UNAVAILABLE',
+    );
+  }
+  if (!rateLimit(
+    req,
+    res,
+    'file-upload-proxy',
+    20,
+    60_000,
+    `${payload.tenantId}:${conversation.id}`,
+    { tenantId: payload.tenantId, conversationId: conversation.id },
+  )) return;
+
+  const result = await pool.query(
+    `
+      SELECT id,conversation_id,filename,mime,size,uploader,created_at,
+             storage,object_key,linked_at,expires_at
+      FROM attachments
+      WHERE id=$1
+        AND conversation_id=$2
+        AND uploader='admin'
+        AND storage='r2'
+        AND object_key IS NOT NULL
+        AND linked_at IS NULL
+        AND expires_at > NOW()
+      LIMIT 1
+    `,
+    [attachmentId, conversation.id],
+  );
+  const attachment = result.rows[0];
+  if (!attachment) {
+    return sendError(
+      res,
+      404,
+      '文件上传任务不存在或已过期，请重新发送。',
+      'FILE_UPLOAD_NOT_FOUND',
+    );
+  }
+  const contentType = String(req.headers['content-type'] || '')
+    .split(';')[0]
+    .trim()
+    .toLowerCase();
+  if (contentType !== attachment.mime) {
+    return sendError(res, 415, '文件类型与上传任务不匹配。', 'FILE_TYPE_MISMATCH');
+  }
+  const suppliedSize = Number(req.headers['content-length']);
+  if (
+    !Number.isSafeInteger(suppliedSize) ||
+    suppliedSize !== Number(attachment.size)
+  ) {
+    return sendError(res, 400, '文件大小与上传任务不匹配。', 'FILE_SIZE_MISMATCH');
+  }
+  if (activeUploads >= MAX_CONCURRENT_UPLOADS) {
+    return sendError(res, 503, '当前上传较多，请稍后重试。', 'UPLOAD_BUSY');
+  }
+
+  activeUploads += 1;
+  try {
+    await r2.send(
+      new PutObjectCommand({
+        Bucket: R2_BUCKET,
+        Key: attachment.object_key,
+        Body: req,
+        ContentLength: Number(attachment.size),
+        ContentType: attachment.mime,
+        CacheControl: 'private, no-store',
+      }),
+    );
+    minuteCounters.uploads += 1;
+  } catch (error) {
+    minuteCounters.uploadFailures += 1;
+    throw error;
+  } finally {
+    activeUploads -= 1;
+  }
+  return sendJson(res, 201, {
+    ok: true,
+    attachment: publicAttachment(attachment),
+    uploadedVia: 'api',
+  });
+}
+
 async function handleUpload(req, res, payload, conversation) {
   if (conversation.status === 'closed') {
     return sendError(res, 409, '此会话已结束。', 'CLOSED');
@@ -22085,6 +22186,32 @@ async function router(req, res, parsedRequestUrl = null) {
         idempotentReplay: Boolean(result.idempotentReplay),
         results: result.results,
       });
+    }
+    const fileUploadContentMatch = pathname.match(
+      /^\/api\/admin\/conversations\/([^/]+)\/file-uploads\/([^/]+)\/content$/,
+    );
+    if (req.method === 'PUT' && fileUploadContentMatch) {
+      const conversationId = safeDecodeURIComponent(fileUploadContentMatch[1]);
+      const attachmentId = safeDecodeURIComponent(fileUploadContentMatch[2]);
+      if (!isUuid(conversationId) || !isUuid(attachmentId)) {
+        return sendError(res, 404, '文件上传任务不存在。', 'NOT_FOUND');
+      }
+      const conversation = await getConversationRow(
+        conversationId,
+        pool,
+        false,
+        payload.tenantId,
+      );
+      if (!conversation || !authorizeConversation(payload, conversation)) {
+        return sendError(res, 404, '会话不存在。', 'NOT_FOUND');
+      }
+      return handleFileUploadProxy(
+        req,
+        res,
+        payload,
+        conversation,
+        attachmentId,
+      );
     }
     const announcementRead = pathname.match(
       /^\/api\/admin\/announcements\/([0-9a-f-]+)\/read$/i,
