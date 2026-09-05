@@ -48,7 +48,7 @@ services:
       - key: TENANT_ENTRY_DOMAIN_SUFFIXES
         value: "ccxxcc.org"
       - key: TENANT_ENTRY_DOMAIN_POOL
-        value: "6687878.xyz,6687876.xyz,6687879.xyz"
+        value: "6687878.xyz,6687876.xyz,6687879.xyz,6686458.xyz,6686658.xyz,6686898.xyz,66878621.xyz,tjy668.xyz"
       - key: TENANT_ENTRY_GATEWAY_SECRET
         sync: false
       - key: CLOUDFLARE_API_TOKEN

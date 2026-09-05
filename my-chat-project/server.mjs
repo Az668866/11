@@ -11928,6 +11928,24 @@ async function sendTelegramReply(message, text, extra = {}) {
   });
 }
 
+// Telegram 通知属于结果回报，不应覆盖已经完成的业务操作。
+// 网络抖动时仅做一次窄范围重试，仍失败也只记录日志并保留主流程结果。
+async function sendTelegramNotification(payload, { label = 'Telegram 通知' } = {}) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await telegramApi('sendMessage', payload);
+    } catch (error) {
+      lastError = error;
+      if (attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      }
+    }
+  }
+  console.error(`${label}发送失败，不影响主流程：`, lastError);
+  return null;
+}
+
 async function cloudflareApi(pathname, { method = 'GET', body } = {}) {
   if (!CLOUDFLARE_API_TOKEN) {
     throw new Error('服务器尚未配置 CLOUDFLARE_API_TOKEN。');
@@ -12680,8 +12698,9 @@ async function handleTenantEntryDomainCallback(callback) {
     text: '正在配置和验收，请稍候…',
   }).catch(() => {});
   await clearTelegramCallbackKeyboard(callback.message);
+  let result;
   try {
-    const result = await switchTenantEntryRootDomain(row.domain, {
+    result = await switchTenantEntryRootDomain(row.domain, {
       telegramUserId: String(userId || ''),
       requestId,
     });
@@ -12691,7 +12710,31 @@ async function handleTenantEntryDomainCallback(callback) {
        WHERE id=$1`,
       [requestId, result.previousDomain],
     );
-    await telegramApi('sendMessage', {
+  } catch (error) {
+    await pool.query(
+      `UPDATE tenant_entry_domain_switch_requests
+       SET status='failed',error=$2,updated_at=NOW()
+       WHERE id=$1`,
+      [requestId, cleanText(error.message, 500)],
+    ).catch(() => {});
+    await sendTelegramNotification({
+      chat_id: chat.id,
+      text: [
+        '<b>❌ 客服入口域名切换失败</b>',
+        '',
+        `<b>目标域名</b>：<code>${escapeTelegramHtml(row.domain)}</code>`,
+        `<b>原因</b>：${escapeTelegramHtml(cleanText(error.message, 300))}`,
+        '',
+        '系统已停止切换；如果数据库已进入新域名阶段，也已自动恢复原域名。',
+      ].join('\n'),
+      parse_mode: 'HTML',
+      ...telegramThread(callback.message),
+    }, { label: '域名切换失败通知' });
+    return true;
+  }
+
+  // 只有上面的切换/数据库流程失败才算切换失败；Telegram 成功通知失败不能回滚或改写状态。
+  await sendTelegramNotification({
       chat_id: chat.id,
       text: [
         '<b>✅ 客服入口域名切换完成</b>',
@@ -12712,28 +12755,7 @@ async function handleTenantEntryDomainCallback(callback) {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
       ...telegramThread(callback.message),
-    });
-  } catch (error) {
-    await pool.query(
-      `UPDATE tenant_entry_domain_switch_requests
-       SET status='failed',error=$2,updated_at=NOW()
-       WHERE id=$1`,
-      [requestId, cleanText(error.message, 500)],
-    ).catch(() => {});
-    await telegramApi('sendMessage', {
-      chat_id: chat.id,
-      text: [
-        '<b>❌ 域名切换失败</b>',
-        '',
-        `<b>目标域名</b>：<code>${escapeTelegramHtml(row.domain)}</code>`,
-        `<b>原因</b>：${escapeTelegramHtml(cleanText(error.message, 300))}`,
-        '',
-        '系统已停止切换；如果数据库已进入新域名阶段，也已自动恢复原域名。',
-      ].join('\n'),
-      parse_mode: 'HTML',
-      ...telegramThread(callback.message),
-    });
-  }
+    }, { label: '域名切换完成通知' });
   return true;
 }
 
