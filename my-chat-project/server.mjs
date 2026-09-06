@@ -755,6 +755,18 @@ function monitoredRouteKey(method, pathname) {
   return `${String(method || 'GET').toUpperCase()} ${normalized}`;
 }
 
+function isOperationalApiErrorStatus(statusCode) {
+  const code = Number(statusCode || 0);
+  return code >= 500 || code === 408 || code === 429;
+}
+
+function isExpectedClientMiss(statusCode, pathname) {
+  return (
+    Number(statusCode || 0) === 404 &&
+    pathname === '/api/public/tenant-entry/resolve'
+  );
+}
+
 function requireLegacyApi(res, apiVersion) {
   if (apiVersion >= 2 || LEGACY_API_ENABLED) return true;
   sendError(
@@ -22935,11 +22947,16 @@ const server = http.createServer((req, res) => {
   }
   res.once('finish', () => {
     const duration = performance.now() - requestStartedAt;
+    const operationalError = isOperationalApiErrorStatus(res.statusCode);
+    const expectedClientMiss = isExpectedClientMiss(
+      res.statusCode,
+      requestPath,
+    );
     requestLatencies.push(duration);
     if (requestLatencies.length > 5000) {
       requestLatencies.splice(0, requestLatencies.length - 5000);
     }
-    if (res.statusCode >= 400) minuteCounters.errors += 1;
+    if (operationalError) minuteCounters.errors += 1;
     let routeKey = monitoredRouteKey(req.method, rawRequestPath);
     if (!routeCounters.has(routeKey) && routeCounters.size >= 200) {
       routeKey = `${String(req.method || 'GET').toUpperCase()} /api/:other`;
@@ -22950,13 +22967,21 @@ const server = http.createServer((req, res) => {
       responseBytes: 0,
     };
     routeMetric.requests += 1;
-    if (res.statusCode >= 400) routeMetric.errors += 1;
+    if (operationalError) routeMetric.errors += 1;
     routeMetric.responseBytes += Number(res.getHeader('Content-Length') || 0);
     routeCounters.set(routeKey, routeMetric);
-    if (duration >= SLOW_API_MS || res.statusCode >= 400) {
+    if (
+      duration >= SLOW_API_MS ||
+      operationalError ||
+      (res.statusCode >= 400 && !expectedClientMiss)
+    ) {
       const logger = res.statusCode >= 500 ? console.error : console.warn;
       logger(JSON.stringify({
-        event: res.statusCode >= 400 ? 'api_request_error' : 'slow_api_request',
+        event: operationalError
+          ? 'api_request_error'
+          : res.statusCode >= 400
+            ? 'api_client_error'
+            : 'slow_api_request',
         requestId,
         traceId,
         method: String(req.method || 'GET').toUpperCase(),

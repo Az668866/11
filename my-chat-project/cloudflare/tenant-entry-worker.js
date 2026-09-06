@@ -1,7 +1,8 @@
 const RESOLVER_CACHE_MS = 5_000;
-const NEGATIVE_CACHE_MS = 1_000;
+const NEGATIVE_CACHE_MS = 5_000;
 const MAX_RESOLVER_CACHE_ENTRIES = 400;
 const resolverCache = new Map();
+const resolverInflight = new Map();
 const FILE_UPLOAD_PROXY_PATH = '/__file-upload-proxy';
 const FILE_UPLOAD_R2_HOST =
   'tuojie-chat-media.4409400db909788c7b8e9e157c9c1b3f.r2.cloudflarestorage.com';
@@ -164,6 +165,9 @@ async function resolveUpstream(hostname, env) {
   const cached = resolverCache.get(hostname);
   if (cached && cached.expiresAt > now) return cached.value;
 
+  const existingRequest = resolverInflight.get(hostname);
+  if (existingRequest) return existingRequest;
+
   const backendBaseUrl = normalizeBaseUrl(
     env.BACKEND_API_BASE || env.BACKEND_BASE_URL,
   );
@@ -178,48 +182,60 @@ async function resolveUpstream(hostname, env) {
     return '';
   }
 
-  const resolverUrl = new URL('/api/public/tenant-entry/resolve', backendBaseUrl);
-  resolverUrl.searchParams.set('host', hostname);
-  let resolution = null;
-  try {
-    const response = await fetch(resolverUrl, {
-      method: 'GET',
-      headers: {
-        Accept: 'application/json',
-        'X-Tenant-Entry-Gateway-Secret': secret,
-      },
-      redirect: 'manual',
-    });
-    if (response.ok) {
-      const result = await response.json();
-      const upstreamBaseUrl = normalizeBaseUrl(result?.upstreamBaseUrl);
-      if (upstreamBaseUrl) {
-        resolution = {
-          upstreamBaseUrl,
-          tenantCode: String(result?.tenantCode || '').trim(),
-        };
+  const request = (async () => {
+    const resolverUrl = new URL('/api/public/tenant-entry/resolve', backendBaseUrl);
+    resolverUrl.searchParams.set('host', hostname);
+    let resolution = null;
+    try {
+      const response = await fetch(resolverUrl, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/json',
+          'X-Tenant-Entry-Gateway-Secret': secret,
+        },
+        redirect: 'manual',
+      });
+      if (response.ok) {
+        const result = await response.json();
+        const upstreamBaseUrl = normalizeBaseUrl(result?.upstreamBaseUrl);
+        if (upstreamBaseUrl) {
+          resolution = {
+            upstreamBaseUrl,
+            tenantCode: String(result?.tenantCode || '').trim(),
+          };
+        }
+      } else {
+        console.error(JSON.stringify({
+          event: 'tenant_entry_resolver_rejected',
+          hostname,
+          status: response.status,
+        }));
       }
-    } else {
+    } catch (error) {
       console.error(JSON.stringify({
-        event: 'tenant_entry_resolver_rejected',
+        event: 'tenant_entry_resolver_fetch_failed',
         hostname,
-        status: response.status,
+        message: String(error?.message || error || 'unknown').slice(0, 200),
       }));
+      resolution = null;
     }
-  } catch (error) {
-    console.error(JSON.stringify({
-      event: 'tenant_entry_resolver_fetch_failed',
-      hostname,
-      message: String(error?.message || error || 'unknown').slice(0, 200),
-    }));
-    resolution = null;
+    const completedAt = Date.now();
+    makeResolverCacheRoom(completedAt);
+    resolverCache.set(hostname, {
+      value: resolution,
+      expiresAt:
+        completedAt + (resolution ? RESOLVER_CACHE_MS : NEGATIVE_CACHE_MS),
+    });
+    return resolution;
+  })();
+  resolverInflight.set(hostname, request);
+  try {
+    return await request;
+  } finally {
+    if (resolverInflight.get(hostname) === request) {
+      resolverInflight.delete(hostname);
+    }
   }
-  makeResolverCacheRoom(now);
-  resolverCache.set(hostname, {
-    value: resolution,
-    expiresAt: now + (resolution ? RESOLVER_CACHE_MS : NEGATIVE_CACHE_MS),
-  });
-  return resolution;
 }
 
 function upstreamRequest(request, resolution) {
