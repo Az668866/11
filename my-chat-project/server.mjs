@@ -273,6 +273,7 @@ const FILE_DOWNLOAD_URL_TTL_SECONDS = Math.trunc(
   envNumber('FILE_DOWNLOAD_URL_TTL_SECONDS', 300, 60, 900),
 );
 const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
+const MAX_VISITOR_BRAND_BYTES = 2 * 1024 * 1024;
 const MAX_QR_LOGO_BYTES = 3 * 1024 * 1024;
 const MAX_COVER_BYTES = 5 * 1024 * 1024;
 const LEGACY_QR_BOTTOM_TEXT =
@@ -598,6 +599,25 @@ const ALLOWED_FILE_TYPES = new Set(
 const DEFAULT_USER_SITE_URL = 'https://zxkf.netlify.app/';
 const DEFAULT_TEMPLATE_ID = '11111111-1111-4111-8111-111111111111';
 const RETENTION_OPTIONS = new Set([1, 6, 12, 24, 72, 168, 240, 360]);
+const VISITOR_HEADER_STYLES = new Set(['light', 'glow', 'color']);
+const VISITOR_THEME_PRESETS = new Set([
+  'ocean',
+  'teal',
+  'violet',
+  'sunset',
+  'gold',
+  'rose',
+]);
+const VISITOR_BRAND_LOGOS = new Set([
+  'template',
+  'none',
+  'wecom',
+  'alipay',
+  'douyin',
+  'xiaohongshu',
+  'kuaishou',
+  'custom',
+]);
 const SUPPORTED_FEATURE_FLAGS = new Set([
   'media_album',
   'auto_reply',
@@ -926,6 +946,12 @@ function defaultConfig() {
       welcomeText: '您好，欢迎咨询。您可以发送文字、图片或视频，我们会尽快回复。',
       onlineStatusText: '客服在线',
       pageTitle: '在线客服',
+      visitorAppearanceEnabled: false,
+      visitorHeaderStyle: 'light',
+      visitorTheme: 'ocean',
+      visitorPlatformLabel: '',
+      visitorBrandLogo: 'template',
+      visitorBrandAssetId: '',
       quickReplyDirectSend: true,
       autoReplyEnabled: true,
       defaultAutoReplyEnabled: true,
@@ -1088,7 +1114,7 @@ async function initDatabase() {
       CREATE TABLE IF NOT EXISTS assets (
         id UUID PRIMARY KEY,
         tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
-        kind TEXT NOT NULL CHECK (kind IN ('brand_avatar','template_cover','qr_logo','reply_image')),
+        kind TEXT NOT NULL CHECK (kind IN ('brand_avatar','visitor_brand','template_cover','qr_logo','reply_image')),
         filename TEXT NOT NULL,
         mime TEXT NOT NULL,
         size INTEGER NOT NULL CHECK (size > 0),
@@ -1108,7 +1134,7 @@ async function initDatabase() {
     await client.query(`
       ALTER TABLE assets
       ADD CONSTRAINT assets_kind_check
-      CHECK (kind IN ('brand_avatar','template_cover','qr_logo','reply_image'))
+      CHECK (kind IN ('brand_avatar','visitor_brand','template_cover','qr_logo','reply_image'))
     `);
 
     await client.query(`
@@ -7269,22 +7295,34 @@ async function ensureTenantTemplateDomain(
   ) {
     return null;
   }
-  const existing = await client.query(
-    `SELECT * FROM tenant_template_domains
-     WHERE tenant_id=$1 AND template_id=$2`,
+  const contextResult = await client.query(
+    `SELECT domains.*,
+            templates.id AS frontend_template_id,
+            templates.name AS frontend_template_name,
+            templates.base_url AS frontend_base_url,
+            templates.entry_host AS frontend_entry_host
+     FROM frontend_templates templates
+     LEFT JOIN tenant_template_domains domains
+       ON domains.tenant_id=$1 AND domains.template_id=templates.id
+     WHERE templates.id=$2`,
     [tenantId, templateId],
   );
-  if (existing.rows[0]) return existing.rows[0];
+  const context = contextResult.rows[0];
+  if (!context) return null;
+  // u/u1/u2... 是“高级自定义版”的共享入口。租户身份继续由链接中的
+  // tenant 参数区分，因此不再为它额外分配 kfmbXX 子域名；历史上已经
+  // 产生的租户专属域名仍保留在数据库中，并继续由 Worker 正常解析。
+  if (unifiedEntryHostSequence(context.frontend_entry_host)) return null;
+  if (context.tenant_id && context.template_id) return context;
   const rootDomain = normalizeTenantDomainSuffix(
     activeTenantEntryRootDomain || TENANT_ENTRY_DOMAIN_SUFFIXES[0],
   );
   if (!rootDomain) return null;
-  const templateResult = await client.query(
-    `SELECT id,name,base_url FROM frontend_templates WHERE id=$1`,
-    [templateId],
-  );
-  const template = templateResult.rows[0];
-  if (!template) return null;
+  const template = {
+    id: context.frontend_template_id,
+    name: context.frontend_template_name,
+    base_url: context.frontend_base_url,
+  };
   const prefix = tenantTemplateShortPrefix(template);
   // 优先分配 10–99 的短号码；紧凑号码用完后扩展到 3–9 位数字。
   // 已写入数据库的 (tenant_id, template_id) 映射始终直接复用，不会因扩容而改变。
@@ -8544,8 +8582,17 @@ async function validateAdminSettings(body, current, tenantId) {
     'welcomeText',
     'onlineStatusText',
     'pageTitle',
+    'visitorHeaderStyle',
+    'visitorTheme',
+    'visitorPlatformLabel',
+    'visitorBrandLogo',
   ];
-  const changesBrand = brandFields.some(
+  const changesBrand =
+    (
+      input.visitorAppearanceEnabled !== undefined &&
+      Boolean(input.visitorAppearanceEnabled) !==
+        Boolean(current.settings.visitorAppearanceEnabled)
+    ) || brandFields.some(
     (field) =>
       input[field] !== undefined &&
       cleanText(input[field], field === 'welcomeText' ? 2000 : 80) !==
@@ -8620,6 +8667,49 @@ async function validateAdminSettings(body, current, tenantId) {
   if (!RETENTION_OPTIONS.has(retentionHours)) {
     throw requestError('消息保存时间无效。', 400, 'RETENTION');
   }
+  const visitorHeaderStyle = cleanText(
+    input.visitorHeaderStyle ?? current.settings.visitorHeaderStyle ?? 'light',
+    20,
+  );
+  if (!VISITOR_HEADER_STYLES.has(visitorHeaderStyle)) {
+    throw requestError('访客端顶部样式无效。', 400, 'VISITOR_HEADER_STYLE');
+  }
+  const visitorTheme = cleanText(
+    input.visitorTheme ?? current.settings.visitorTheme ?? 'ocean',
+    20,
+  );
+  if (!VISITOR_THEME_PRESETS.has(visitorTheme)) {
+    throw requestError('访客端配色无效。', 400, 'VISITOR_THEME');
+  }
+  const visitorBrandLogo = cleanText(
+    input.visitorBrandLogo ?? current.settings.visitorBrandLogo ?? 'template',
+    24,
+  );
+  if (!VISITOR_BRAND_LOGOS.has(visitorBrandLogo)) {
+    throw requestError('访客端品牌图片选项无效。', 400, 'VISITOR_BRAND_LOGO');
+  }
+  const visitorBrandAssetId = cleanText(
+    current.settings.visitorBrandAssetId,
+    80,
+  );
+  if (visitorBrandLogo === 'custom') {
+    if (!isUuid(visitorBrandAssetId)) {
+      throw requestError('请先上传自定义品牌图片。', 400, 'VISITOR_BRAND_ASSET');
+    }
+    const visitorBrandAsset = await pool.query(
+      `SELECT id FROM assets
+       WHERE id=$1 AND tenant_id=$2 AND kind='visitor_brand'
+         AND mime='image/webp'`,
+      [visitorBrandAssetId, tenantId],
+    );
+    if (!visitorBrandAsset.rows[0]) {
+      throw requestError(
+        '自定义品牌图片不存在，或不属于当前客户。',
+        400,
+        'VISITOR_BRAND_ASSET',
+      );
+    }
+  }
 
   const settings = {
     ...current.settings,
@@ -8647,12 +8737,24 @@ async function validateAdminSettings(body, current, tenantId) {
       input.onlineStatusText !== undefined
         ? cleanText(input.onlineStatusText, 40) || '客服在线'
         : current.settings.onlineStatusText || '客服在线',
-       pageTitle:
+    pageTitle:
       input.pageTitle !== undefined
         ? cleanText(input.pageTitle, 80) || '在线客服'
         : current.settings.pageTitle ||
           current.settings.siteName ||
           '在线客服',
+    visitorAppearanceEnabled:
+      input.visitorAppearanceEnabled !== undefined
+        ? Boolean(input.visitorAppearanceEnabled)
+        : Boolean(current.settings.visitorAppearanceEnabled),
+    visitorHeaderStyle,
+    visitorTheme,
+    visitorPlatformLabel:
+      input.visitorPlatformLabel !== undefined
+        ? cleanText(input.visitorPlatformLabel, 12)
+        : cleanText(current.settings.visitorPlatformLabel, 12),
+    visitorBrandLogo,
+    visitorBrandAssetId,
     quickReplyDirectSend:
       input.quickReplyDirectSend !== undefined
         ? Boolean(input.quickReplyDirectSend)
@@ -12983,6 +13085,63 @@ function tenantEntryHostFromNetlifyUrl(value) {
   );
 }
 
+function normalizeTenantEntryPrefix(value) {
+  const prefix = cleanText(value, 32).trim().toLowerCase();
+  return /^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(prefix)
+    ? prefix
+    : '';
+}
+
+function tenantEntryHostFromPrefix(value) {
+  if (!TENANT_ENTRY_ENABLED) return '';
+  const prefix = normalizeTenantEntryPrefix(value);
+  const rootDomain =
+    activeTenantEntryRootDomain || TENANT_ENTRY_DOMAIN_SUFFIXES[0] || '';
+  return prefix && rootDomain
+    ? normalizeTenantEntryHost(`${prefix}.${rootDomain}`)
+    : '';
+}
+
+function unifiedEntryHostSequence(value) {
+  const host = normalizeTenantEntryHost(value);
+  if (!host) return null;
+  const [label, ...rootParts] = host.split('.');
+  const match = label.match(/^u(\d*)$/);
+  if (!match || !rootParts.length) return null;
+  return {
+    current: match[1] ? Number(match[1]) : 0,
+    rootDomain: rootParts.join('.'),
+  };
+}
+
+async function nextUnifiedEntryHost(client, value) {
+  const sequence = unifiedEntryHostSequence(value);
+  if (!sequence || !Number.isSafeInteger(sequence.current)) return '';
+  for (let offset = 1; offset <= 1000; offset += 1) {
+    const candidate = normalizeTenantEntryHost(
+      `u${sequence.current + offset}.${sequence.rootDomain}`,
+    );
+    if (!candidate) continue;
+    const occupied = await client.query(
+      `SELECT 1
+       FROM (
+         SELECT entry_host AS hostname FROM frontend_templates
+         UNION ALL
+         SELECT hostname FROM frontend_template_entry_aliases
+         UNION ALL
+         SELECT hostname FROM tenant_template_domains
+         UNION ALL
+         SELECT hostname FROM tenant_template_domain_aliases
+       ) reserved
+       WHERE LOWER(hostname)=LOWER($1)
+       LIMIT 1`,
+      [candidate],
+    );
+    if (!occupied.rows[0]) return candidate;
+  }
+  return '';
+}
+
 function tenantEntryOrigin(value) {
   if (!TENANT_ENTRY_ENABLED) return '';
   const host = normalizeTenantEntryHost(value);
@@ -13231,20 +13390,26 @@ async function resolveQrIncidentDomain(
       ),
     };
   }
-  if (!NETLIFY_AUTH_TOKEN) throw new Error('服务器尚未配置 NETLIFY_AUTH_TOKEN。');
-  if (!normalizeNetlifySiteId(incident.netlify_site_id)) {
-    throw new Error('请先在超级后台为该模板填写 Netlify Site ID。');
-  }
   const oldNetlifyDomain = displayTemplateDomain(incident.current_base_url);
   const oldDomain = displayTenantEntryDomain(
     incident.current_base_url,
     incident.current_entry_host,
   );
-  if (!normalizeNetlifyDomain(oldNetlifyDomain)) {
-    throw new Error(`当前后台域名 ${oldNetlifyDomain} 不是可自动更换的 netlify.app 域名。`);
-  }
   const manualDomain = targetDomain ? normalizeNetlifyDomain(targetDomain) : '';
   if (targetDomain && !manualDomain) throw new Error('目标域名格式无效。');
+  const unifiedAutomaticChange =
+    !manualDomain && Boolean(unifiedEntryHostSequence(incident.current_entry_host));
+  if (!unifiedAutomaticChange) {
+    if (!NETLIFY_AUTH_TOKEN) {
+      throw new Error('服务器尚未配置 NETLIFY_AUTH_TOKEN。');
+    }
+    if (!normalizeNetlifySiteId(incident.netlify_site_id)) {
+      throw new Error('请先在超级后台为该模板填写 Netlify Site ID。');
+    }
+    if (!normalizeNetlifyDomain(oldNetlifyDomain)) {
+      throw new Error(`当前后台域名 ${oldNetlifyDomain} 不是可自动更换的 netlify.app 域名。`);
+    }
+  }
 
   const claimed = await pool.query(
     `
@@ -13268,6 +13433,106 @@ async function resolveQrIncidentDomain(
     incident = await getQrIncident(incidentId);
     if (incident?.status === 'processing') throw new Error('该异常正在处理中。');
     throw new Error('异常状态已经变化，请刷新后重试。');
+  }
+
+  if (unifiedAutomaticChange) {
+    const client = await pool.connect();
+    let nextEntryHost = '';
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtext('tenant-entry-host-registry'))`,
+      );
+      const currentTemplate = await client.query(
+        `SELECT entry_host,base_url
+         FROM frontend_templates
+         WHERE id=$1
+         FOR UPDATE`,
+        [incident.template_id],
+      );
+      const currentEntryHost = normalizeTenantEntryHost(
+        currentTemplate.rows[0]?.entry_host,
+      );
+      if (!unifiedEntryHostSequence(currentEntryHost)) {
+        throw new Error('该模板当前入口已经变化，请刷新后重试。');
+      }
+      nextEntryHost = await nextUnifiedEntryHost(client, currentEntryHost);
+      if (!nextEntryHost) {
+        throw new Error('没有找到可用的 u 系列入口域名。');
+      }
+      await storeTemplateEntryAlias(
+        client,
+        incident.template_id,
+        currentEntryHost,
+      );
+      await client.query(
+        `UPDATE frontend_templates
+         SET entry_host=$2,updated_at=NOW()
+         WHERE id=$1`,
+        [incident.template_id, nextEntryHost],
+      );
+      await client.query(
+        `UPDATE qr_incidents
+         SET status='resolved',requested_base_url=$2,resolved_at=NOW(),
+             error='',updated_at=NOW()
+         WHERE id=$1`,
+        [incident.id, currentTemplate.rows[0].base_url],
+      );
+      await client.query(
+        `INSERT INTO audit_logs (
+           action,target_type,target_id,metadata,risk_level,summary
+         ) VALUES (
+           'frontend_template.entry_domain_change','frontend_template',
+           $1,$2::jsonb,'critical','商家上报二维码异常并递增了 u 系列入口域名'
+         )`,
+        [
+          incident.template_id,
+          JSON.stringify({
+            incidentId: incident.id,
+            tenantId: incident.tenant_id,
+            oldDomain: currentEntryHost,
+            newDomain: nextEntryHost,
+            source,
+          }),
+        ],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      await pool.query(
+        `UPDATE qr_incidents
+         SET status='failed',error=$2,updated_at=NOW()
+         WHERE id=$1`,
+        [incident.id, cleanText(error.message, 500)],
+      ).catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+    invalidateTenantCaches();
+    invalidateTenantEntryCaches();
+    invalidateApprovedOrigins();
+    await refreshApprovedOrigins(true).catch((error) =>
+      console.error('u 系列入口更换后来源缓存刷新失败：', error.message),
+    );
+    publishEvent(
+      { type: 'frontend_catalog_updated' },
+      { targetKind: 'tenant_admin' },
+    );
+    await publishDomainChange(incident, oldDomain, nextEntryHost).catch((error) =>
+      console.error('u 系列入口更换通知保存失败：', error.message),
+    );
+    await clearQrIncidentKeyboard(incident).catch(() => {});
+    await sendQrResolvedTelegram(
+      incident,
+      oldDomain,
+      nextEntryHost,
+      source,
+    ).catch((error) =>
+      console.error('u 系列入口更换 Telegram 回执失败：', error.message),
+    );
+    broadcastSuper({ type: 'qr-incident-updated' });
+    return { oldDomain, newDomain: nextEntryHost, duplicate: false };
   }
 
   let selectedDomain = '';
@@ -19486,7 +19751,20 @@ return sendJson(res, 200, { ok: true });
     }
     parsed.hash = '';
     const baseUrl = parsed.toString();
-    const entryHost = tenantEntryHostFromNetlifyUrl(baseUrl);
+    const requestedEntryPrefix = body.entryPrefix === undefined
+      ? ''
+      : normalizeTenantEntryPrefix(body.entryPrefix);
+    if (body.entryPrefix !== undefined && !requestedEntryPrefix) {
+      return sendError(
+        res,
+        400,
+        '入口前缀只能使用小写字母、数字和短横线，并且必须以字母开头。',
+        'TENANT_ENTRY_PREFIX',
+      );
+    }
+    const entryHost = requestedEntryPrefix
+      ? tenantEntryHostFromPrefix(requestedEntryPrefix)
+      : tenantEntryHostFromNetlifyUrl(baseUrl);
     const netlifySiteId = normalizeNetlifySiteId(body.netlifySiteId);
     if (body.netlifySiteId && !netlifySiteId) {
       return sendError(
@@ -19738,6 +20016,20 @@ return sendJson(res, 200, { ok: true });
         } catch {
           return sendError(res, 400, '模板必须使用有效 HTTPS 地址。', 'TEMPLATE_URL');
         }
+      }
+      if (body.entryPrefix !== undefined) {
+        const requestedEntryPrefix = normalizeTenantEntryPrefix(
+          body.entryPrefix,
+        );
+        if (!requestedEntryPrefix) {
+          return sendError(
+            res,
+            400,
+            '入口前缀只能使用小写字母、数字和短横线，并且必须以字母开头。',
+            'TENANT_ENTRY_PREFIX',
+          );
+        }
+        entryHost = tenantEntryHostFromPrefix(requestedEntryPrefix);
       }
       if (body.netlifySiteId !== undefined) {
         netlifySiteId = normalizeNetlifySiteId(body.netlifySiteId);
@@ -21769,6 +22061,111 @@ async function router(req, res, parsedRequestUrl = null) {
         payload.tenantId,
       );
       return sendJson(res, 200, { ok: true });
+    }
+
+    if (
+      req.method === 'POST' &&
+      pathname === '/api/admin/brand/visitor-logo'
+    ) {
+      await requireTenantFeature('tenant_branding', payload.tenantId);
+      if (
+        !rateLimit(
+          req,
+          res,
+          'tenant-visitor-brand-upload',
+          12,
+          10 * 60_000,
+          payload.tenantId,
+          { tenantId: payload.tenantId, licenseId: payload.licenseId },
+        )
+      ) return;
+      const data = await prepareImageUpload(req, {
+        maxBytes: MAX_VISITOR_BRAND_BYTES,
+        width: 900,
+        height: 260,
+        fit: 'inside',
+      });
+      const current = await getConfig(payload.tenantId);
+      const oldAssetId = cleanText(
+        current.settings.visitorBrandAssetId,
+        80,
+      );
+      const asset = await saveAsset({
+        tenantId: payload.tenantId,
+        kind: 'visitor_brand',
+        filename: 'visitor-brand.webp',
+        mime: 'image/webp',
+        data,
+      });
+      await pool.query(
+        `UPDATE tenant_config
+         SET settings=jsonb_set(
+               COALESCE(settings,'{}'::jsonb),
+               '{visitorBrandAssetId}',
+               to_jsonb($2::text),
+               true
+             ),updated_at=NOW()
+         WHERE tenant_id=$1`,
+        [payload.tenantId, asset.id],
+      );
+      if (isUuid(oldAssetId)) {
+        await deleteAsset(oldAssetId, payload.tenantId);
+      }
+      invalidateTenantCaches(payload.tenantId);
+      const settings = (await getConfig(payload.tenantId)).settings;
+      broadcast(
+        { type: 'settings-updated', settings },
+        null,
+        payload.tenantId,
+      );
+      await writeTenantAudit(req, payload, 'tenant.visitor_brand.update', {
+        targetType: 'tenant',
+        targetId: payload.tenantId,
+      }).catch(() => {});
+      return sendJson(res, 201, {
+        ok: true,
+        visitorBrandAssetId: asset.id,
+        visitorBrandUrl: `${PUBLIC_API_BASE}/api/public/assets/${asset.id}`,
+        settings,
+      });
+    }
+
+    if (
+      req.method === 'DELETE' &&
+      pathname === '/api/admin/brand/visitor-logo'
+    ) {
+      await requireTenantFeature('tenant_branding', payload.tenantId);
+      const current = await getConfig(payload.tenantId);
+      const oldAssetId = cleanText(
+        current.settings.visitorBrandAssetId,
+        80,
+      );
+      await pool.query(
+        `UPDATE tenant_config
+         SET settings=(COALESCE(settings,'{}'::jsonb) - 'visitorBrandAssetId') ||
+             CASE WHEN settings->>'visitorBrandLogo'='custom'
+               THEN '{"visitorBrandLogo":"none"}'::jsonb
+               ELSE '{}'::jsonb
+             END,
+             updated_at=NOW()
+         WHERE tenant_id=$1`,
+        [payload.tenantId],
+      );
+      if (isUuid(oldAssetId)) {
+        await deleteAsset(oldAssetId, payload.tenantId);
+      }
+      invalidateTenantCaches(payload.tenantId);
+      const settings = (await getConfig(payload.tenantId)).settings;
+      broadcast(
+        { type: 'settings-updated', settings },
+        null,
+        payload.tenantId,
+      );
+      await writeTenantAudit(req, payload, 'tenant.visitor_brand.delete', {
+        targetType: 'tenant',
+        targetId: payload.tenantId,
+      }).catch(() => {});
+      return sendJson(res, 200, { ok: true, settings });
     }
 
     if (req.method === 'POST' && pathname === '/api/admin/qr/logo') {
