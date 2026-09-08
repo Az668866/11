@@ -598,6 +598,10 @@ const ALLOWED_FILE_TYPES = new Set(
 );
 const DEFAULT_USER_SITE_URL = 'https://zxkf.netlify.app/';
 const DEFAULT_TEMPLATE_ID = '11111111-1111-4111-8111-111111111111';
+const UNIFIED_USER_SITE_URL = 'https://u668781.netlify.app/';
+const UNIFIED_TEMPLATE_ID = '5e970b64-af5f-4579-b0b8-04a160e148a9';
+const UNIFIED_ENTRY_PREFIX = 'u';
+const UNIFIED_ENTRY_HOST = `${UNIFIED_ENTRY_PREFIX}.668781.xyz`;
 const RETENTION_OPTIONS = new Set([1, 6, 12, 24, 72, 168, 240, 360]);
 const VISITOR_HEADER_STYLES = new Set(['light', 'glow', 'color']);
 const VISITOR_THEME_PRESETS = new Set([
@@ -958,7 +962,7 @@ function defaultConfig() {
       defaultAutoReply: '消息已收到，客服看到后会尽快回复。',
       defaultAutoReplyImageAssetId: '',
       autoReplyCooldownSeconds: 20,
-      frontendTemplateId: DEFAULT_TEMPLATE_ID,
+      frontendTemplateId: UNIFIED_TEMPLATE_ID,
       retentionHours: 24,
     },
   };
@@ -1333,13 +1337,38 @@ async function initDatabase() {
         id, name, base_url, origin, entry_host,
         client_version, min_backend_version,
         status, sort_order, recommended, is_default
-      ) VALUES ($1, '拓界经典版', $2, $3, $4, $5, $5, 'enabled', 10, TRUE, TRUE)
+      ) VALUES ($1, '拓界经典版', $2, $3, $4, $5, $5, 'enabled', 10, TRUE, FALSE)
       ON CONFLICT (id) DO NOTHING
     `, [
       DEFAULT_TEMPLATE_ID,
       DEFAULT_USER_SITE_URL,
       new URL(DEFAULT_USER_SITE_URL).origin,
       tenantEntryHostFromNetlifyUrl(DEFAULT_USER_SITE_URL),
+      APP_VERSION,
+    ]);
+    // 统一自定义前端是新租户的默认入口。已有租户的
+    // tenant_config.frontend_template_id 不会被改写，历史链接继续有效。
+    await client.query(`UPDATE frontend_templates SET is_default=FALSE WHERE is_default=TRUE`);
+    await client.query(`
+      INSERT INTO frontend_templates (
+        id, name, base_url, origin, entry_host,
+        client_version, min_backend_version,
+        status, sort_order, recommended, is_default
+      ) VALUES ($1, '高级自定义版', $2, $3, $4, $5, $5, 'enabled', 0, TRUE, TRUE)
+      ON CONFLICT (id) DO UPDATE SET
+        name=EXCLUDED.name,
+        client_version=EXCLUDED.client_version,
+        min_backend_version=EXCLUDED.min_backend_version,
+        status='enabled',
+        sort_order=0,
+        recommended=TRUE,
+        is_default=TRUE,
+        updated_at=NOW()
+    `, [
+      UNIFIED_TEMPLATE_ID,
+      UNIFIED_USER_SITE_URL,
+      new URL(UNIFIED_USER_SITE_URL).origin,
+      normalizeTenantEntryHost(UNIFIED_ENTRY_HOST),
       APP_VERSION,
     ]);
     await client.query(`
@@ -7425,7 +7454,7 @@ async function createTenantConfig(tenantId, client = pool) {
       JSON.stringify(defaults.cannedReplies),
       JSON.stringify(defaults.autoReplies),
       JSON.stringify(defaults.settings),
-      DEFAULT_TEMPLATE_ID,
+      UNIFIED_TEMPLATE_ID,
     ],
   );
   await client.query(
@@ -7557,7 +7586,7 @@ async function getConfig(tenantId, client = pool) {
     };
   });
   const currentTemplateId =
-    result.rows[0].frontend_template_id || DEFAULT_TEMPLATE_ID;
+    result.rows[0].frontend_template_id || UNIFIED_TEMPLATE_ID;
   const currentDomain = tenantDomains.get(currentTemplateId);
   const currentDomainUrl = tenantTemplateDomainUrl(currentDomain?.hostname);
   const config = {
@@ -8613,7 +8642,7 @@ async function validateAdminSettings(body, current, tenantId) {
   const frontendTemplateId = cleanText(
     input.frontendTemplateId ??
       current.settings.frontendTemplateId ??
-      DEFAULT_TEMPLATE_ID,
+      UNIFIED_TEMPLATE_ID,
     80,
   );
   if (!isUuid(frontendTemplateId)) {
@@ -18796,7 +18825,7 @@ async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
    const oldOwnerDistributorId =
   tenantOwnerResult.rows[0].owner_distributor_id;
 const currentFrontendTemplateId =
-  tenantOwnerResult.rows[0].frontend_template_id || DEFAULT_TEMPLATE_ID;
+  tenantOwnerResult.rows[0].frontend_template_id || UNIFIED_TEMPLATE_ID;
 let nextOwnerDistributorId = oldOwnerDistributorId;
 
 if (body.action === 'assignDistributor') {
