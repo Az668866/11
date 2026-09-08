@@ -1357,6 +1357,8 @@ async function initDatabase() {
       ) VALUES ($1, '高级自定义版', $2, $3, $4, $5, $5, 'enabled', 0, TRUE, TRUE)
       ON CONFLICT (id) DO UPDATE SET
         name=EXCLUDED.name,
+        base_url=EXCLUDED.base_url,
+        origin=EXCLUDED.origin,
         client_version=EXCLUDED.client_version,
         min_backend_version=EXCLUDED.min_backend_version,
         status='enabled',
