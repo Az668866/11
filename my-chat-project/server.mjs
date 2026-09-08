@@ -954,6 +954,7 @@ function defaultConfig() {
       visitorHeaderStyle: 'light',
       visitorTheme: 'ocean',
       visitorPlatformLabel: '',
+      visitorServiceBadge: '官方客服',
       visitorBrandLogo: 'template',
       visitorBrandAssetId: '',
       quickReplyDirectSend: true,
@@ -4106,6 +4107,7 @@ const TENANT_HIGH_RISK_AUDIT_ACTIONS = new Set([
   'tenant.message.delete',
   'tenant.message.recall',
   'tenant.conversation.delete',
+  'tenant.conversations.clear_all',
 ]);
 
 const AUDIT_SUMMARIES = Object.freeze({
@@ -4115,6 +4117,7 @@ const AUDIT_SUMMARIES = Object.freeze({
   'tenant.message.delete': '租户永久删除了客服消息',
   'tenant.message.recall': '租户撤回了客服消息',
   'tenant.conversation.delete': '租户永久删除了访客会话',
+  'tenant.conversations.clear_all': '租户永久清空了当前商家的全部聊天记录',
   'tenant.login': '租户后台发生高风险登录失败',
   'license.create': '管理员批量生成普通卡密和超级卡密',
   'license.disable': '管理员禁用了普通卡密',
@@ -8616,7 +8619,10 @@ async function validateAdminSettings(body, current, tenantId) {
     'visitorHeaderStyle',
     'visitorTheme',
     'visitorPlatformLabel',
+    'visitorServiceBadge',
     'visitorBrandLogo',
+    'avatarAssetId',
+    'visitorBrandAssetId',
   ];
   const changesBrand =
     (
@@ -8712,6 +8718,28 @@ async function validateAdminSettings(body, current, tenantId) {
   if (!VISITOR_THEME_PRESETS.has(visitorTheme)) {
     throw requestError('访客端配色无效。', 400, 'VISITOR_THEME');
   }
+  const avatarAssetId = cleanText(
+    input.avatarAssetId ?? current.settings.avatarAssetId,
+    80,
+  );
+  if (avatarAssetId) {
+    if (!isUuid(avatarAssetId)) {
+      throw requestError('客服头像无效。', 400, 'AVATAR_ASSET');
+    }
+    const avatarAsset = await pool.query(
+      `SELECT id FROM assets
+       WHERE id=$1 AND tenant_id=$2 AND kind='brand_avatar'
+         AND mime='image/webp'`,
+      [avatarAssetId, tenantId],
+    );
+    if (!avatarAsset.rows[0]) {
+      throw requestError(
+        '客服头像不存在，或不属于当前客户。',
+        400,
+        'AVATAR_ASSET',
+      );
+    }
+  }
   const visitorBrandLogo = cleanText(
     input.visitorBrandLogo ?? current.settings.visitorBrandLogo ?? 'template',
     24,
@@ -8720,12 +8748,12 @@ async function validateAdminSettings(body, current, tenantId) {
     throw requestError('访客端品牌图片选项无效。', 400, 'VISITOR_BRAND_LOGO');
   }
   const visitorBrandAssetId = cleanText(
-    current.settings.visitorBrandAssetId,
+    input.visitorBrandAssetId ?? current.settings.visitorBrandAssetId,
     80,
   );
-  if (visitorBrandLogo === 'custom') {
+  if (visitorBrandAssetId) {
     if (!isUuid(visitorBrandAssetId)) {
-      throw requestError('请先上传自定义品牌图片。', 400, 'VISITOR_BRAND_ASSET');
+      throw requestError('自定义品牌图片无效。', 400, 'VISITOR_BRAND_ASSET');
     }
     const visitorBrandAsset = await pool.query(
       `SELECT id FROM assets
@@ -8741,6 +8769,9 @@ async function validateAdminSettings(body, current, tenantId) {
       );
     }
   }
+  if (visitorBrandLogo === 'custom' && !visitorBrandAssetId) {
+      throw requestError('请先上传自定义品牌图片。', 400, 'VISITOR_BRAND_ASSET');
+  }
 
   const settings = {
     ...current.settings,
@@ -8748,7 +8779,7 @@ async function validateAdminSettings(body, current, tenantId) {
       input.siteName !== undefined
         ? cleanText(input.siteName, 80) || '在线客服'
         : current.settings.siteName,
-    avatarAssetId: cleanText(current.settings.avatarAssetId, 80),
+    avatarAssetId,
     qrTopText:
       input.qrTopText !== undefined
         ? cleanText(input.qrTopText, 120)
@@ -8784,6 +8815,10 @@ async function validateAdminSettings(body, current, tenantId) {
       input.visitorPlatformLabel !== undefined
         ? cleanText(input.visitorPlatformLabel, 12)
         : cleanText(current.settings.visitorPlatformLabel, 12),
+    visitorServiceBadge:
+      input.visitorServiceBadge !== undefined
+        ? cleanText(input.visitorServiceBadge, 12) || '官方客服'
+        : cleanText(current.settings.visitorServiceBadge, 12) || '官方客服',
     visitorBrandLogo,
     visitorBrandAssetId,
     quickReplyDirectSend:
@@ -10684,6 +10719,62 @@ async function deleteAdminMessage(
     messageIds,
     requestApiVersion,
   });
+}
+
+async function deleteAllTenantConversations(tenantId) {
+  if (!isUuid(tenantId)) {
+    throw requestError('当前商家身份无效。', 400, 'TENANT_INVALID');
+  }
+  const client = await pool.connect();
+  let result;
+  try {
+    await client.query('BEGIN');
+    const counts = await client.query(
+      `
+        SELECT
+          (SELECT COUNT(*)::int FROM conversations WHERE tenant_id=$1) AS conversations,
+          (SELECT COUNT(*)::int FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.tenant_id=$1) AS messages,
+          (SELECT COUNT(*)::int FROM attachments a JOIN conversations c ON c.id=a.conversation_id WHERE c.tenant_id=$1) AS attachments,
+          (SELECT COUNT(*)::int FROM call_sessions cs WHERE cs.tenant_id=$1) AS calls
+      `,
+      [tenantId],
+    );
+    const storedObjects = await client.query(
+      `
+        SELECT a.object_key
+        FROM attachments a
+        JOIN conversations c ON c.id=a.conversation_id
+        WHERE c.tenant_id=$1
+          AND a.storage='r2'
+          AND a.object_key IS NOT NULL
+      `,
+      [tenantId],
+    );
+    const deleted = await client.query(
+      `DELETE FROM conversations WHERE tenant_id=$1 RETURNING id`,
+      [tenantId],
+    );
+    await queueObjectDeletes(
+      [...new Set(storedObjects.rows.map((row) => row.object_key).filter(Boolean))],
+      client,
+    );
+    await client.query('COMMIT');
+    const row = counts.rows[0] || {};
+    result = {
+      conversationsDeleted: deleted.rowCount,
+      messagesDeleted: Number(row.messages || 0),
+      attachmentsDeleted: Number(row.attachments || 0),
+      callsDeleted: Number(row.calls || 0),
+    };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+  recentChatActivity.delete(tenantId);
+  processObjectDeleteQueue().catch(() => {});
+  return result;
 }
 
 async function recallAdminMessage(
@@ -21898,6 +21989,81 @@ async function router(req, res, parsedRequestUrl = null) {
       });
     }
 
+    if (req.method === 'DELETE' && pathname === '/api/admin/conversations') {
+      if (!rateLimit(
+        req,
+        res,
+        'tenant-clear-all-conversations',
+        3,
+        60_000,
+        payload.tenantId,
+        { tenantId: payload.tenantId },
+      )) return;
+      const body = await readJson(req, 4096);
+      if (body.confirmation !== 'DELETE_ALL_CHAT_RECORDS') {
+        return sendError(
+          res,
+          400,
+          '请确认永久删除当前商家的全部聊天记录。',
+          'DELETE_CONFIRMATION_REQUIRED',
+        );
+      }
+      const deleted = await deleteAllTenantConversations(payload.tenantId);
+      await writeTenantAudit(req, payload, 'tenant.conversations.clear_all', {
+        targetType: 'tenant',
+        targetId: payload.tenantId,
+        metadata: deleted,
+      }).catch((error) =>
+        console.error('租户全部聊天记录删除审计写入失败：', error.message),
+      );
+      broadcast(
+        {
+          type: 'tenant-conversations-cleared',
+          ...deleted,
+          at: nowIso(),
+        },
+        null,
+        payload.tenantId,
+      );
+      return sendJson(res, 200, { ok: true, ...deleted });
+    }
+
+    const draftBrandAssetMatch = pathname.match(
+      /^\/api\/admin\/brand\/draft-asset\/([0-9a-f-]{36})$/i,
+    );
+    if (req.method === 'DELETE' && draftBrandAssetMatch) {
+      await requireTenantFeature('tenant_branding', payload.tenantId);
+      const assetId = draftBrandAssetMatch[1];
+      if (!isUuid(assetId)) {
+        return sendError(res, 400, '暂存图片标识无效。', 'INVALID_ASSET');
+      }
+      const [assetResult, current] = await Promise.all([
+        pool.query(
+          `SELECT id FROM assets
+           WHERE id=$1 AND tenant_id=$2
+             AND kind IN ('brand_avatar','visitor_brand')`,
+          [assetId, payload.tenantId],
+        ),
+        getConfig(payload.tenantId),
+      ]);
+      if (!assetResult.rows[0]) {
+        return sendJson(res, 200, { ok: true, deleted: false });
+      }
+      if (
+        assetId === cleanText(current.settings.avatarAssetId, 80) ||
+        assetId === cleanText(current.settings.visitorBrandAssetId, 80)
+      ) {
+        return sendError(
+          res,
+          409,
+          '这张图片已经保存，不能按草稿删除。',
+          'ASSET_ALREADY_APPLIED',
+        );
+      }
+      await deleteAsset(assetId, payload.tenantId);
+      return sendJson(res, 200, { ok: true, deleted: true });
+    }
+
     if (req.method === 'PUT' && pathname === '/api/admin/settings') {
       const body = await readJson(req, 512 * 1024);
       const tenant = activeTenant;
@@ -21965,6 +22131,20 @@ async function router(req, res, parsedRequestUrl = null) {
       } finally {
         databaseClient.release();
       }
+      const supersededBrandAssets = [
+        [current.settings.avatarAssetId, validated.settings.avatarAssetId],
+        [
+          current.settings.visitorBrandAssetId,
+          validated.settings.visitorBrandAssetId,
+        ],
+      ]
+        .filter(([oldId, newId]) => isUuid(oldId) && oldId !== newId)
+        .map(([oldId]) => oldId);
+      for (const assetId of new Set(supersededBrandAssets)) {
+        await deleteAsset(assetId, payload.tenantId).catch((error) =>
+          console.error('旧品牌图片清理失败：', error.message),
+        );
+      }
       await writeTenantAudit(req, payload, 'tenant.config.update', {
         targetType: 'tenant',
         targetId: payload.tenantId,
@@ -22023,6 +22203,14 @@ async function router(req, res, parsedRequestUrl = null) {
         mime: 'image/webp',
         data,
       });
+      if (url.searchParams.get('draft') === '1') {
+        return sendJson(res, 201, {
+          ok: true,
+          draft: true,
+          avatarAssetId: asset.id,
+          avatarUrl: `${PUBLIC_API_BASE}/api/public/assets/${asset.id}`,
+        });
+      }
       await pool.query(
         `
           UPDATE tenant_config
@@ -22128,6 +22316,14 @@ async function router(req, res, parsedRequestUrl = null) {
         mime: 'image/webp',
         data,
       });
+      if (url.searchParams.get('draft') === '1') {
+        return sendJson(res, 201, {
+          ok: true,
+          draft: true,
+          visitorBrandAssetId: asset.id,
+          visitorBrandUrl: `${PUBLIC_API_BASE}/api/public/assets/${asset.id}`,
+        });
+      }
       await pool.query(
         `UPDATE tenant_config
          SET settings=jsonb_set(
