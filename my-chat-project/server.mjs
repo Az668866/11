@@ -1804,6 +1804,32 @@ async function initDatabase() {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS telegram_group_accounts (
+        chat_id TEXT PRIMARY KEY,
+        balance NUMERIC(20,2) NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS telegram_group_ledger (
+        id BIGSERIAL PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        operation_type CHAR(1) NOT NULL CHECK (operation_type IN ('+','-')),
+        amount NUMERIC(20,2) NOT NULL CHECK (amount > 0),
+        note TEXT NOT NULL DEFAULT '',
+        operator_user_id TEXT NOT NULL DEFAULT '',
+        operator_username TEXT NOT NULL DEFAULT '',
+        operator_display_name TEXT NOT NULL DEFAULT '',
+        balance_after NUMERIC(20,2) NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS telegram_group_ledger_chat_time_idx
+      ON telegram_group_ledger (chat_id, created_at DESC, id DESC)
+    `);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS qr_incidents (
@@ -1980,6 +2006,7 @@ async function initDatabase() {
           CHECK (caller_kind IN ('user','admin')),
         caller_name TEXT NOT NULL DEFAULT '',
         caller_device_id TEXT NOT NULL DEFAULT '',
+        assigned_device_id TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT 'ringing'
           CHECK (status IN (
             'ringing','answered','connected','completed','rejected',
@@ -2000,6 +2027,7 @@ async function initDatabase() {
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS caller_kind TEXT NOT NULL DEFAULT 'admin'`);
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS caller_name TEXT NOT NULL DEFAULT ''`);
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS caller_device_id TEXT NOT NULL DEFAULT ''`);
+    await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS assigned_device_id TEXT NOT NULL DEFAULT ''`);
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS claimed_by TEXT`);
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ`);
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS answered_at TIMESTAMPTZ`);
@@ -2009,6 +2037,15 @@ async function initDatabase() {
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS end_reason TEXT NOT NULL DEFAULT ''`);
     await client.query(`ALTER TABLE call_sessions DROP CONSTRAINT IF EXISTS call_sessions_status_check`);
     await client.query(`UPDATE call_sessions SET status='completed',end_reason=COALESCE(NULLIF(end_reason,''),'completed'),ended_at=COALESCE(ended_at,updated_at) WHERE status='ended'`);
+    // Signaling SDP is transient call metadata, never call content. Clear any
+    // historical terminal rows during migration so old deployments do not
+    // retain offer payloads after this privacy fix is released.
+    await client.query(`
+      UPDATE call_sessions
+      SET offer='{}'::jsonb
+      WHERE status NOT IN ('ringing','answered','connected')
+        AND offer IS DISTINCT FROM '{}'::jsonb
+    `);
     await client.query(`
       ALTER TABLE call_sessions
       ADD CONSTRAINT call_sessions_status_check CHECK (status IN (
@@ -2859,6 +2896,7 @@ async function cleanupExpiredData() {
     await client.query(`
       UPDATE call_sessions cs
       SET status='missed',
+          offer='{}'::jsonb,
           ended_at=COALESCE(cs.ended_at,cs.expires_at),
           end_reason='missed',
           updated_at=NOW(),
@@ -2871,6 +2909,7 @@ async function cleanupExpiredData() {
     await client.query(`
       UPDATE call_sessions cs
       SET status='failed',
+          offer='{}'::jsonb,
           ended_at=COALESCE(cs.ended_at,cs.expires_at),
           end_reason='network_timeout',
           duration_seconds=0,
@@ -6509,6 +6548,7 @@ async function finalizeExpiredCallSessions(
     `
       UPDATE call_sessions cs
       SET status='missed',
+          offer='{}'::jsonb,
           ended_at=COALESCE(cs.ended_at,cs.expires_at),
           end_reason='missed',
           updated_at=NOW(),
@@ -6527,6 +6567,7 @@ async function finalizeExpiredCallSessions(
     `
       UPDATE call_sessions cs
       SET status='failed',
+          offer='{}'::jsonb,
           ended_at=COALESCE(cs.ended_at,cs.expires_at),
           end_reason='network_timeout',
           duration_seconds=0,
@@ -6750,6 +6791,79 @@ async function callIdentitySnapshot(client, tenantId, conversationId, callerKind
   };
 }
 
+async function idleTenantAdminDeviceIds(tenantId, client = pool) {
+  if (!isUuid(tenantId)) return [];
+  const online = [];
+  const seen = new Set();
+  const now = Date.now();
+  for (const liveClient of sseClients) {
+    if (liveClient.kind !== 'tenant_admin' || liveClient.tenantId !== tenantId) continue;
+    if (liveClient.lastSeenAt && now - liveClient.lastSeenAt > 45_000) continue;
+    const deviceId = cleanText(liveClient.deviceId, 120) || 'legacy';
+    const deviceKey = cleanText(liveClient.deviceHash, 100) || deviceId;
+    if (seen.has(deviceKey)) continue;
+    seen.add(deviceKey);
+    online.push(deviceId);
+  }
+  if (!online.length) return [];
+  const active = await client.query(
+    `
+      SELECT caller_kind,caller_device_id,assigned_device_id,claimed_by
+      FROM call_sessions
+      WHERE tenant_id=$1
+        AND status=ANY($2::text[])
+        AND expires_at > NOW()
+    `,
+    [tenantId, [...ACTIVE_CALL_STATUSES]],
+  );
+  const busy = new Set();
+  for (const row of active.rows) {
+    if (row.assigned_device_id) busy.add(row.assigned_device_id);
+    if (row.caller_kind === 'admin' && row.caller_device_id) {
+      busy.add(row.caller_device_id);
+    }
+    const claimedBy = cleanText(row.claimed_by, 160);
+    if (claimedBy.startsWith('admin:')) busy.add(claimedBy.slice(6));
+  }
+  return online.filter((deviceId) => !busy.has(deviceId));
+}
+
+async function reassignPendingCallsForDevice(tenantId, deviceId) {
+  const disconnectedDeviceId = cleanText(deviceId, 120);
+  if (!isUuid(tenantId) || !disconnectedDeviceId) return;
+  const pending = await pool.query(
+    `SELECT * FROM call_sessions
+     WHERE tenant_id=$1 AND caller_kind='user' AND status='ringing'
+       AND expires_at > NOW() AND claimed_by IS NULL
+       AND assigned_device_id=$2
+     ORDER BY created_at ASC`,
+    [tenantId, disconnectedDeviceId],
+  );
+  for (const row of pending.rows) {
+    const nextDeviceId = (await idleTenantAdminDeviceIds(tenantId))
+      .find((item) => item !== disconnectedDeviceId);
+    if (!nextDeviceId) continue;
+    const updated = await pool.query(
+      `UPDATE call_sessions
+       SET assigned_device_id=$3,updated_at=NOW()
+       WHERE id=$1 AND tenant_id=$2 AND status='ringing'
+         AND claimed_by IS NULL AND assigned_device_id=$4
+       RETURNING *`,
+      [row.id, tenantId, nextDeviceId, disconnectedDeviceId],
+    );
+    if (!updated.rows[0]) continue;
+    publishEvent(
+      pendingCallEvent(updated.rows[0]),
+      {
+        tenantId,
+        conversationId: updated.rows[0].conversation_id,
+        targetKind: 'tenant_admin',
+        targetDeviceIds: [nextDeviceId],
+      },
+    );
+  }
+}
+
 async function savePendingCallOffer(
   tenantId,
   conversationId,
@@ -6818,28 +6932,54 @@ async function savePendingCallOffer(
       conversationId,
       normalizedCallerKind,
     );
-    const activeResult = await client.query(
+    let assignedDeviceId = '';
+    let deviceBusy = false;
+    const activeConversationResult = await client.query(
       `
         SELECT id
         FROM call_sessions
-        WHERE tenant_id=$1
-          AND status=ANY($2::text[])
+        WHERE tenant_id=$1 AND conversation_id=$2
+          AND status=ANY($3::text[])
           AND expires_at > NOW()
         ORDER BY created_at DESC
         LIMIT 1
         FOR UPDATE
       `,
-      [tenantId, [...ACTIVE_CALL_STATUSES]],
+      [tenantId, conversationId, [...ACTIVE_CALL_STATUSES]],
     );
-    if (activeResult.rows[0]) {
+    deviceBusy = Boolean(activeConversationResult.rows[0]);
+    if (normalizedCallerKind === 'user') {
+      if (!deviceBusy) {
+        assignedDeviceId = (await idleTenantAdminDeviceIds(tenantId, client))[0] || '';
+        deviceBusy = !assignedDeviceId;
+      }
+    } else if (!deviceBusy) {
+      const activeDeviceResult = await client.query(
+        `
+          SELECT id
+          FROM call_sessions
+          WHERE tenant_id=$1
+            AND caller_kind='admin'
+            AND caller_device_id=$2
+            AND status=ANY($3::text[])
+            AND expires_at > NOW()
+          ORDER BY created_at DESC
+          LIMIT 1
+          FOR UPDATE
+        `,
+        [tenantId, callerDeviceId, [...ACTIVE_CALL_STATUSES]],
+      );
+      deviceBusy = Boolean(activeDeviceResult.rows[0]);
+    }
+    if (deviceBusy) {
       const busyResult = await client.query(
         `
           INSERT INTO call_sessions (
             id,tenant_id,conversation_id,mode,offer,caller_kind,caller_name,
-            caller_device_id,status,ended_at,end_reason,expires_at
+            caller_device_id,assigned_device_id,status,ended_at,end_reason,expires_at
           ) VALUES (
             $1,$2,$3,$4,$5::jsonb,$6,$7,
-            $8,'busy',NOW(),'busy',NOW() + ($9::int::text || ' hours')::interval
+            $8,$9,'busy',NOW(),'busy',NOW() + ($10::int::text || ' hours')::interval
           )
           RETURNING *
         `,
@@ -6852,6 +6992,7 @@ async function savePendingCallOffer(
           normalizedCallerKind,
           identity.callerName,
           callerDeviceId,
+          assignedDeviceId,
           identity.retentionHours,
         ],
       );
@@ -6863,10 +7004,10 @@ async function savePendingCallOffer(
       `
         INSERT INTO call_sessions (
           id,tenant_id,conversation_id,mode,offer,caller_kind,caller_name,
-          caller_device_id,status,expires_at
+          caller_device_id,assigned_device_id,status,expires_at
         ) VALUES (
           $1,$2,$3,$4,$5::jsonb,$6,$7,
-          $8,'ringing',NOW() + ($9::int::text || ' seconds')::interval
+          $8,$9,'ringing',NOW() + ($10::int::text || ' seconds')::interval
         )
         RETURNING *
       `,
@@ -6879,6 +7020,7 @@ async function savePendingCallOffer(
         normalizedCallerKind,
         identity.callerName,
         callerDeviceId,
+        assignedDeviceId,
         CALL_RING_TIMEOUT_SECONDS,
       ],
     );
@@ -7075,6 +7217,7 @@ async function finishPendingCall(
       `
         UPDATE call_sessions
         SET status=$4,
+            offer='{}'::jsonb,
             ended_at=NOW(),
             duration_seconds=$5,
             end_reason=$6,
@@ -7135,9 +7278,10 @@ async function getPendingCall(callId, tenantId, conversationId) {
   return pendingCallEvent(result.rows[0]);
 }
 
-async function getPendingAdminCall(tenantId) {
+async function getPendingAdminCall(tenantId, deviceId = '') {
   if (!isUuid(tenantId)) return null;
   await finalizeExpiredCallSessions(tenantId);
+  const normalizedDeviceId = cleanText(deviceId, 120) || 'legacy';
   const result = await pool.query(
     `
       SELECT * FROM call_sessions
@@ -7145,10 +7289,11 @@ async function getPendingAdminCall(tenantId) {
         AND caller_kind='user'
         AND status='ringing' AND expires_at > NOW()
         AND claimed_by IS NULL
+        AND (assigned_device_id='' OR assigned_device_id=$2)
       ORDER BY created_at DESC
       LIMIT 1
     `,
-    [tenantId],
+    [tenantId, normalizedDeviceId],
   );
   return pendingCallEvent(result.rows[0]);
 }
@@ -8885,6 +9030,12 @@ function clientAcceptsEvent(client, event) {
     client.kind === 'user' &&
     client.conversationId !== event.conversationId
   ) return false;
+  if (
+    Array.isArray(event.targetDeviceIds) &&
+    event.targetDeviceIds.length &&
+    client.kind === 'tenant_admin' &&
+    !event.targetDeviceIds.includes(client.deviceId || 'legacy')
+  ) return false;
   return true;
 }
 
@@ -8895,6 +9046,7 @@ function publishEvent(
     tenantId = null,
     distributorId = null,
     targetKind = null,
+    targetDeviceIds = null,
     apiVersion = null,
     keepHistory = true,
   } = {},
@@ -8906,6 +9058,9 @@ function publishEvent(
     tenantId,
     distributorId,
     targetKind,
+    targetDeviceIds: Array.isArray(targetDeviceIds)
+      ? [...new Set(targetDeviceIds.map((item) => cleanText(item, 120)).filter(Boolean))]
+      : null,
     apiVersion,
   };
   if (keepHistory) {
@@ -9100,9 +9255,10 @@ function updateTenantConnectionsAfterRenewal(
       } catch {}
       sseClients.delete(client);
       continue;
-    }
-    client.accessExpiresAt = expiry;
-    try {
+      }
+      client.accessExpiresAt = expiry;
+      client.lastSeenAt = Date.now();
+      try {
       sendSse(client.res, {
         type: 'tenant-renewed',
         accessExpiresAt: new Date(accessExpiresAt).toISOString(),
@@ -9127,6 +9283,23 @@ setInterval(() => {
         client.res.end();
         sseClients.delete(client);
         continue;
+      }
+      client.lastSeenAt = Date.now();
+      if (
+        client.kind === 'tenant_admin' &&
+        client.licenseId &&
+        client.deviceHash &&
+        (!client.lastPresencePersistAt ||
+          client.lastPresencePersistAt < Date.now() - 30_000)
+      ) {
+        client.lastPresencePersistAt = Date.now();
+        pool.query(
+          `UPDATE license_devices
+           SET last_seen_at=NOW()
+           WHERE license_id=$1 AND access_kind='normal'
+             AND device_hash=$2 AND revoked_at IS NULL`,
+          [client.licenseId, client.deviceHash],
+        ).catch(() => {});
       }
       client.res.write(': heartbeat\n\n');
     } catch {
@@ -13045,6 +13218,51 @@ function incrementNetlifyDomain(domain, offset = 1) {
   return normalizeNetlifyDomain(`${nextLabel}${suffix}`);
 }
 
+async function filterQrDomainCandidates(candidates, templateId) {
+  const unique = [...new Set(
+    (Array.isArray(candidates) ? candidates : [])
+      .map((value) => normalizeNetlifyDomain(value))
+      .filter(Boolean),
+  )];
+  if (!unique.length || !isUuid(templateId)) return [];
+  // Store/compare canonical origins without a trailing slash. Older rows may
+  // contain either form, so the query trims trailing slashes before matching.
+  const origins = unique.map((domain) => `https://${domain}`);
+  const hosts = unique
+    .map((domain) => tenantEntryHostFromNetlifyUrl(`https://${domain}/`))
+    .filter(Boolean);
+  const collisions = await pool.query(
+    `
+      SELECT LOWER(base_url) AS value
+      FROM frontend_templates
+      WHERE LOWER(regexp_replace(base_url,'/+$',''))=ANY($1::text[]) AND id<>$2
+      UNION ALL
+      SELECT LOWER(entry_host) AS value
+      FROM frontend_templates
+      WHERE LOWER(entry_host)=ANY($3::text[]) AND id<>$2
+      UNION ALL
+      SELECT LOWER(hostname) AS value
+      FROM frontend_template_entry_aliases
+      WHERE LOWER(hostname)=ANY($3::text[]) AND template_id<>$2
+      UNION ALL
+      SELECT LOWER(hostname) AS value
+      FROM tenant_template_domains
+      WHERE LOWER(hostname)=ANY($3::text[])
+      UNION ALL
+      SELECT LOWER(hostname) AS value
+      FROM tenant_template_domain_aliases
+      WHERE LOWER(hostname)=ANY($3::text[])
+    `,
+    [origins.map((value) => value.toLowerCase()), templateId, hosts.map((value) => value.toLowerCase())],
+  );
+  const occupied = new Set(collisions.rows.map((row) => String(row.value || '').toLowerCase()));
+  return unique.filter((domain) => {
+    const url = `https://${domain}`.toLowerCase();
+    const host = tenantEntryHostFromNetlifyUrl(`https://${domain}/`).toLowerCase();
+    return !occupied.has(url) && (!host || !occupied.has(host));
+  });
+}
+
 async function qrDomainCandidates(currentDomain, templateId, limit = 40) {
   const candidates = [];
   for (let offset = 1; offset <= limit; offset += 1) {
@@ -13052,16 +13270,7 @@ async function qrDomainCandidates(currentDomain, templateId, limit = 40) {
     if (!domain) break;
     candidates.push(domain);
   }
-  if (!candidates.length) return [];
-  const urls = candidates.map((domain) => `https://${domain}/`);
-  const collisions = await pool.query(
-    `SELECT base_url
-     FROM frontend_templates
-     WHERE base_url=ANY($1::text[]) AND id<>$2`,
-    [urls, templateId],
-  );
-  const occupied = new Set(collisions.rows.map((row) => row.base_url));
-  return candidates.filter((domain) => !occupied.has(`https://${domain}/`));
+  return filterQrDomainCandidates(candidates, templateId);
 }
 
 function qrIncidentKeyboard(incidentId) {
@@ -13662,7 +13871,13 @@ async function resolveQrIncidentDomain(
   let databaseCommitted = false;
   try {
     const candidates = manualDomain
-      ? [manualDomain]
+      ? await filterQrDomainCandidates(
+          [
+            manualDomain,
+            ...(await qrDomainCandidates(manualDomain, incident.template_id)),
+          ],
+          incident.template_id,
+        )
       : await qrDomainCandidates(oldNetlifyDomain, incident.template_id);
     if (!candidates.length) throw new Error('没有找到可用的递增域名。');
     let nextBaseUrl = '';
@@ -13677,7 +13892,6 @@ async function resolveQrIncidentDomain(
         break;
       } catch (error) {
         lastError = error;
-        if (manualDomain) break;
       }
     }
     if (!nextBaseUrl || !selectedDomain) {
@@ -14393,6 +14607,260 @@ function telegramUserChatUrl(user) {
     : `tg://user?id=${encodeURIComponent(String(user?.id || ''))}`;
 }
 
+function telegramLedgerGroupAllowed(chat) {
+  return Boolean(
+    chat &&
+    ['group', 'supergroup'].includes(chat.type) &&
+    TELEGRAM_ALLOWED_GROUP_IDS.has(String(chat.id)),
+  );
+}
+
+function parseTelegramLedgerCommand(raw) {
+  const value = String(raw || '').trim();
+  const match = value.match(/^([+-])\s*(\d{1,16}(?:\.\d{1,2})?)\s+(.{1,500})$/u);
+  if (!match) return null;
+  const amount = match[2];
+  if (!Number.isFinite(Number(amount)) || Number(amount) <= 0) return null;
+  return {
+    operationType: match[1],
+    amount,
+    note: match[3].trim(),
+  };
+}
+
+function currencyCents(value) {
+  const text = String(value ?? '').trim();
+  const match = text.match(/^(-?)(\d+)(?:\.(\d{1,2}))?$/);
+  if (!match) return null;
+  const whole = BigInt(match[2]);
+  const fraction = BigInt(String(match[3] || '').padEnd(2, '0') || '0');
+  const cents = whole * 100n + fraction;
+  return match[1] ? -cents : cents;
+}
+
+function formatCurrencyCents(value) {
+  const cents = typeof value === 'bigint' ? value : currencyCents(value);
+  if (cents == null) return '0';
+  const negative = cents < 0n;
+  const absolute = negative ? -cents : cents;
+  const whole = absolute / 100n;
+  const fraction = absolute % 100n;
+  const suffix = fraction ? `.${String(fraction).padStart(2, '0').replace(/0$/, '')}` : '';
+  return `${negative ? '-' : ''}${whole}${suffix}`;
+}
+
+function telegramLedgerKeyboard(chatId, confirm = false) {
+  const value = String(chatId);
+  return {
+    inline_keyboard: confirm
+      ? [[
+          { text: '⚠️ 确认永久删除', callback_data: `ledger:confirm:${value}` },
+          { text: '取消', callback_data: `ledger:cancel:${value}` },
+        ]]
+      : [[{ text: '🗑 删除全部账单', callback_data: `ledger:delete:${value}` }]],
+  };
+}
+
+async function writeTelegramGroupLedger(message, entry) {
+  const chatId = String(message.chat.id);
+  const amountCents = currencyCents(entry.amount);
+  if (amountCents == null || amountCents <= 0n) {
+    throw new Error('金额格式无效。');
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO telegram_group_accounts (chat_id)
+       VALUES ($1) ON CONFLICT (chat_id) DO NOTHING`,
+      [chatId],
+    );
+    const account = await client.query(
+      `SELECT balance::text AS balance FROM telegram_group_accounts
+       WHERE chat_id=$1 FOR UPDATE`,
+      [chatId],
+    );
+    const currentCents = currencyCents(account.rows[0]?.balance || '0') || 0n;
+    const nextCents = entry.operationType === '+'
+      ? currentCents + amountCents
+      : currentCents - amountCents;
+    const maxCents = 99999999999999999999n;
+    if (nextCents > maxCents || nextCents < -maxCents) {
+      throw new Error('账户余额超出允许范围。');
+    }
+    const operator = message.from || {};
+    await client.query(
+      `INSERT INTO telegram_group_ledger (
+         chat_id,operation_type,amount,note,operator_user_id,
+         operator_username,operator_display_name,balance_after
+       ) VALUES ($1,$2,$3::numeric,$4,$5,$6,$7,$8::numeric)`,
+      [
+        chatId,
+        entry.operationType,
+        entry.amount,
+        entry.note,
+        String(operator.id || ''),
+        cleanText(operator.username, 80),
+        telegramDisplayName(operator),
+        formatCurrencyCents(nextCents),
+      ],
+    );
+    await client.query(
+      `UPDATE telegram_group_accounts
+       SET balance=$2::numeric,updated_at=NOW() WHERE chat_id=$1`,
+      [chatId, formatCurrencyCents(nextCents)],
+    );
+    await client.query('COMMIT');
+    return { balance: formatCurrencyCents(nextCents) };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function telegramGroupLedgerText(chatId) {
+  // Read the balance and its ledger rows from one snapshot so a concurrent
+  // write cannot produce a message with a new bill and an old balance.
+  const client = await pool.connect();
+  let account;
+  let ledger;
+  try {
+    await client.query('BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+    account = await client.query(
+      `SELECT balance::text AS balance FROM telegram_group_accounts WHERE chat_id=$1`,
+      [String(chatId)],
+    );
+    ledger = await client.query(
+      `SELECT operation_type,amount::text AS amount,note,
+              operator_display_name,operator_username,created_at
+       FROM telegram_group_ledger
+       WHERE chat_id=$1 ORDER BY created_at DESC,id DESC LIMIT 20`,
+      [String(chatId)],
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+  const balance = account.rows[0]?.balance || '0';
+  const lines = [
+    '💰 <b>账户余额</b>',
+    `当前余额：<code>${escapeTelegramHtml(formatCurrencyCents(currencyCents(balance) || 0n))}</code>`,
+  ];
+  if (!ledger.rows.length) {
+    lines.push('', '📋 暂无账单记录');
+    return lines.join('\n');
+  }
+  lines.push('', '📋 <b>最近账单</b>');
+  for (const row of ledger.rows) {
+    const sign = row.operation_type === '+' ? '+' : '-';
+    const icon = row.operation_type === '+' ? '🟢' : '🔴';
+    const operator = row.operator_display_name ||
+      (row.operator_username ? `@${row.operator_username}` : '未设置姓名');
+    lines.push(
+      `${icon} <code>${sign}${escapeTelegramHtml(formatCurrencyCents(currencyCents(row.amount) || 0n))}</code> ｜ ${escapeTelegramHtml(row.note || '')}`,
+      `👤 ${escapeTelegramHtml(operator)}`,
+      `🕐 ${escapeTelegramHtml(formatTelegramDate(row.created_at))}`,
+      '',
+    );
+  }
+  lines.push('━━━━━━━━━━━━━━', `💰 当前余额：<code>${escapeTelegramHtml(formatCurrencyCents(currencyCents(balance) || 0n))}</code>`);
+  return lines.join('\n');
+}
+
+async function handleTelegramGroupLedgerMessage(message, entry = null) {
+  if (!telegramLedgerGroupAllowed(message?.chat)) return false;
+  const chatId = message.chat.id;
+  if (entry) {
+    try {
+      const result = await writeTelegramGroupLedger(message, entry);
+      const operator = telegramDisplayName(message.from) || '未设置姓名';
+      const icon = entry.operationType === '+' ? '➕' : '➖';
+      await telegramApi('sendMessage', {
+        chat_id: chatId,
+        text: [
+          '✅ <b>记账成功</b>',
+          `${icon} 金额：${escapeTelegramHtml(entry.amount)}`,
+          `📝 备注：${escapeTelegramHtml(entry.note)}`,
+          `👤 操作人：${escapeTelegramHtml(operator)}`,
+          `💰 当前余额：${escapeTelegramHtml(result.balance)}`,
+        ].join('\n'),
+        parse_mode: 'HTML',
+        ...telegramThread(message),
+      });
+    } catch (error) {
+      await telegramApi('sendMessage', {
+        chat_id: chatId,
+        text: `❌ 记账失败：${escapeTelegramHtml(error.message || '金额格式无效。')}`,
+        ...telegramThread(message),
+      });
+    }
+    return true;
+  }
+  await telegramApi('sendMessage', {
+    chat_id: chatId,
+    text: await telegramGroupLedgerText(chatId),
+    parse_mode: 'HTML',
+    reply_markup: telegramLedgerKeyboard(chatId),
+    ...telegramThread(message),
+  });
+  return true;
+}
+
+async function handleTelegramGroupLedgerCallback(callback) {
+  const match = String(callback?.data || '').match(/^ledger:(delete|confirm|cancel):(-?\d+)$/);
+  const chat = callback?.message?.chat;
+  if (!match || !telegramLedgerGroupAllowed(chat)) return false;
+  const chatId = match[2];
+  const messageId = callback?.message?.message_id;
+  await telegramApi('answerCallbackQuery', { callback_query_id: callback.id }).catch(() => {});
+  if (match[1] === 'delete') {
+    await telegramApi('editMessageReplyMarkup', {
+      chat_id: chat.id,
+      message_id: messageId,
+      reply_markup: telegramLedgerKeyboard(chatId, true),
+    });
+    return true;
+  }
+  if (match[1] === 'cancel') {
+    await telegramApi('editMessageReplyMarkup', {
+      chat_id: chat.id,
+      message_id: messageId,
+      reply_markup: telegramLedgerKeyboard(chatId),
+    });
+    return true;
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `DELETE FROM telegram_group_ledger WHERE chat_id=$1`,
+      [chatId],
+    );
+    await client.query(
+      `DELETE FROM telegram_group_accounts WHERE chat_id=$1`,
+      [chatId],
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+  await telegramApi('editMessageText', {
+    chat_id: chat.id,
+    message_id: messageId,
+    text: '🗑 <b>账单已永久删除</b>\n全部账单记录已删除。\n💰 当前余额：<code>0</code>\n此操作不可恢复。',
+    parse_mode: 'HTML',
+  });
+  return true;
+}
+
 async function handleTelegramPrivateInbound(message) {
   if (message?.chat?.type !== 'private' || message?.from?.is_bot) return false;
   const userId = String(message.from?.id || '');
@@ -14517,6 +14985,12 @@ async function processTelegramUpdate(update) {
     const chatId = chat?.id;
     const userId = message.from?.id;
     const raw = String(message.text || '').trim();
+    const ledgerEntry = parseTelegramLedgerCommand(raw);
+    const isLedgerBalance = ['账户余额', '余额'].includes(raw);
+    if (telegramLedgerGroupAllowed(chat) && (ledgerEntry || isLedgerBalance)) {
+      await handleTelegramGroupLedgerMessage(message, ledgerEntry);
+      return;
+    }
     const command = (raw.split(/\s+/)[0] || '')
       .replace(/@[A-Za-z0-9_]+$/i, '')
       .toLowerCase();
@@ -14591,6 +15065,8 @@ async function processTelegramUpdate(update) {
           '域名池：发送“查看可用域名”或 /domains',
           '切换根域名：发送“更换域名 6687878.xyz”并点击确认',
           '二维码异常：回复异常消息并发送“更换域名wxmb2.netlify.app”',
+          '群账户记账：发送“+38 周卡”或“-10 买号”',
+          '查询余额：发送“账户余额”或“余额”',
         ].join('\n'),
         ...telegramThread(message),
       });
@@ -14701,6 +15177,10 @@ async function processTelegramUpdate(update) {
       await sendAllLicenses(chatId, message, listPage);
       return;
     }
+  }
+
+  if (callback?.data?.startsWith('ledger:')) {
+    if (await handleTelegramGroupLedgerCallback(callback)) return;
   }
 
   if (callback?.data?.startsWith('qr:')) {
@@ -16363,6 +16843,11 @@ function publicLicenseRow(row) {
     ),
     desktopDevices: Number(row.desktop_devices || 0),
     mobileDevices: Number(row.mobile_devices || 0),
+    onlineDesktopDevices: Number(row.online_desktop_devices || 0),
+    onlineMobileDevices: Number(row.online_mobile_devices || 0),
+    onlineDevices:
+      Number(row.online_desktop_devices || 0) +
+      Number(row.online_mobile_devices || 0),
     generator:
       row.generated_by_username ||
       (row.generated_by_distributor_username
@@ -16658,7 +17143,9 @@ async function getSuperLicenses(
       t.name AS tenant_name, sa.username AS generated_by_username,
       d.username AS generated_by_distributor_username,
       COALESCE(device_counts.desktop_devices,0)::int AS desktop_devices,
-      COALESCE(device_counts.mobile_devices,0)::int AS mobile_devices
+      COALESCE(device_counts.mobile_devices,0)::int AS mobile_devices,
+      COALESCE(device_counts.online_desktop_devices,0)::int AS online_desktop_devices,
+      COALESCE(device_counts.online_mobile_devices,0)::int AS online_mobile_devices
     FROM license_keys l
     LEFT JOIN tenants t ON t.id = l.tenant_id
     LEFT JOIN super_admins sa ON sa.id = l.generated_by_admin_id
@@ -16666,7 +17153,15 @@ async function getSuperLicenses(
     LEFT JOIN LATERAL (
       SELECT
         COUNT(*) FILTER (WHERE device_type='desktop') AS desktop_devices,
-        COUNT(*) FILTER (WHERE device_type='mobile') AS mobile_devices
+        COUNT(*) FILTER (WHERE device_type='mobile') AS mobile_devices,
+        COUNT(*) FILTER (
+          WHERE device_type='desktop'
+            AND last_seen_at >= NOW() - INTERVAL '45 seconds'
+        ) AS online_desktop_devices,
+        COUNT(*) FILTER (
+          WHERE device_type='mobile'
+            AND last_seen_at >= NOW() - INTERVAL '45 seconds'
+        ) AS online_mobile_devices
       FROM license_devices ld
       WHERE ld.license_id=l.id
         AND ld.access_kind='normal'
@@ -21153,6 +21648,10 @@ async function router(req, res, parsedRequestUrl = null) {
         : payload.kind === 'tenant_admin'
           ? `${payload.tenantId}:${payload.licenseId}`
           : `${payload.tenantId}:${payload.conversationId}`;
+    const requestedDeviceId =
+      payload.kind === 'tenant_admin'
+        ? cleanText(url.searchParams.get('deviceId'), 120) || 'legacy'
+        : '';
     if (
       !rateLimit(
         req,
@@ -21206,6 +21705,9 @@ async function router(req, res, parsedRequestUrl = null) {
       tenantId: payload.tenantId,
       conversationId: payload.conversationId || null,
       licenseId: payload.licenseId || null,
+      deviceId: requestedDeviceId,
+      deviceHash: cleanText(payload.deviceHash, 100),
+      lastSeenAt: Date.now(),
       accessKind:
         payload.kind === 'tenant_admin'
           ? tenantAdminAccessKind(payload)
@@ -21277,6 +21779,11 @@ async function router(req, res, parsedRequestUrl = null) {
       ) {
         scheduleSuperPresenceUpdate();
         scheduleDistributorPresenceUpdate(tenant?.owner_distributor_id);
+      }
+      if (removed && payload.kind === 'tenant_admin') {
+        reassignPendingCallsForDevice(payload.tenantId, client.deviceId).catch((error) =>
+          console.error('后台设备离线后的来电转移失败：', error.message),
+        );
       }
       if (payload.kind !== 'user') return;
       setTimeout(() => {
@@ -21473,12 +21980,15 @@ async function router(req, res, parsedRequestUrl = null) {
             ...signal,
             at: nowIso(),
           },
-          {
-            tenantId: payload.tenantId,
-            conversationId: conversation.id,
-            targetKind: 'tenant_admin',
-          },
-        );
+            {
+              tenantId: payload.tenantId,
+              conversationId: conversation.id,
+              targetKind: 'tenant_admin',
+              targetDeviceIds: saved.call.assigned_device_id
+                ? [saved.call.assigned_device_id]
+                : null,
+            },
+          );
         return sendJson(res, 200, {
           ok: true,
           busy: false,
@@ -21985,7 +22495,10 @@ async function router(req, res, parsedRequestUrl = null) {
     if (req.method === 'GET' && pathname === '/api/admin/pending-call') {
       return sendJson(res, 200, {
         ok: true,
-        call: await getPendingAdminCall(payload.tenantId),
+        call: await getPendingAdminCall(
+          payload.tenantId,
+          url.searchParams.get('deviceId'),
+        ),
       });
     }
 
@@ -23149,11 +23662,12 @@ async function router(req, res, parsedRequestUrl = null) {
                 mode: signal.mode,
                 at: nowIso(),
               },
-              {
-                tenantId: payload.tenantId,
-                conversationId,
-                targetKind: 'tenant_admin',
-              },
+            {
+              tenantId: payload.tenantId,
+              conversationId,
+              targetKind: 'tenant_admin',
+              targetDeviceIds: [signal.deviceId || 'legacy'],
+            },
             );
             return sendJson(res, 200, {
               ok: true,
