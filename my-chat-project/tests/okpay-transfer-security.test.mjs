@@ -32,6 +32,16 @@ function loadTransferParser() {
   return factory();
 }
 
+function loadOkpayCurrencyCents() {
+  const start = source.indexOf('function currencyCents');
+  const end = source.indexOf('function telegramLedgerKeyboard', start);
+  assert.ok(start >= 0 && end > start, 'currency helpers must exist');
+  const factory = new Function(
+    `${source.slice(start, end)}\nreturn okpayCurrencyCents;`,
+  );
+  return factory();
+}
+
 function loadShopTokenAmount() {
   const start = source.indexOf('function shopDecimalUnits');
   const end = source.indexOf('function shopOrderPublic', start);
@@ -103,6 +113,17 @@ test('OKPay fixed 8-decimal USDT amounts compare without rounding', () => {
   assert.equal(amount('10.12345600'), 10_123_456n);
   assert.equal(amount('10.12345601'), null);
   assert.equal(amount(''), null);
+});
+
+test('OKPay transfer amounts accept only zero-padded provider precision', () => {
+  const amount = loadOkpayCurrencyCents();
+  assert.equal(amount('3'), 300n);
+  assert.equal(amount('3.00'), 300n);
+  assert.equal(amount('3.00000000'), 300n);
+  assert.equal(amount('10.12000000'), 1_012n);
+  assert.equal(amount('3.00000001'), null);
+  assert.equal(amount('10.12300000'), null);
+  assert.equal(amount('invalid'), null);
 });
 
 test('TRC20 order tags use exactly two decimals without undercharging', () => {
@@ -185,6 +206,7 @@ test('signed success responses and withdrawal callbacks are verified', () => {
   assert.match(source, /if \(data\.type === 'withdraw'\)/);
   assert.match(source, /applyOkpayTransferResult\(data, \{ fallbackMessage: true \}\)/);
   assert.match(source, /String\(data\.to_user_id \|\| ''\) !== String\(current\.to_user_id\)/);
+  assert.match(source, /providerAmount = okpayCurrencyCents/);
   assert.match(source, /providerAmount !== expectedAmount/);
 });
 

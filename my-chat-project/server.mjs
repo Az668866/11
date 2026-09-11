@@ -12618,7 +12618,7 @@ async function getOkpayRecipient(telegramId) {
 async function getOkpayUsdtBalance() {
   const result = await okpayRequest('/shop/balance', {});
   const balance = String(result.data?.usdt ?? '').trim();
-  if (currencyCents(balance) == null) {
+  if (okpayCurrencyCents(balance) == null) {
     throw new Error('OKPay 未返回有效的 USDT 余额。');
   }
   return balance;
@@ -17096,7 +17096,7 @@ async function applyOkpayTransferResult(data, { fallbackMessage = false } = {}) 
   );
   const current = found.rows[0];
   if (!current) return null;
-  const providerAmount = currencyCents(String(data.amount ?? ''));
+  const providerAmount = okpayCurrencyCents(String(data.amount ?? ''));
   const expectedAmount = currencyCents(current.amount_usdt);
   const mismatch =
     String(data.coin || '').toUpperCase() !== 'USDT' ||
@@ -17433,6 +17433,24 @@ function currencyCents(value) {
   const fraction = BigInt(String(match[3] || '').padEnd(2, '0') || '0');
   const cents = whole * 100n + fraction;
   return match[1] ? -cents : cents;
+}
+
+function okpayCurrencyCents(value) {
+  const text = String(value ?? '').trim();
+  const match = text.match(/^(-?)(\d+)(?:\.(\d+))?$/);
+  if (!match || match[2].length > 18) return null;
+  const fraction = match[3] || '';
+  // OKPay serializes USDT amounts with eight decimal places. The transfer
+  // command itself remains limited to two decimals; extra provider digits are
+  // accepted only when they are zero, so comparison is exact and never rounds.
+  if (fraction.length > 2 && /[^0]/.test(fraction.slice(2))) return null;
+  try {
+    const cents = BigInt(match[2]) * 100n +
+      BigInt((fraction + '00').slice(0, 2) || '0');
+    return match[1] ? -cents : cents;
+  } catch {
+    return null;
+  }
 }
 
 function formatCurrencyCents(value) {
