@@ -167,6 +167,8 @@ const TRON_USDT_CONTRACT = String(
 ).trim();
 const SHOP_ORDER_TTL_MINUTES = 20;
 const SHOP_TRON_POLL_INTERVAL_MS = 30_000;
+const OKPAY_TRANSFER_CONFIRM_TTL_MINUTES = 3;
+const OKPAY_TRANSFER_POLL_INTERVAL_MS = 60_000;
 const SHOP_AMOUNT_RESERVATION_HOURS = 48;
 const SHOP_ORDER_RETENTION_DAYS = 1;
 const SHOP_FAILED_ORDER_RETENTION_DAYS = 2;
@@ -775,6 +777,7 @@ let cloudflareTurnAnalyticsCache = {
 let telegramShopConfigCache = null;
 let telegramShopConfigCacheExpiresAt = 0;
 let telegramShopTronPollPromise = null;
+let telegramOkpayTransferPollPromise = null;
 let telegramShopReportTimer = null;
 let readinessCache = {
   expiresAt: 0,
@@ -2700,6 +2703,45 @@ async function initDatabase() {
       )
     `);
     await client.query(`
+      CREATE TABLE IF NOT EXISTS telegram_okpay_transfers (
+        id UUID PRIMARY KEY,
+        unique_id TEXT NOT NULL UNIQUE,
+        initiator_user_id TEXT NOT NULL,
+        initiator_username TEXT NOT NULL DEFAULT '',
+        initiator_display_name TEXT NOT NULL DEFAULT '',
+        chat_id TEXT NOT NULL,
+        to_user_id TEXT NOT NULL,
+        recipient_username TEXT NOT NULL DEFAULT '',
+        amount_usdt TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'awaiting_confirmation'
+          CHECK (status IN (
+            'awaiting_confirmation','submitting','pending','succeeded',
+            'failed','cancelled','expired','unknown'
+          )),
+        okpay_order_id TEXT UNIQUE,
+        need_review BOOLEAN,
+        telegram_message_id BIGINT,
+        error_message TEXT NOT NULL DEFAULT '',
+        expires_at TIMESTAMPTZ NOT NULL,
+        confirmed_at TIMESTAMPTZ,
+        submitted_at TIMESTAMPTZ,
+        completed_at TIMESTAMPTZ,
+        next_check_at TIMESTAMPTZ,
+        last_checked_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS telegram_okpay_transfers_due_idx
+      ON telegram_okpay_transfers (next_check_at, created_at)
+      WHERE status IN ('submitting','pending','unknown')
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS telegram_okpay_transfers_operator_idx
+      ON telegram_okpay_transfers (initiator_user_id, created_at DESC)
+    `);
+    await client.query(`
       CREATE TABLE IF NOT EXISTS telegram_shop_daily_reports (
         report_date DATE PRIMARY KEY,
         status TEXT NOT NULL CHECK (status IN ('pending','sent','failed')),
@@ -3041,6 +3083,17 @@ async function cleanupExpiredData() {
     await client.query(`
       DELETE FROM telegram_shop_amount_reservations
       WHERE reserved_until <= NOW()
+    `);
+    await client.query(`
+      UPDATE telegram_okpay_transfers
+      SET status='expired',completed_at=COALESCE(completed_at,NOW()),updated_at=NOW()
+      WHERE status='awaiting_confirmation' AND expires_at <= NOW()
+    `);
+    await client.query(`
+      DELETE FROM telegram_okpay_transfers
+      WHERE (status='succeeded' AND completed_at < NOW() - INTERVAL '1 day')
+         OR (status IN ('failed','cancelled','expired')
+             AND COALESCE(completed_at,updated_at) < NOW() - INTERVAL '2 days')
     `);
     await client.query(`
       UPDATE license_keys l
@@ -12428,9 +12481,20 @@ async function okpayRequest(pathname, params) {
   });
   const body = await response.json().catch(() => null);
   if (!response.ok || body?.status !== 'success') {
-    throw new Error(cleanText(body?.message || body?.error || `OKPay 返回状态 ${response.status}`, 240));
+    const error = new Error(cleanText(
+      body?.msg || body?.message || body?.error ||
+        `OKPay 请求失败（HTTP ${response.status}）`,
+      240,
+    ));
+    error.okpayDefinitive = Boolean(
+      body && ['warning', 'error'].includes(String(body.status || '').toLowerCase()),
+    );
+    throw error;
   }
-  if (body.sign && !timingSafeTextEqual(String(body.sign), okpaySignature(body))) {
+  if (!body.sign) {
+    throw new Error('OKPay 成功响应缺少签名，结果未被采用。');
+  }
+  if (!timingSafeTextEqual(String(body.sign), okpaySignature(body))) {
     throw new Error('OKPay 返回签名校验失败。');
   }
   return body;
@@ -12439,6 +12503,50 @@ async function okpayRequest(pathname, params) {
 function verifyOkpayCallback(body) {
   if (!body || typeof body !== 'object' || !body.sign) return false;
   return timingSafeTextEqual(String(body.sign), okpaySignature(body));
+}
+
+async function getOkpayRecipient(telegramId) {
+  const result = await okpayRequest('/shop/censorUserByTG', {
+    telegramID: String(telegramId),
+  });
+  const data = result.data || {};
+  if (data.exist !== true && String(data.exist).toLowerCase() !== 'true') {
+    throw new Error('该 Telegram ID 不是可接收转账的 OKPay 用户，请先让对方启动 @okpay。');
+  }
+  if (String(data.telegramID || telegramId) !== String(telegramId)) {
+    throw new Error('OKPay 返回的收款用户不一致，已停止转账。');
+  }
+  return {
+    telegramId: String(telegramId),
+    username: cleanText(data.username, 80),
+  };
+}
+
+async function getOkpayUsdtBalance() {
+  const result = await okpayRequest('/shop/balance', {});
+  const balance = String(result.data?.usdt ?? '').trim();
+  if (currencyCents(balance) == null) {
+    throw new Error('OKPay 未返回有效的 USDT 余额。');
+  }
+  return balance;
+}
+
+async function submitOkpayTransfer(transfer) {
+  const callbackUrl = `${PUBLIC_API_BASE}/api/okpay/callback`;
+  return okpayRequest('/shop/transfer', {
+    to_user_id: String(transfer.to_user_id),
+    amount: String(transfer.amount_usdt),
+    coin: 'USDT',
+    unique_id: String(transfer.unique_id),
+    name: '拓界云服管理员转账',
+    callback_url: callbackUrl,
+  });
+}
+
+async function checkOkpayTransfer(uniqueId) {
+  return okpayRequest('/shop/checkTransfer', {
+    unique_id: String(uniqueId),
+  });
 }
 
 async function createOkpayOrderLink(order) {
@@ -12579,6 +12687,21 @@ function telegramShopMainKeyboard(isAdmin = false) {
   return { inline_keyboard: rows };
 }
 
+function telegramShopPersistentKeyboard(isAdmin = false) {
+  const rows = [
+    [{ text: '购买卡密' }, { text: '查询新增' }],
+    [{ text: '使用帮助' }, { text: '联系客服' }],
+  ];
+  if (isAdmin) rows.push([{ text: '机器人设置' }]);
+  return {
+    keyboard: rows,
+    resize_keyboard: true,
+    is_persistent: true,
+    one_time_keyboard: false,
+    input_field_placeholder: '请选择功能',
+  };
+}
+
 function telegramShopContactKeyboard(contacts) {
   const enabled = normalizeShopContacts(contacts).filter((item) => item.enabled);
   if (!enabled.length) return { inline_keyboard: [] };
@@ -12667,24 +12790,51 @@ async function sendTelegramShopMenu(chatId, userId, message = null) {
       '请选择你要使用的功能：',
     ].join('\n'),
     parse_mode: 'HTML',
-    reply_markup: telegramShopMainKeyboard(isAdmin),
+    reply_markup: telegramShopPersistentKeyboard(isAdmin),
     ...(message ? telegramThread(message) : {}),
   });
 }
 
-async function sendTelegramShopSupport(chatId) {
+async function editTelegramShopCallbackMessage(callback, text, replyMarkup) {
+  const payload = {
+    chat_id: callback.message.chat.id,
+    message_id: callback.message.message_id,
+    text,
+    parse_mode: 'HTML',
+    reply_markup: replyMarkup,
+    link_preview_options: { is_disabled: true },
+  };
+  try {
+    return await telegramApi('editMessageText', payload);
+  } catch {
+    return telegramApi('sendMessage', {
+      chat_id: payload.chat_id,
+      text,
+      parse_mode: payload.parse_mode,
+      reply_markup: replyMarkup,
+      link_preview_options: payload.link_preview_options,
+    });
+  }
+}
+
+async function sendTelegramShopSupport(chatId, callback = null) {
   const config = await getTelegramShopConfig();
   const contacts = config.contacts.filter((item) => item.enabled);
   const text = contacts.length
     ? '<b>💬 联系客服</b>\n\n请选择客服：'
     : '当前暂无可用客服，请稍后再试。';
+  const replyMarkup = contacts.length
+    ? telegramShopContactKeyboard(contacts)
+    : telegramShopMainKeyboard(TELEGRAM_ALLOWED_USER_IDS.has(String(chatId)));
+  if (callback) {
+    await editTelegramShopCallbackMessage(callback, text, replyMarkup);
+    return;
+  }
   await telegramApi('sendMessage', {
     chat_id: chatId,
     text,
     parse_mode: 'HTML',
-    reply_markup: contacts.length
-      ? telegramShopContactKeyboard(contacts)
-      : telegramShopMainKeyboard(TELEGRAM_ALLOWED_USER_IDS.has(String(chatId))),
+    reply_markup: replyMarkup,
   });
 }
 
@@ -12746,11 +12896,14 @@ function telegramShopOrderText(order, link = null) {
   return lines.join('\n');
 }
 
-function telegramShopOrderKeyboard(order, link = null) {
+function telegramShopOrderKeyboard(order, link = null, contacts = []) {
   const rows = [];
   if (link) rows.push([{ text: '🟢 前往OKPay支付', url: link }]);
   rows.push([{ text: '🔄 我已完成支付，查询订单', callback_data: `shop:check:${order.id}` }]);
-  rows.push([{ text: '💬 联系客服', callback_data: 'shop:support' }]);
+  const firstContact = normalizeShopContacts(contacts).find((item) => item.enabled);
+  rows.push([firstContact
+    ? { text: `💬 联系${firstContact.name}`, url: firstContact.url }
+    : { text: '💬 联系客服', callback_data: 'shop:support' }]);
   return { inline_keyboard: rows };
 }
 
@@ -13201,6 +13354,13 @@ async function handleOkpayShopCallback(req, res) {
     return sendError(res, 400, 'OKPay回调签名无效。', 'OKPAY_SIGNATURE');
   }
   const data = body.data || {};
+  if (data.type === 'withdraw') {
+    if ([0, 1, 2].includes(Number(data.status))) {
+      await applyOkpayTransferResult(data, { fallbackMessage: true });
+    }
+    // 出款回调同样只保存必要状态，不保存原始回调正文。
+    return sendJson(res, 200, { ok: true });
+  }
   if (data.type !== 'deposit' || Number(data.status) !== 1) {
     return sendJson(res, 200, { ok: true });
   }
@@ -13229,10 +13389,9 @@ async function handleOkpayShopCallback(req, res) {
   return sendJson(res, 200, { ok: true });
 }
 
-async function recordTelegramShopIllegalAttempt(callback, action) {
-  const target = callback?.from || {};
+async function recordTelegramShopIllegalActor(target = {}, action) {
   const userId = String(target.id || '');
-  if (!/^\d+$/.test(userId)) return;
+  if (!/^\d+$/.test(userId) || TELEGRAM_ALLOWED_USER_IDS.has(userId)) return null;
   const updated = await pool.query(
     `INSERT INTO telegram_shop_illegal_attempts(
        user_id,username,display_name,attempt_count,last_action,last_at,updated_at
@@ -13276,6 +13435,11 @@ async function recordTelegramShopIllegalAttempt(callback, action) {
       ).catch(() => {});
     }
   }
+  return row;
+}
+
+async function recordTelegramShopIllegalAttempt(callback, action) {
+  await recordTelegramShopIllegalActor(callback?.from || {}, action);
   await telegramApi('answerCallbackQuery', {
     callback_query_id: callback.id,
     text: '检测到未授权操作，已通知管理员。',
@@ -13336,7 +13500,7 @@ async function blockTelegramShopUser(operatorCallback, targetUserId) {
   }).catch(() => {});
 }
 
-async function sendTelegramShopAdminContacts(chatId) {
+async function sendTelegramShopAdminContacts(chatId, callback = null) {
   const config = await getTelegramShopConfig();
   const lines = [
     '<b>👤 客服设置</b>',
@@ -13350,24 +13514,29 @@ async function sendTelegramShopAdminContacts(chatId) {
     const item = config.contacts[index];
     lines.push(`${index + 1}. ${item?.enabled ? `${item.name}｜${item.value}` : '未设置'}`);
   }
+  const replyMarkup = {
+    inline_keyboard: [
+      [
+        { text: '客服1', callback_data: 'admin:contact:1' },
+        { text: '客服2', callback_data: 'admin:contact:2' },
+        { text: '客服3', callback_data: 'admin:contact:3' },
+      ],
+      [{ text: '⬅️ 返回设置', callback_data: 'shop:admin' }],
+    ],
+  };
+  if (callback) {
+    await editTelegramShopCallbackMessage(callback, lines.join('\n'), replyMarkup);
+    return;
+  }
   await telegramApi('sendMessage', {
     chat_id: chatId,
     text: lines.join('\n'),
     parse_mode: 'HTML',
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: '客服1', callback_data: 'admin:contact:1' },
-          { text: '客服2', callback_data: 'admin:contact:2' },
-          { text: '客服3', callback_data: 'admin:contact:3' },
-        ],
-        [{ text: '⬅️ 返回设置', callback_data: 'shop:admin' }],
-      ],
-    },
+    reply_markup: replyMarkup,
   });
 }
 
-async function sendTelegramShopAbnormalOrders(chatId) {
+async function sendTelegramShopAbnormalOrders(chatId, callback = null) {
   const result = await pool.query(
     `SELECT * FROM telegram_shop_orders
      WHERE payment_status IN ('overpaid','late','manual','underpaid')
@@ -13385,11 +13554,18 @@ async function sendTelegramShopAbnormalOrders(chatId) {
       '',
     );
   }
+  const replyMarkup = {
+    inline_keyboard: [[{ text: '⬅️ 返回设置', callback_data: 'shop:admin' }]],
+  };
+  if (callback) {
+    await editTelegramShopCallbackMessage(callback, lines.join('\n'), replyMarkup);
+    return;
+  }
   await telegramApi('sendMessage', {
     chat_id: chatId,
     text: lines.join('\n'),
     parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: [[{ text: '⬅️ 返回设置', callback_data: 'shop:admin' }]] },
+    reply_markup: replyMarkup,
   });
 }
 
@@ -13472,21 +13648,66 @@ async function handleTelegramShopPrivateInbound(message) {
     await sendTelegramShopBlocked(message.chat.id);
     return true;
   }
-  if (TELEGRAM_ALLOWED_USER_IDS.has(userId)) {
+  const raw = String(message.text || '').trim();
+  const shortcut = new Set([
+    '/start', '/help', '开始', '菜单', '购买卡密', '买卡', '购买',
+    '查询新增', '查询新增访客', '查卡密新增', '使用帮助', '联系客服',
+    '联系客户', '机器人设置',
+  ]).has(raw.toLowerCase());
+  if (TELEGRAM_ALLOWED_USER_IDS.has(userId) && !shortcut) {
     if (await handleTelegramShopAdminText(message)) return true;
   }
-  const raw = String(message.text || '').trim();
-  if (['/start', '/help', '开始', '菜单', '购买卡密'].includes(raw.toLowerCase())) {
-    if (raw.toLowerCase() === '/help') {
-      await telegramApi('sendMessage', {
-        chat_id: message.chat.id,
-        text: telegramShopHelpText(),
-        parse_mode: 'HTML',
-        reply_markup: telegramShopMainKeyboard(TELEGRAM_ALLOWED_USER_IDS.has(userId)),
-      });
-    } else {
-      await sendTelegramShopMenu(message.chat.id, userId, message);
-    }
+  if (['/start', '开始', '菜单'].includes(raw.toLowerCase())) {
+    await clearTelegramShopSession(userId);
+    await sendTelegramShopMenu(message.chat.id, userId, message);
+    return true;
+  }
+  if (['/help', '使用帮助'].includes(raw.toLowerCase())) {
+    await clearTelegramShopSession(userId);
+    await telegramApi('sendMessage', {
+      chat_id: message.chat.id,
+      text: telegramShopHelpText(),
+      parse_mode: 'HTML',
+      reply_markup: telegramShopMainKeyboard(TELEGRAM_ALLOWED_USER_IDS.has(userId)),
+    });
+    return true;
+  }
+  if (['联系客服', '联系客户'].includes(raw)) {
+    await clearTelegramShopSession(userId);
+    await sendTelegramShopSupport(message.chat.id);
+    return true;
+  }
+  if (['查询新增', '查询新增访客', '查卡密新增'].includes(raw)) {
+    await setTelegramShopSession(userId, 'query_key');
+    await telegramApi('sendMessage', {
+      chat_id: message.chat.id,
+      text: '请发送你要查询的已激活卡密。',
+    });
+    return true;
+  }
+  if (raw === '机器人设置' && !TELEGRAM_ALLOWED_USER_IDS.has(userId)) {
+    await recordTelegramShopIllegalActor(message.from || {}, '尝试打开机器人设置')
+      .catch(() => {});
+    await telegramApi('sendMessage', {
+      chat_id: message.chat.id,
+      text: '⛔ 该功能仅限管理员使用，操作已记录并通知管理员。',
+    });
+    return true;
+  }
+  if (raw === '机器人设置' && TELEGRAM_ALLOWED_USER_IDS.has(userId)) {
+    await clearTelegramShopSession(userId);
+    await telegramApi('sendMessage', {
+      chat_id: message.chat.id,
+      text: '<b>⚙️ 机器人设置</b>\n\n价格只对新订单生效；未付款旧订单保留原金额。',
+      parse_mode: 'HTML',
+      reply_markup: telegramShopAdminKeyboard(await getTelegramShopConfig()),
+    });
+    return true;
+  }
+  if (['购买卡密', '买卡', '购买'].includes(raw)) {
+    await clearTelegramShopSession(userId);
+    const config = await getTelegramShopConfig();
+    await telegramApi('sendMessage', { chat_id: message.chat.id, text: telegramShopPurchaseText(config.products), parse_mode: 'HTML', reply_markup: telegramShopPackageKeyboard(config) });
     return true;
   }
   const session = await getTelegramShopSession(userId);
@@ -13523,11 +13744,6 @@ async function handleTelegramShopPrivateInbound(message) {
     }
     return true;
   }
-  if (['购买卡密', '买卡', '购买'].includes(raw)) {
-    const config = await getTelegramShopConfig();
-    await telegramApi('sendMessage', { chat_id: message.chat.id, text: telegramShopPurchaseText(config.products), parse_mode: 'HTML', reply_markup: telegramShopPackageKeyboard(config) });
-    return true;
-  }
   return false;
 }
 
@@ -13560,7 +13776,12 @@ async function handleTelegramShopCallback(callback) {
     }
     if (data === 'admin:contacts') {
       await telegramApi('answerCallbackQuery', { callback_query_id: callback.id }).catch(() => {});
-      await sendTelegramShopAdminContacts(chatId);
+      await sendTelegramShopAdminContacts(chatId, callback);
+      return true;
+    }
+    if (data === 'admin:orders') {
+      await telegramApi('answerCallbackQuery', { callback_query_id: callback.id }).catch(() => {});
+      await sendTelegramShopAbnormalOrders(chatId, callback);
       return true;
     }
     if (parts[1] === 'contact' && /^[123]$/.test(parts[2])) {
@@ -13579,7 +13800,11 @@ async function handleTelegramShopCallback(callback) {
         ? { okpayEnabled: !config.okpayEnabled }
         : { tronEnabled: !config.tronEnabled });
       await telegramApi('answerCallbackQuery', { callback_query_id: callback.id, text: '设置已更新。' }).catch(() => {});
-      await telegramApi('sendMessage', { chat_id: chatId, text: '✅ 支付设置已更新。', reply_markup: telegramShopAdminKeyboard(await getTelegramShopConfig()) });
+      await editTelegramShopCallbackMessage(
+        callback,
+        '<b>⚙️ 机器人设置</b>\n\n✅ 支付设置已更新。价格只对新订单生效。',
+        telegramShopAdminKeyboard(await getTelegramShopConfig()),
+      );
       return true;
     }
     if (parts[1] === 'block' && /^\d+$/.test(parts[2])) {
@@ -13615,30 +13840,55 @@ async function handleTelegramShopCallback(callback) {
   const parts = data.split(':');
   await telegramApi('answerCallbackQuery', { callback_query_id: callback.id }).catch(() => {});
   if (data === 'shop:menu') {
-    await sendTelegramShopMenu(chatId, userId);
+    await clearTelegramShopSession(userId);
+    await editTelegramShopCallbackMessage(
+      callback,
+      '<b>🛍 拓界云服卡密服务</b>\n\n请选择你要使用的功能：',
+      telegramShopMainKeyboard(TELEGRAM_ALLOWED_USER_IDS.has(userId)),
+    );
     return true;
   }
   if (data === 'shop:buy') {
+    await clearTelegramShopSession(userId);
     const config = await getTelegramShopConfig();
-    await telegramApi('sendMessage', { chat_id: chatId, text: telegramShopPurchaseText(config.products), parse_mode: 'HTML', reply_markup: telegramShopPackageKeyboard(config) });
+    await editTelegramShopCallbackMessage(
+      callback,
+      telegramShopPurchaseText(config.products),
+      telegramShopPackageKeyboard(config),
+    );
     return true;
   }
   if (data === 'shop:help') {
-    await telegramApi('sendMessage', { chat_id: chatId, text: telegramShopHelpText(), parse_mode: 'HTML', reply_markup: telegramShopMainKeyboard(TELEGRAM_ALLOWED_USER_IDS.has(userId)) });
+    await clearTelegramShopSession(userId);
+    await editTelegramShopCallbackMessage(
+      callback,
+      telegramShopHelpText(),
+      telegramShopMainKeyboard(TELEGRAM_ALLOWED_USER_IDS.has(userId)),
+    );
     return true;
   }
   if (data === 'shop:support') {
-    await sendTelegramShopSupport(chatId);
+    await clearTelegramShopSession(userId);
+    await sendTelegramShopSupport(chatId, callback);
     return true;
   }
   if (data === 'shop:admin') {
     if (!(await telegramShopAdminAuthorized(callback, '打开机器人设置'))) return true;
-    await telegramApi('sendMessage', { chat_id: chatId, text: '<b>⚙️ 机器人设置</b>\n\n价格只对新订单生效；未付款旧订单保留原金额。', parse_mode: 'HTML', reply_markup: telegramShopAdminKeyboard(await getTelegramShopConfig()) });
+    await clearTelegramShopSession(userId);
+    await editTelegramShopCallbackMessage(
+      callback,
+      '<b>⚙️ 机器人设置</b>\n\n价格只对新订单生效；未付款旧订单保留原金额。',
+      telegramShopAdminKeyboard(await getTelegramShopConfig()),
+    );
     return true;
   }
   if (data === 'shop:query') {
     await setTelegramShopSession(userId, 'query_key');
-    await telegramApi('sendMessage', { chat_id: chatId, text: '请发送你要查询的已激活卡密。' });
+    await editTelegramShopCallbackMessage(
+      callback,
+      '<b>🔎 查询新增访客</b>\n\n请发送你要查询的已激活卡密。',
+      { inline_keyboard: [[{ text: '⬅️ 返回菜单', callback_data: 'shop:menu' }]] },
+    );
     return true;
   }
   if (parts[1] === 'pkg' && TELEGRAM_SHOP_DURATION_CODES.includes(parts[2])) {
@@ -13648,13 +13898,18 @@ async function handleTelegramShopCallback(callback) {
       await telegramApi('answerCallbackQuery', { callback_query_id: callback.id, text: '该套餐已下架。', show_alert: true });
       return true;
     }
-    await telegramApi('sendMessage', { chat_id: chatId, text: telegramShopPaymentText(product), parse_mode: 'HTML', reply_markup: telegramShopPaymentKeyboard(config, parts[2]) });
+    await editTelegramShopCallbackMessage(
+      callback,
+      telegramShopPaymentText(product),
+      telegramShopPaymentKeyboard(config, parts[2]),
+    );
     return true;
   }
   if (parts[1] === 'pay' && TELEGRAM_SHOP_DURATION_CODES.includes(parts[2]) && ['okpay_usdt', 'usdt_trc20'].includes(parts[3])) {
     try {
+      const config = await getTelegramShopConfig();
       const result = await createTelegramShopOrder({ from: callback.from, chat: callback.message.chat }, parts[2], parts[3]);
-      await telegramApi('sendMessage', { chat_id: chatId, text: telegramShopOrderText(result.order, result.link?.payUrl), parse_mode: 'HTML', reply_markup: telegramShopOrderKeyboard(result.order, result.link?.payUrl) });
+      await telegramApi('sendMessage', { chat_id: chatId, text: telegramShopOrderText(result.order, result.link?.payUrl), parse_mode: 'HTML', reply_markup: telegramShopOrderKeyboard(result.order, result.link?.payUrl, config.contacts) });
     } catch (error) {
       await telegramApi('sendMessage', { chat_id: chatId, text: `❌ ${cleanText(error.message, 240)}` });
     }
@@ -13704,7 +13959,11 @@ async function handleTelegramShopCallback(callback) {
     const lines = [`<b>📊 新增访客统计</b>`, '', `你选择查询最近${requestedLabel}的新增访客。`];
     if (actualHours < hours) lines.push(`当前商家后台仅保留最近${actualLabel}的访客记录，超过部分已按设置清理，因此本次只能统计最近${actualLabel}。`);
     lines.push(`统计结果：新增访客 <b>${Number(count)}</b> 人。`);
-    await telegramApi('sendMessage', { chat_id: chatId, text: lines.join('\n'), parse_mode: 'HTML', reply_markup: telegramShopMainKeyboard(TELEGRAM_ALLOWED_USER_IDS.has(userId)) });
+    await editTelegramShopCallbackMessage(
+      callback,
+      lines.join('\n'),
+      telegramShopMainKeyboard(TELEGRAM_ALLOWED_USER_IDS.has(userId)),
+    );
     return true;
   }
   return true;
@@ -16398,6 +16657,547 @@ function telegramUserChatUrl(user) {
     : `tg://user?id=${encodeURIComponent(String(user?.id || ''))}`;
 }
 
+function parseOkpayTransferCommand(raw) {
+  const value = String(raw || '').trim();
+  const prefix = value.match(/^(转账|提现)(?:\s|$)/u);
+  if (!prefix) return null;
+  const match = value.match(
+    /^(转账|提现)\s+(\d{1,12}(?:\.\d{1,2})?)\s+(\d{1,20})$/u,
+  );
+  if (!match) return { invalid: true, legacyName: prefix[1] === '提现' };
+  const amountCents = currencyCents(match[2]);
+  let telegramId;
+  try {
+    telegramId = BigInt(match[3]);
+  } catch {
+    return null;
+  }
+  if (amountCents == null || amountCents <= 100n || telegramId <= 0n) {
+    return { invalid: true, legacyName: match[1] === '提现' };
+  }
+  return {
+    invalid: false,
+    legacyName: match[1] === '提现',
+    amount: formatCurrencyCents(amountCents),
+    toUserId: match[3],
+  };
+}
+
+function telegramOkpayTransferKeyboard(transferId) {
+  return {
+    inline_keyboard: [[
+      { text: '✅ 确认转账', callback_data: `transfer:confirm:${transferId}` },
+      { text: '取消', callback_data: `transfer:cancel:${transferId}` },
+    ]],
+  };
+}
+
+function telegramOkpayTransferText(transfer) {
+  const status = String(transfer.status || '');
+  const titles = {
+    awaiting_confirmation: '⚠️ 请确认 OKPay 转账',
+    submitting: '⏳ 正在提交 OKPay 转账',
+    pending: '⏳ OKPay 转账已受理',
+    succeeded: '✅ OKPay 转账成功',
+    failed: '❌ OKPay 转账失败',
+    cancelled: '已取消 OKPay 转账',
+    expired: '⌛ OKPay 转账确认已过期',
+    unknown: '⚠️ OKPay 转账状态待核验',
+  };
+  const lines = [
+    `<b>${titles[status] || 'OKPay 转账'}</b>`,
+    '',
+    `<b>金额</b>：${escapeTelegramHtml(transfer.amount_usdt)} USDT`,
+    `<b>收款 Telegram ID</b>：<code>${escapeTelegramHtml(transfer.to_user_id)}</code>`,
+  ];
+  if (transfer.recipient_username) {
+    lines.push(`<b>OKPay 用户</b>：@${escapeTelegramHtml(transfer.recipient_username)}`);
+  }
+  lines.push(
+    `<b>操作人</b>：${escapeTelegramHtml(
+      transfer.initiator_display_name ||
+        (transfer.initiator_username ? `@${transfer.initiator_username}` : transfer.initiator_user_id),
+    )}`,
+    `<b>转账编号</b>：<code>${escapeTelegramHtml(transfer.unique_id)}</code>`,
+  );
+  if (status === 'awaiting_confirmation') {
+    lines.push(
+      `<b>确认截止</b>：${escapeTelegramHtml(formatTelegramDate(transfer.expires_at))}`,
+      '',
+      '确认后 OKPay 会冻结相应商户余额。请仔细核对金额和收款人；按钮只能由本次发起人操作。',
+    );
+  } else if (status === 'submitting') {
+    lines.push('', '请求正在提交，请勿重复发送转账命令。');
+  } else if (status === 'pending') {
+    lines.push(
+      '',
+      transfer.need_review
+        ? 'OKPay 已冻结余额，请到 @okpay 完成商户主/财务审核。最终结果会自动更新在本消息。'
+        : 'OKPay 已受理并进入放款队列，最终结果会自动更新在本消息。',
+    );
+  } else if (status === 'succeeded') {
+    lines.push('', '款项已经由 OKPay 放款给收款用户。');
+  } else if (status === 'failed') {
+    lines.push('', escapeTelegramHtml(
+      transfer.error_message || '转账被拒绝或失败；如余额曾被冻结，OKPay 会将其退回商户余额。',
+    ));
+  } else if (status === 'unknown') {
+    lines.push(
+      '',
+      escapeTelegramHtml(
+        transfer.error_message || '提交结果暂时无法确认，系统会使用同一转账编号查询，不会重复创建转账。',
+      ),
+    );
+  }
+  return lines.join('\n');
+}
+
+async function editTelegramOkpayTransferMessage(transfer, fallback = false) {
+  if (!transfer?.telegram_message_id || !transfer?.chat_id) return;
+  const payload = {
+    chat_id: transfer.chat_id,
+    message_id: transfer.telegram_message_id,
+    text: telegramOkpayTransferText(transfer),
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+    reply_markup: transfer.status === 'awaiting_confirmation'
+      ? telegramOkpayTransferKeyboard(transfer.id)
+      : { inline_keyboard: [] },
+  };
+  try {
+    await telegramApi('editMessageText', payload);
+  } catch (error) {
+    if (!fallback) return;
+    await telegramApi('sendMessage', {
+      chat_id: transfer.chat_id,
+      text: payload.text,
+      parse_mode: 'HTML',
+      link_preview_options: payload.link_preview_options,
+    }).catch(() => {});
+  }
+}
+
+function okpayTransferNextCheck(submittedAt = null) {
+  const age = submittedAt
+    ? Math.max(0, Date.now() - new Date(submittedAt).getTime())
+    : 0;
+  const delay = age < 10 * 60_000
+    ? 60_000
+    : age < 60 * 60_000
+      ? 5 * 60_000
+      : 15 * 60_000;
+  return new Date(Date.now() + delay);
+}
+
+async function createTelegramOkpayTransfer(message, command) {
+  const initiatorId = String(message.from.id);
+  const recipient = await getOkpayRecipient(command.toUserId);
+  const balance = await getOkpayUsdtBalance();
+  const balanceCents = currencyCents(balance);
+  const amountCents = currencyCents(command.amount);
+  if (balanceCents == null || amountCents == null || balanceCents < amountCents) {
+    throw new Error(`OKPay USDT 余额不足，当前可用余额为 ${balance} USDT。`);
+  }
+  const client = await pool.connect();
+  let transfer;
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtext($1))`,
+      [`tuojie-okpay-transfer:${initiatorId}`],
+    );
+    const unfinished = await client.query(
+      `SELECT status FROM telegram_okpay_transfers
+       WHERE initiator_user_id=$1
+         AND status IN ('awaiting_confirmation','submitting','unknown')
+         AND (status<>'awaiting_confirmation' OR expires_at>NOW())
+       ORDER BY created_at DESC LIMIT 1`,
+      [initiatorId],
+    );
+    if (unfinished.rows[0]) {
+      throw new Error(
+        unfinished.rows[0].status === 'awaiting_confirmation'
+          ? '你已有一笔等待确认的转账，请先确认或取消。'
+          : '你有一笔提交结果仍在核验的转账，请勿重复创建。',
+      );
+    }
+    const id = randomUUID();
+    const uniqueId = `TJW${id.replace(/-/g, '').toUpperCase()}`;
+    const inserted = await client.query(
+      `INSERT INTO telegram_okpay_transfers(
+         id,unique_id,initiator_user_id,initiator_username,
+         initiator_display_name,chat_id,to_user_id,recipient_username,
+         amount_usdt,expires_at
+       ) VALUES(
+         $1,$2,$3,$4,$5,$6,$7,$8,$9,
+         NOW()+($10::int*INTERVAL '1 minute')
+       ) RETURNING *`,
+      [
+        id,
+        uniqueId,
+        initiatorId,
+        cleanText(message.from.username, 80),
+        telegramDisplayName(message.from),
+        String(message.chat.id),
+        command.toUserId,
+        recipient.username,
+        command.amount,
+        OKPAY_TRANSFER_CONFIRM_TTL_MINUTES,
+      ],
+    );
+    transfer = inserted.rows[0];
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+  try {
+    const sent = await telegramApi('sendMessage', {
+      chat_id: transfer.chat_id,
+      text: telegramOkpayTransferText(transfer),
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: telegramOkpayTransferKeyboard(transfer.id),
+      ...telegramThread(message),
+    });
+    const updated = await pool.query(
+      `UPDATE telegram_okpay_transfers SET telegram_message_id=$2,updated_at=NOW()
+       WHERE id=$1 RETURNING *`,
+      [transfer.id, sent.message_id],
+    );
+    return updated.rows[0] || transfer;
+  } catch (error) {
+    await pool.query(
+      `UPDATE telegram_okpay_transfers
+       SET status='cancelled',completed_at=NOW(),error_message='确认消息发送失败',updated_at=NOW()
+       WHERE id=$1 AND status='awaiting_confirmation'`,
+      [transfer.id],
+    ).catch(() => {});
+    throw error;
+  }
+}
+
+async function applyOkpayTransferResult(data, { fallbackMessage = false } = {}) {
+  const uniqueId = cleanText(data?.unique_id, 160);
+  const orderId = cleanText(data?.order_id, 160);
+  if (!uniqueId && !orderId) return null;
+  const found = await pool.query(
+    `SELECT * FROM telegram_okpay_transfers
+     WHERE ($1<>'' AND unique_id=$1) OR ($2<>'' AND okpay_order_id=$2)
+     ORDER BY created_at DESC LIMIT 1`,
+    [uniqueId, orderId],
+  );
+  const current = found.rows[0];
+  if (!current) return null;
+  const providerAmount = currencyCents(String(data.amount ?? ''));
+  const expectedAmount = currencyCents(current.amount_usdt);
+  const mismatch =
+    String(data.coin || '').toUpperCase() !== 'USDT' ||
+    String(data.to_user_id || '') !== String(current.to_user_id) ||
+    providerAmount == null || expectedAmount == null || providerAmount !== expectedAmount;
+  const providerStatus = Number(data.status);
+  let nextStatus = providerStatus === 1
+    ? 'succeeded'
+    : providerStatus === 2
+      ? 'failed'
+      : 'pending';
+  let errorMessage = '';
+  if (mismatch) {
+    nextStatus = 'unknown';
+    errorMessage = 'OKPay 返回的币种、金额或收款人不一致，已停止自动确认，请人工核验。';
+  } else if (nextStatus === 'failed') {
+    errorMessage = '转账被拒绝或失败；如余额曾被冻结，OKPay 会将其退回商户余额。';
+  }
+  const terminal = ['succeeded', 'failed'].includes(nextStatus);
+  const nextNeedReview = data.need_review === undefined
+    ? null
+    : Boolean(Number(data.need_review));
+  const changed = current.status !== nextStatus ||
+    (orderId && current.okpay_order_id !== orderId) ||
+    (nextNeedReview !== null && Boolean(current.need_review) !== nextNeedReview) ||
+    current.error_message !== errorMessage;
+  const updated = await pool.query(
+    `UPDATE telegram_okpay_transfers
+     SET status=$2,
+         okpay_order_id=COALESCE(NULLIF($3,''),okpay_order_id),
+         need_review=COALESCE($4::boolean,need_review),
+         error_message=$5,
+         submitted_at=COALESCE(submitted_at,NOW()),
+         completed_at=CASE WHEN $6::boolean THEN COALESCE(completed_at,NOW()) ELSE completed_at END,
+         next_check_at=CASE WHEN $6::boolean THEN NULL ELSE $7 END,
+         last_checked_at=NOW(),updated_at=NOW()
+     WHERE id=$1 AND status NOT IN ('succeeded','failed','cancelled','expired')
+     RETURNING *`,
+    [
+      current.id,
+      nextStatus,
+      orderId,
+      nextNeedReview,
+      errorMessage,
+      terminal,
+      terminal ? null : okpayTransferNextCheck(current.submitted_at),
+    ],
+  );
+  const transfer = updated.rows[0];
+  if (transfer && changed) {
+    await editTelegramOkpayTransferMessage(transfer, fallbackMessage);
+  }
+  return transfer || current;
+}
+
+async function confirmTelegramOkpayTransfer(callback, transferId) {
+  const chat = callback?.message?.chat;
+  const userId = String(callback?.from?.id || '');
+  if (!telegramLedgerGroupAllowed(chat, userId)) {
+    await recordTelegramShopIllegalAttempt(callback, '确认 OKPay 转账');
+    return;
+  }
+  const selected = await pool.query(
+    `SELECT * FROM telegram_okpay_transfers WHERE id=$1`,
+    [transferId],
+  );
+  const transfer = selected.rows[0];
+  if (!transfer || String(transfer.chat_id) !== String(chat.id)) {
+    await telegramApi('answerCallbackQuery', {
+      callback_query_id: callback.id,
+      text: '转账记录不存在或不属于当前群组。',
+      show_alert: true,
+    });
+    return;
+  }
+  if (String(transfer.initiator_user_id) !== userId) {
+    await telegramApi('answerCallbackQuery', {
+      callback_query_id: callback.id,
+      text: '只能由本次转账的发起人操作。',
+      show_alert: true,
+    });
+    return;
+  }
+  if (transfer.status !== 'awaiting_confirmation') {
+    await telegramApi('answerCallbackQuery', {
+      callback_query_id: callback.id,
+      text: '这笔转账已经处理，请查看当前状态。',
+      show_alert: true,
+    }).catch(() => {});
+    return;
+  }
+  if (new Date(transfer.expires_at).getTime() <= Date.now()) {
+    const expired = await pool.query(
+      `UPDATE telegram_okpay_transfers
+       SET status='expired',completed_at=NOW(),updated_at=NOW()
+       WHERE id=$1 AND status='awaiting_confirmation' RETURNING *`,
+      [transfer.id],
+    );
+    if (expired.rows[0]) await editTelegramOkpayTransferMessage(expired.rows[0]);
+    await telegramApi('answerCallbackQuery', {
+      callback_query_id: callback.id,
+      text: '确认时间已超过3分钟，请重新发起。',
+      show_alert: true,
+    }).catch(() => {});
+    return;
+  }
+  const claimed = await pool.query(
+    `UPDATE telegram_okpay_transfers
+     SET status='submitting',confirmed_at=NOW(),submitted_at=NOW(),
+         next_check_at=NOW()+INTERVAL '1 minute',updated_at=NOW()
+     WHERE id=$1 AND status='awaiting_confirmation' AND expires_at>NOW()
+     RETURNING *`,
+    [transfer.id],
+  );
+  if (!claimed.rows[0]) {
+    await telegramApi('answerCallbackQuery', {
+      callback_query_id: callback.id,
+      text: '这笔转账已被其他请求处理。',
+      show_alert: true,
+    }).catch(() => {});
+    return;
+  }
+  await telegramApi('answerCallbackQuery', {
+    callback_query_id: callback.id,
+    text: '正在安全提交转账…',
+  }).catch(() => {});
+  await editTelegramOkpayTransferMessage(claimed.rows[0]);
+  try {
+    const response = await submitOkpayTransfer(claimed.rows[0]);
+    const data = response.data || {};
+    if (!data.order_id || ![0, 1, 2].includes(Number(data.status))) {
+      throw new Error('OKPay 未返回有效的转账订单。');
+    }
+    await applyOkpayTransferResult({
+      ...data,
+      unique_id: claimed.rows[0].unique_id,
+      amount: data.amount ?? claimed.rows[0].amount_usdt,
+      coin: data.coin ?? 'USDT',
+      to_user_id: data.to_user_id ?? claimed.rows[0].to_user_id,
+    });
+  } catch (error) {
+    let recovered = null;
+    try {
+      const checked = await checkOkpayTransfer(claimed.rows[0].unique_id);
+      recovered = await applyOkpayTransferResult(checked.data || {});
+    } catch {
+      // A network timeout can happen after OKPay has accepted the request.
+      // Keep the same unique_id and query it later instead of retrying a debit.
+    }
+    if (!recovered) {
+      const status = error.okpayDefinitive ? 'failed' : 'unknown';
+      const message = status === 'failed'
+        ? cleanText(error.message, 240)
+        : '提交结果暂时无法确认，系统将使用同一转账编号继续查询；请勿重复创建转账。';
+      const updated = await pool.query(
+        `UPDATE telegram_okpay_transfers
+         SET status=$2,error_message=$3,
+             completed_at=CASE WHEN $2='failed' THEN NOW() ELSE completed_at END,
+             next_check_at=CASE WHEN $2='unknown' THEN NOW()+INTERVAL '1 minute' ELSE NULL END,
+             updated_at=NOW()
+         WHERE id=$1 AND status='submitting' RETURNING *`,
+        [claimed.rows[0].id, status, message],
+      );
+      if (updated.rows[0]) await editTelegramOkpayTransferMessage(updated.rows[0], true);
+    }
+  }
+}
+
+async function cancelTelegramOkpayTransfer(callback, transferId) {
+  const chat = callback?.message?.chat;
+  const userId = String(callback?.from?.id || '');
+  if (!telegramLedgerGroupAllowed(chat, userId)) {
+    await recordTelegramShopIllegalAttempt(callback, '取消 OKPay 转账');
+    return;
+  }
+  const updated = await pool.query(
+    `UPDATE telegram_okpay_transfers
+     SET status='cancelled',completed_at=NOW(),updated_at=NOW()
+     WHERE id=$1 AND chat_id=$2 AND initiator_user_id=$3
+       AND status='awaiting_confirmation'
+     RETURNING *`,
+    [transferId, String(chat.id), userId],
+  );
+  await telegramApi('answerCallbackQuery', {
+    callback_query_id: callback.id,
+    text: updated.rows[0] ? '转账已取消。' : '只能由发起人取消尚未提交的转账。',
+    show_alert: !updated.rows[0],
+  }).catch(() => {});
+  if (updated.rows[0]) await editTelegramOkpayTransferMessage(updated.rows[0]);
+}
+
+async function handleTelegramOkpayTransferCallback(callback) {
+  const match = String(callback?.data || '').match(
+    /^transfer:(confirm|cancel):([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i,
+  );
+  if (!match) return false;
+  if (match[1] === 'confirm') {
+    await confirmTelegramOkpayTransfer(callback, match[2]);
+  } else {
+    await cancelTelegramOkpayTransfer(callback, match[2]);
+  }
+  return true;
+}
+
+async function handleTelegramOkpayTransferCommand(message, command) {
+  const chat = message?.chat;
+  const userId = String(message?.from?.id || '');
+  if (!telegramLedgerGroupAllowed(chat, userId)) {
+    await recordTelegramShopIllegalActor(message?.from || {}, '尝试发起 OKPay 转账')
+      .catch(() => {});
+    await telegramApi('sendMessage', {
+      chat_id: chat.id,
+      text: '⛔ “转账”只能由白名单管理员在已授权通知群中使用。',
+      ...telegramThread(message),
+    }).catch(() => {});
+    return true;
+  }
+  if (command.legacyName) {
+    await telegramApi('sendMessage', {
+      chat_id: chat.id,
+      text: '命令名称已改为“转账”，请使用：转账 金额 Telegram数字ID',
+      ...telegramThread(message),
+    });
+    return true;
+  }
+  if (command.invalid) {
+    await telegramApi('sendMessage', {
+      chat_id: chat.id,
+      text: '格式不正确。请使用：转账 金额 Telegram数字ID\n金额最多两位小数，并且必须大于 1 USDT。',
+      ...telegramThread(message),
+    });
+    return true;
+  }
+  try {
+    await createTelegramOkpayTransfer(message, command);
+  } catch (error) {
+    await telegramApi('sendMessage', {
+      chat_id: chat.id,
+      text: `❌ 无法创建转账：${escapeTelegramHtml(cleanText(error.message, 240))}`,
+      parse_mode: 'HTML',
+      ...telegramThread(message),
+    });
+  }
+  return true;
+}
+
+async function processTelegramOkpayTransfers() {
+  if (telegramOkpayTransferPollPromise) return telegramOkpayTransferPollPromise;
+  telegramOkpayTransferPollPromise = (async () => {
+    if (!OKPAY_SHOP_ID || !OKPAY_TOKEN) return;
+    const client = await pool.connect();
+    let locked = false;
+    try {
+      const lock = await client.query(
+        `SELECT pg_try_advisory_lock(hashtext('tuojie-okpay-transfer-poll')) AS locked`,
+      );
+      locked = Boolean(lock.rows[0]?.locked);
+      if (!locked) return;
+      const expired = await client.query(
+        `UPDATE telegram_okpay_transfers
+         SET status='expired',completed_at=NOW(),updated_at=NOW()
+         WHERE status='awaiting_confirmation' AND expires_at<=NOW()
+         RETURNING *`,
+      );
+      for (const transfer of expired.rows) {
+        await editTelegramOkpayTransferMessage(transfer).catch(() => {});
+      }
+      const due = await client.query(
+        `SELECT * FROM telegram_okpay_transfers
+         WHERE status IN ('submitting','pending','unknown')
+           AND COALESCE(next_check_at,created_at)<=NOW()
+         ORDER BY COALESCE(next_check_at,created_at) ASC
+         LIMIT 20`,
+      );
+      for (const transfer of due.rows) {
+        try {
+          const result = await checkOkpayTransfer(transfer.unique_id);
+          await applyOkpayTransferResult({
+            ...(result.data || {}),
+            unique_id: result.data?.unique_id || transfer.unique_id,
+          }, { fallbackMessage: true });
+        } catch {
+          await client.query(
+            `UPDATE telegram_okpay_transfers
+             SET last_checked_at=NOW(),next_check_at=$2,updated_at=NOW()
+             WHERE id=$1 AND status IN ('submitting','pending','unknown')`,
+            [transfer.id, okpayTransferNextCheck(transfer.submitted_at)],
+          );
+        }
+      }
+    } finally {
+      if (locked) {
+        await client.query(
+          `SELECT pg_advisory_unlock(hashtext('tuojie-okpay-transfer-poll'))`,
+        ).catch(() => {});
+      }
+      client.release();
+    }
+  })().catch((error) => {
+    console.error('OKPay转账状态查询失败：', cleanText(error?.message, 240));
+  }).finally(() => {
+    telegramOkpayTransferPollPromise = null;
+  });
+  return telegramOkpayTransferPollPromise;
+}
+
 function telegramLedgerGroupAllowed(chat, userId) {
   return Boolean(
     userId != null && TELEGRAM_ALLOWED_USER_IDS.has(String(userId)) &&
@@ -16792,6 +17592,11 @@ async function processTelegramUpdate(update) {
     const chatId = chat?.id;
     const userId = message.from?.id;
     const raw = String(message.text || '').trim();
+    const okpayTransferCommand = parseOkpayTransferCommand(raw);
+    if (okpayTransferCommand) {
+      await handleTelegramOkpayTransferCommand(message, okpayTransferCommand);
+      return;
+    }
     const ledgerEntry = parseTelegramLedgerCommand(raw);
     const isLedgerBalance = ['账户余额', '余额'].includes(raw);
     if (telegramLedgerGroupAllowed(chat, userId) && (ledgerEntry || isLedgerBalance)) {
@@ -16874,6 +17679,7 @@ async function processTelegramUpdate(update) {
           '二维码异常：回复异常消息并发送“更换域名wxmb2.netlify.app”',
           '群账户记账：发送“+38 周卡”或“-10 买号”',
           '查询余额：发送“账户余额”或“余额”',
+          'OKPay转账：在授权群发送“转账 金额 Telegram数字ID”',
         ].join('\n'),
         ...telegramThread(message),
       });
@@ -16985,6 +17791,8 @@ async function processTelegramUpdate(update) {
       return;
     }
   }
+
+  if (callback && await handleTelegramOkpayTransferCallback(callback)) return;
 
   if (callback && await handleTelegramShopCallback(callback)) return;
 
@@ -18716,6 +19524,11 @@ function startBackgroundJobs() {
     processTelegramShopTronPayments().catch(() => {});
   }, SHOP_TRON_POLL_INTERVAL_MS);
   tronPollTimer.unref();
+  processTelegramOkpayTransfers().catch(() => {});
+  const okpayTransferPollTimer = setInterval(() => {
+    processTelegramOkpayTransfers().catch(() => {});
+  }, OKPAY_TRANSFER_POLL_INTERVAL_MS);
+  okpayTransferPollTimer.unref();
 }
 
 function effectiveLicenseStatus(row) {
