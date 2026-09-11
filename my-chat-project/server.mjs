@@ -12472,23 +12472,27 @@ function shopNormalizeBasePrice(value) {
   return units == null ? '' : shopFormatUnits(units, 6, true);
 }
 
-function shopBaseToFourUnits(value) {
+function shopBasePriceParts(value) {
   const text = String(value ?? '').trim();
   const match = text.match(/^(\d{1,12})(?:\.(\d{1,2}))?$/);
   if (!match) return null;
   try {
-    const whole = BigInt(match[1]);
-    const fraction = BigInt((match[2] || '').padEnd(4, '0'));
-    return whole * 10_000n + fraction;
+    return {
+      whole: BigInt(match[1]),
+      cents: Number((match[2] || '').padEnd(2, '0')),
+    };
   } catch {
     return null;
   }
 }
 
 function shopAmountWithTag(basePrice, tag) {
-  const base = shopBaseToFourUnits(basePrice);
+  const base = shopBasePriceParts(basePrice);
   if (base == null || !Number.isInteger(tag) || tag < 1 || tag > 99) return '';
-  return shopFormatUnits(base + BigInt(tag), 4, false);
+  // The two decimal digits are the order tag. Never allocate an amount below
+  // a configured fractional price (for example, 10.50 starts at 10.50).
+  if (tag < Math.max(1, base.cents)) return '';
+  return shopFormatUnits(base.whole * 100n + BigInt(tag), 2, false);
 }
 
 function shopTokenAmount(value) {
@@ -12677,6 +12681,7 @@ async function lockShopAmountTag(client, orderId, walletAddress, baseAmount) {
   );
   for (let tag = 1; tag <= 99; tag += 1) {
     const amount = shopAmountWithTag(baseAmount, tag);
+    if (!amount) continue;
     const inserted = await client.query(
       `INSERT INTO telegram_shop_amount_reservations(
          wallet_address,base_amount_usdt,tag,amount_usdt,order_id,reserved_until
@@ -12687,7 +12692,7 @@ async function lockShopAmountTag(client, orderId, walletAddress, baseAmount) {
     );
     if (inserted.rows[0]) return inserted.rows[0].amount_usdt;
   }
-  throw new Error('该套餐当前USDT金额编号已用完，请改用OKPay或稍后再试。');
+  throw new Error('该套餐当前USDT两位小数金额编号已用完，请改用OKPay或稍后再试。');
 }
 
 async function createTelegramShopOrder(message, durationCode, paymentMethod) {

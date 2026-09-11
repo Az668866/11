@@ -42,6 +42,16 @@ function loadShopTokenAmount() {
   return factory();
 }
 
+function loadShopAmountWithTag() {
+  const start = source.indexOf('function shopDecimalUnits');
+  const end = source.indexOf('function shopOrderPublic', start);
+  assert.ok(start >= 0 && end > start, 'shop amount helpers must exist');
+  const factory = new Function(
+    `${source.slice(start, end)}\nreturn shopAmountWithTag;`,
+  );
+  return factory();
+}
+
 test('OKPay HMAC implementation matches all protocol vectors', () => {
   const signing = loadOkpaySigning('TESTtoken123456789abcdefghijABCD');
   assert.equal(
@@ -93,6 +103,17 @@ test('OKPay fixed 8-decimal USDT amounts compare without rounding', () => {
   assert.equal(amount('10.12345600'), 10_123_456n);
   assert.equal(amount('10.12345601'), null);
   assert.equal(amount(''), null);
+});
+
+test('TRC20 order tags use exactly two decimals without undercharging', () => {
+  const amount = loadShopAmountWithTag();
+  assert.equal(amount('10', 1), '10.01');
+  assert.equal(amount('10', 99), '10.99');
+  assert.equal(amount('10.50', 49), '');
+  assert.equal(amount('10.50', 50), '10.50');
+  assert.equal(amount('10.50', 99), '10.99');
+  assert.equal(amount('10.99', 98), '');
+  assert.equal(amount('10.99', 99), '10.99');
 });
 
 test('transfer flow keeps authorization, confirmation and idempotency barriers', () => {
