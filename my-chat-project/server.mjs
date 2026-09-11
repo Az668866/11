@@ -17,9 +17,11 @@ import {
 import {
   DeleteObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import pg from 'pg';
 import QRCode from 'qrcode';
 import sharp from 'sharp';
@@ -143,6 +145,32 @@ const INSTANCE_MEMORY_MB = envNumber(
 const INSTANCE_CPU_CORES = envNumber('INSTANCE_CPU_CORES', 1, 0.1, 256);
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const TELEGRAM_WEBHOOK_SECRET = String(process.env.TELEGRAM_WEBHOOK_SECRET || '').trim();
+// Telegram 自动售卡支付配置。OKPay 的密钥和 TronGrid 的只读 API Key
+// 只从服务器环境变量读取，绝不进入机器人消息、数据库订单正文或日志。
+const OKPAY_API_BASE = String(
+  process.env.OKPAY_API_BASE || 'https://api.okaypay.me',
+).replace(/\/+$/, '');
+const OKPAY_SHOP_ID = String(
+  process.env.OKPAY_SHOP_ID || process.env.OKPAY_APP_ID || '',
+).trim();
+const OKPAY_TOKEN = String(
+  process.env.OKPAY_TOKEN || process.env.OKPAY_SECRET || '',
+).trim();
+const TRONGRID_API_BASE = String(
+  process.env.TRONGRID_API_BASE || 'https://api.trongrid.io',
+).replace(/\/+$/, '');
+const TRONGRID_API_KEY = String(
+  process.env.TRONGRID_API_KEY || '',
+).trim();
+const TRON_USDT_CONTRACT = String(
+  process.env.TRON_USDT_CONTRACT || 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t',
+).trim();
+const SHOP_ORDER_TTL_MINUTES = 20;
+const SHOP_TRON_POLL_INTERVAL_MS = 30_000;
+const SHOP_AMOUNT_RESERVATION_HOURS = 48;
+const SHOP_ORDER_RETENTION_DAYS = 1;
+const SHOP_FAILED_ORDER_RETENTION_DAYS = 2;
+const SHOP_REPORT_TIMEZONE = 'Asia/Shanghai';
 const TELEGRAM_ALLOWED_USER_IDS = new Set(
   [
     process.env.TELEGRAM_ALLOWED_USER_IDS,
@@ -256,7 +284,22 @@ const MAX_VIDEO_BYTES =
   envNumber('MAX_VIDEO_MB', 25, 1, 50) * 1024 * 1024;
 const MAX_AUDIO_BYTES =
   envNumber('MAX_AUDIO_MB', 12, 1, 30) * 1024 * 1024;
+const MAX_FILE_BYTES =
+  envNumber('MAX_FILE_MB', 100, 1, 200) * 1024 * 1024;
+const MAX_FILES_PER_MESSAGE = Math.trunc(
+  envNumber('MAX_FILES_PER_MESSAGE', 10, 1, 10),
+);
+const MAX_FILE_BROADCAST_RECIPIENTS = Math.trunc(
+  envNumber('MAX_FILE_BROADCAST_RECIPIENTS', 100, 2, 500),
+);
+const FILE_UPLOAD_URL_TTL_SECONDS = Math.trunc(
+  envNumber('FILE_UPLOAD_URL_TTL_SECONDS', 300, 60, 900),
+);
+const FILE_DOWNLOAD_URL_TTL_SECONDS = Math.trunc(
+  envNumber('FILE_DOWNLOAD_URL_TTL_SECONDS', 300, 60, 900),
+);
 const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
+const MAX_VISITOR_BRAND_BYTES = 2 * 1024 * 1024;
 const MAX_QR_LOGO_BYTES = 3 * 1024 * 1024;
 const MAX_COVER_BYTES = 5 * 1024 * 1024;
 const LEGACY_QR_BOTTOM_TEXT =
@@ -555,9 +598,56 @@ const ALLOWED_AUDIO_TYPES = new Set([
   'audio/mpeg',
   'audio/wav',
 ]);
+const CHAT_FILE_TYPES = Object.freeze({
+  apk: { mime: 'application/vnd.android.package-archive', label: 'Android 安装包' },
+  pdf: { mime: 'application/pdf', label: 'PDF 文档' },
+  doc: { mime: 'application/msword', label: 'Word 文档' },
+  docx: { mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', label: 'Word 文档' },
+  xls: { mime: 'application/vnd.ms-excel', label: 'Excel 表格' },
+  xlsx: { mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', label: 'Excel 表格' },
+  ppt: { mime: 'application/vnd.ms-powerpoint', label: 'PowerPoint 演示文稿' },
+  pptx: { mime: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', label: 'PowerPoint 演示文稿' },
+  txt: { mime: 'text/plain', label: '文本文件' },
+  log: { mime: 'text/plain', label: '日志文件' },
+  csv: { mime: 'text/csv', label: 'CSV 表格' },
+  md: { mime: 'text/markdown', label: 'Markdown 文档' },
+  json: { mime: 'application/json', label: 'JSON 文件' },
+  xml: { mime: 'application/xml', label: 'XML 文件' },
+  zip: { mime: 'application/zip', label: 'ZIP 压缩包' },
+  rar: { mime: 'application/vnd.rar', label: 'RAR 压缩包' },
+  '7z': { mime: 'application/x-7z-compressed', label: '7Z 压缩包' },
+  gz: { mime: 'application/gzip', label: 'GZIP 压缩包' },
+  tar: { mime: 'application/x-tar', label: 'TAR 压缩包' },
+});
+const ALLOWED_FILE_TYPES = new Set(
+  Object.values(CHAT_FILE_TYPES).map((item) => item.mime),
+);
 const DEFAULT_USER_SITE_URL = 'https://zxkf.netlify.app/';
 const DEFAULT_TEMPLATE_ID = '11111111-1111-4111-8111-111111111111';
+const UNIFIED_USER_SITE_URL = 'https://tuojie-u-668781.netlify.app/';
+const UNIFIED_TEMPLATE_ID = '5e970b64-af5f-4579-b0b8-04a160e148a9';
+const UNIFIED_ENTRY_PREFIX = 'u';
+const UNIFIED_ENTRY_HOST = `${UNIFIED_ENTRY_PREFIX}.668781.xyz`;
 const RETENTION_OPTIONS = new Set([1, 6, 12, 24, 72, 168, 240, 360]);
+const VISITOR_HEADER_STYLES = new Set(['light', 'glow', 'color']);
+const VISITOR_THEME_PRESETS = new Set([
+  'ocean',
+  'teal',
+  'violet',
+  'sunset',
+  'gold',
+  'rose',
+]);
+const VISITOR_BRAND_LOGOS = new Set([
+  'template',
+  'none',
+  'wecom',
+  'alipay',
+  'douyin',
+  'xiaohongshu',
+  'kuaishou',
+  'custom',
+]);
 const SUPPORTED_FEATURE_FLAGS = new Set([
   'media_album',
   'auto_reply',
@@ -682,6 +772,10 @@ let cloudflareTurnAnalyticsCache = {
   value: null,
   promise: null,
 };
+let telegramShopConfigCache = null;
+let telegramShopConfigCacheExpiresAt = 0;
+let telegramShopTronPollPromise = null;
+let telegramShopReportTimer = null;
 let readinessCache = {
   expiresAt: 0,
   value: null,
@@ -713,6 +807,18 @@ function monitoredRouteKey(method, pathname) {
     .replace(/\/\d+(?=\/|$)/g, '/:number')
     .slice(0, 180);
   return `${String(method || 'GET').toUpperCase()} ${normalized}`;
+}
+
+function isOperationalApiErrorStatus(statusCode) {
+  const code = Number(statusCode || 0);
+  return code >= 500 || code === 408 || code === 429;
+}
+
+function isExpectedClientMiss(statusCode, pathname) {
+  return (
+    Number(statusCode || 0) === 404 &&
+    pathname === '/api/public/tenant-entry/resolve'
+  );
 }
 
 function requireLegacyApi(res, apiVersion) {
@@ -874,13 +980,20 @@ function defaultConfig() {
       welcomeText: '您好，欢迎咨询。您可以发送文字、图片或视频，我们会尽快回复。',
       onlineStatusText: '客服在线',
       pageTitle: '在线客服',
+      visitorAppearanceEnabled: false,
+      visitorHeaderStyle: 'light',
+      visitorTheme: 'ocean',
+      visitorPlatformLabel: '',
+      visitorServiceBadge: '官方客服',
+      visitorBrandLogo: 'template',
+      visitorBrandAssetId: '',
       quickReplyDirectSend: true,
       autoReplyEnabled: true,
       defaultAutoReplyEnabled: true,
       defaultAutoReply: '消息已收到，客服看到后会尽快回复。',
       defaultAutoReplyImageAssetId: '',
       autoReplyCooldownSeconds: 20,
-      frontendTemplateId: DEFAULT_TEMPLATE_ID,
+      frontendTemplateId: UNIFIED_TEMPLATE_ID,
       retentionHours: 24,
     },
   };
@@ -1036,7 +1149,7 @@ async function initDatabase() {
       CREATE TABLE IF NOT EXISTS assets (
         id UUID PRIMARY KEY,
         tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
-        kind TEXT NOT NULL CHECK (kind IN ('brand_avatar','template_cover','qr_logo','reply_image')),
+        kind TEXT NOT NULL CHECK (kind IN ('brand_avatar','visitor_brand','template_cover','qr_logo','reply_image')),
         filename TEXT NOT NULL,
         mime TEXT NOT NULL,
         size INTEGER NOT NULL CHECK (size > 0),
@@ -1056,7 +1169,7 @@ async function initDatabase() {
     await client.query(`
       ALTER TABLE assets
       ADD CONSTRAINT assets_kind_check
-      CHECK (kind IN ('brand_avatar','template_cover','qr_logo','reply_image'))
+      CHECK (kind IN ('brand_avatar','visitor_brand','template_cover','qr_logo','reply_image'))
     `);
 
     await client.query(`
@@ -1255,13 +1368,40 @@ async function initDatabase() {
         id, name, base_url, origin, entry_host,
         client_version, min_backend_version,
         status, sort_order, recommended, is_default
-      ) VALUES ($1, '拓界经典版', $2, $3, $4, $5, $5, 'enabled', 10, TRUE, TRUE)
+      ) VALUES ($1, '拓界经典版', $2, $3, $4, $5, $5, 'enabled', 10, TRUE, FALSE)
       ON CONFLICT (id) DO NOTHING
     `, [
       DEFAULT_TEMPLATE_ID,
       DEFAULT_USER_SITE_URL,
       new URL(DEFAULT_USER_SITE_URL).origin,
       tenantEntryHostFromNetlifyUrl(DEFAULT_USER_SITE_URL),
+      APP_VERSION,
+    ]);
+    // 统一自定义前端是新租户的默认入口。已有租户的
+    // tenant_config.frontend_template_id 不会被改写，历史链接继续有效。
+    await client.query(`UPDATE frontend_templates SET is_default=FALSE WHERE is_default=TRUE`);
+    await client.query(`
+      INSERT INTO frontend_templates (
+        id, name, base_url, origin, entry_host,
+        client_version, min_backend_version,
+        status, sort_order, recommended, is_default
+      ) VALUES ($1, '高级自定义版', $2, $3, $4, $5, $5, 'enabled', 0, TRUE, TRUE)
+      ON CONFLICT (id) DO UPDATE SET
+        name=EXCLUDED.name,
+        base_url=EXCLUDED.base_url,
+        origin=EXCLUDED.origin,
+        client_version=EXCLUDED.client_version,
+        min_backend_version=EXCLUDED.min_backend_version,
+        status='enabled',
+        sort_order=0,
+        recommended=TRUE,
+        is_default=TRUE,
+        updated_at=NOW()
+    `, [
+      UNIFIED_TEMPLATE_ID,
+      UNIFIED_USER_SITE_URL,
+      new URL(UNIFIED_USER_SITE_URL).origin,
+      normalizeTenantEntryHost(UNIFIED_ENTRY_HOST),
       APP_VERSION,
     ]);
     await client.query(`
@@ -1694,6 +1834,32 @@ async function initDatabase() {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS telegram_group_accounts (
+        chat_id TEXT PRIMARY KEY,
+        balance NUMERIC(20,2) NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS telegram_group_ledger (
+        id BIGSERIAL PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        operation_type CHAR(1) NOT NULL CHECK (operation_type IN ('+','-')),
+        amount NUMERIC(20,2) NOT NULL CHECK (amount > 0),
+        note TEXT NOT NULL DEFAULT '',
+        operator_user_id TEXT NOT NULL DEFAULT '',
+        operator_username TEXT NOT NULL DEFAULT '',
+        operator_display_name TEXT NOT NULL DEFAULT '',
+        balance_after NUMERIC(20,2) NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS telegram_group_ledger_chat_time_idx
+      ON telegram_group_ledger (chat_id, created_at DESC, id DESC)
+    `);
 
     await client.query(`
       CREATE TABLE IF NOT EXISTS qr_incidents (
@@ -1870,6 +2036,7 @@ async function initDatabase() {
           CHECK (caller_kind IN ('user','admin')),
         caller_name TEXT NOT NULL DEFAULT '',
         caller_device_id TEXT NOT NULL DEFAULT '',
+        assigned_device_id TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT 'ringing'
           CHECK (status IN (
             'ringing','answered','connected','completed','rejected',
@@ -1890,6 +2057,7 @@ async function initDatabase() {
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS caller_kind TEXT NOT NULL DEFAULT 'admin'`);
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS caller_name TEXT NOT NULL DEFAULT ''`);
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS caller_device_id TEXT NOT NULL DEFAULT ''`);
+    await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS assigned_device_id TEXT NOT NULL DEFAULT ''`);
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS claimed_by TEXT`);
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ`);
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS answered_at TIMESTAMPTZ`);
@@ -1899,6 +2067,15 @@ async function initDatabase() {
     await client.query(`ALTER TABLE call_sessions ADD COLUMN IF NOT EXISTS end_reason TEXT NOT NULL DEFAULT ''`);
     await client.query(`ALTER TABLE call_sessions DROP CONSTRAINT IF EXISTS call_sessions_status_check`);
     await client.query(`UPDATE call_sessions SET status='completed',end_reason=COALESCE(NULLIF(end_reason,''),'completed'),ended_at=COALESCE(ended_at,updated_at) WHERE status='ended'`);
+    // Signaling SDP is transient call metadata, never call content. Clear any
+    // historical terminal rows during migration so old deployments do not
+    // retain offer payloads after this privacy fix is released.
+    await client.query(`
+      UPDATE call_sessions
+      SET offer='{}'::jsonb
+      WHERE status NOT IN ('ringing','answered','connected')
+        AND offer IS DISTINCT FROM '{}'::jsonb
+    `);
     await client.query(`
       ALTER TABLE call_sessions
       ADD CONSTRAINT call_sessions_status_check CHECK (status IN (
@@ -1930,7 +2107,14 @@ async function initDatabase() {
         mime TEXT NOT NULL CHECK (mime IN (
           'image/jpeg','image/png','image/webp','image/gif',
           'video/mp4','video/webm','video/quicktime',
-          'audio/webm','audio/ogg','audio/mp4','audio/mpeg','audio/wav'
+          'audio/webm','audio/ogg','audio/mp4','audio/mpeg','audio/wav',
+          'application/vnd.android.package-archive','application/pdf',
+          'application/msword','application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          'application/vnd.ms-excel','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          'application/vnd.ms-powerpoint','application/vnd.openxmlformats-officedocument.presentationml.presentation',
+          'text/plain','text/csv','text/markdown','application/json','application/xml',
+          'application/zip','application/vnd.rar','application/x-7z-compressed',
+          'application/gzip','application/x-tar'
         )),
         size INTEGER NOT NULL CHECK (size > 0),
         uploader TEXT NOT NULL CHECK (uploader IN ('user','admin')),
@@ -1950,7 +2134,7 @@ async function initDatabase() {
         conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
         role TEXT NOT NULL CHECK (role IN ('user','admin')),
         source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('manual','auto')),
-        type TEXT NOT NULL CHECK (type IN ('text','image','video','audio')),
+        type TEXT NOT NULL CHECK (type IN ('text','image','video','audio','file')),
         text TEXT NOT NULL DEFAULT '',
         attachment_id UUID UNIQUE REFERENCES attachments(id) ON DELETE CASCADE,
         asset_id UUID REFERENCES assets(id) ON DELETE RESTRICT,
@@ -1961,7 +2145,7 @@ async function initDatabase() {
           (type = 'text' AND attachment_id IS NULL AND asset_id IS NULL AND length(text) > 0)
           OR
           (
-            type IN ('image','video','audio')
+            type IN ('image','video','audio','file')
             AND ((attachment_id IS NOT NULL)::int + (asset_id IS NOT NULL)::int) = 1
           )
         )
@@ -1986,13 +2170,20 @@ async function initDatabase() {
       ADD CONSTRAINT attachments_mime_check CHECK (mime IN (
         'image/jpeg','image/png','image/webp','image/gif',
         'video/mp4','video/webm','video/quicktime',
-        'audio/webm','audio/ogg','audio/mp4','audio/mpeg','audio/wav'
+        'audio/webm','audio/ogg','audio/mp4','audio/mpeg','audio/wav',
+        'application/vnd.android.package-archive','application/pdf',
+        'application/msword','application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'application/vnd.ms-excel','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'application/vnd.ms-powerpoint','application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        'text/plain','text/csv','text/markdown','application/json','application/xml',
+        'application/zip','application/vnd.rar','application/x-7z-compressed',
+        'application/gzip','application/x-tar'
       ))
     `);
     await client.query(`ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_type_check`);
     await client.query(`
       ALTER TABLE messages
-      ADD CONSTRAINT messages_type_check CHECK (type IN ('text','image','video','audio'))
+      ADD CONSTRAINT messages_type_check CHECK (type IN ('text','image','video','audio','file'))
     `);
     await client.query(`ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_check`);
     await client.query(`
@@ -2008,7 +2199,7 @@ async function initDatabase() {
         (
           recalled_at IS NULL
           AND
-          type IN ('image','video','audio')
+          type IN ('image','video','audio','file')
           AND ((attachment_id IS NOT NULL)::int + (asset_id IS NOT NULL)::int) = 1
         )
       )
@@ -2105,14 +2296,22 @@ async function initDatabase() {
           FROM pg_constraint
           WHERE conrelid = 'attachments'::regclass
             AND conname = 'attachments_mime_check'
-            AND pg_get_constraintdef(oid) LIKE '%video/mp4%'
+            AND pg_get_constraintdef(oid) LIKE '%application/vnd.android.package-archive%'
         ) THEN
           ALTER TABLE attachments
             DROP CONSTRAINT IF EXISTS attachments_mime_check;
           ALTER TABLE attachments
             ADD CONSTRAINT attachments_mime_check CHECK (mime IN (
               'image/jpeg','image/png','image/webp','image/gif',
-              'video/mp4','video/webm','video/quicktime'
+              'video/mp4','video/webm','video/quicktime',
+              'audio/webm','audio/ogg','audio/mp4','audio/mpeg','audio/wav',
+              'application/vnd.android.package-archive','application/pdf',
+              'application/msword','application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+              'application/vnd.ms-excel','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+              'application/vnd.ms-powerpoint','application/vnd.openxmlformats-officedocument.presentationml.presentation',
+              'text/plain','text/csv','text/markdown','application/json','application/xml',
+              'application/zip','application/vnd.rar','application/x-7z-compressed',
+              'application/gzip','application/x-tar'
             ));
         END IF;
 
@@ -2121,12 +2320,12 @@ async function initDatabase() {
           FROM pg_constraint
           WHERE conrelid = 'messages'::regclass
             AND conname = 'messages_type_check'
-            AND pg_get_constraintdef(oid) LIKE '%video%'
+            AND pg_get_constraintdef(oid) LIKE '%file%'
         ) THEN
           ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_type_check;
           ALTER TABLE messages
             ADD CONSTRAINT messages_type_check
-            CHECK (type IN ('text','image','video'));
+            CHECK (type IN ('text','image','video','audio','file'));
         END IF;
 
         IF NOT EXISTS (
@@ -2136,6 +2335,7 @@ async function initDatabase() {
             AND conname = 'messages_check'
             AND pg_get_constraintdef(oid) LIKE '%recalled_at%'
             AND pg_get_constraintdef(oid) LIKE '%asset_id%'
+            AND pg_get_constraintdef(oid) LIKE '%file%'
         ) THEN
           ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_check;
           ALTER TABLE messages
@@ -2158,7 +2358,7 @@ async function initDatabase() {
               OR
               (
                 recalled_at IS NULL
-                AND type IN ('image','video','audio')
+                AND type IN ('image','video','audio','file')
                 AND ((attachment_id IS NOT NULL)::int + (asset_id IS NOT NULL)::int) = 1
               )
             );
@@ -2380,6 +2580,138 @@ async function initDatabase() {
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
+    `);
+    await client.query(`
+      ALTER TABLE telegram_blocked_users
+      ADD COLUMN IF NOT EXISTS illegal_attempts INTEGER NOT NULL DEFAULT 0
+    `);
+    await client.query(`
+      ALTER TABLE telegram_blocked_users
+      ADD COLUMN IF NOT EXISTS last_attempt_at TIMESTAMPTZ
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS telegram_shop_config (
+        id SMALLINT PRIMARY KEY CHECK (id = 1),
+        products JSONB NOT NULL DEFAULT '{}'::jsonb,
+        tron_wallet_address TEXT NOT NULL DEFAULT '',
+        okpay_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+        tron_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        contacts JSONB NOT NULL DEFAULT '[]'::jsonb,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS telegram_shop_sessions (
+        user_id TEXT PRIMARY KEY,
+        state TEXT NOT NULL DEFAULT '',
+        payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS telegram_shop_orders (
+        id UUID PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        username TEXT NOT NULL DEFAULT '',
+        display_name TEXT NOT NULL DEFAULT '',
+        duration_code TEXT NOT NULL
+          CHECK (duration_code IN ('1d','7d','30d','180d','365d')),
+        package_label TEXT NOT NULL,
+        payment_method TEXT NOT NULL
+          CHECK (payment_method IN ('okpay_usdt','usdt_trc20')),
+        base_amount_usdt TEXT NOT NULL,
+        amount_usdt TEXT NOT NULL,
+        wallet_address TEXT NOT NULL DEFAULT '',
+        okpay_unique_id TEXT UNIQUE,
+        okpay_order_id TEXT UNIQUE,
+        payment_status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (payment_status IN ('pending','paid','expired','underpaid','overpaid','late','manual','failed')),
+        delivery_status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (delivery_status IN ('pending','sending','delivered','paused','failed')),
+        txid TEXT UNIQUE,
+        license_id UUID REFERENCES license_keys(id) ON DELETE SET NULL,
+        license_suffix TEXT NOT NULL DEFAULT '',
+        paid_at TIMESTAMPTZ,
+        delivered_at TIMESTAMPTZ,
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS telegram_shop_orders_pending_idx
+      ON telegram_shop_orders (payment_status, expires_at)
+      WHERE payment_status='pending'
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS telegram_shop_orders_user_idx
+      ON telegram_shop_orders (user_id, created_at DESC)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS telegram_shop_orders_paid_idx
+      ON telegram_shop_orders (paid_at DESC)
+    `);
+    await client.query(`
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM pg_constraint
+          WHERE conrelid='telegram_shop_orders'::regclass
+            AND conname='telegram_shop_orders_delivery_status_check'
+            AND pg_get_constraintdef(oid) NOT LIKE '%sending%'
+        ) THEN
+          ALTER TABLE telegram_shop_orders
+            DROP CONSTRAINT telegram_shop_orders_delivery_status_check;
+          ALTER TABLE telegram_shop_orders
+            ADD CONSTRAINT telegram_shop_orders_delivery_status_check
+            CHECK (delivery_status IN ('pending','sending','delivered','paused','failed'));
+        END IF;
+      END $$
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS telegram_shop_amount_reservations (
+        wallet_address TEXT NOT NULL,
+        base_amount_usdt TEXT NOT NULL,
+        tag SMALLINT NOT NULL CHECK (tag BETWEEN 1 AND 99),
+        amount_usdt TEXT NOT NULL,
+        order_id UUID NOT NULL UNIQUE REFERENCES telegram_shop_orders(id) ON DELETE CASCADE,
+        reserved_until TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (wallet_address, base_amount_usdt, tag),
+        UNIQUE (wallet_address, amount_usdt)
+      )
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS telegram_shop_amount_reservations_expiry_idx
+      ON telegram_shop_amount_reservations (reserved_until)
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS telegram_shop_illegal_attempts (
+        user_id TEXT PRIMARY KEY,
+        username TEXT NOT NULL DEFAULT '',
+        display_name TEXT NOT NULL DEFAULT '',
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        last_action TEXT NOT NULL DEFAULT '',
+        last_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        telegram_chat_id TEXT NOT NULL DEFAULT '',
+        telegram_message_id BIGINT,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS telegram_shop_daily_reports (
+        report_date DATE PRIMARY KEY,
+        status TEXT NOT NULL CHECK (status IN ('pending','sent','failed')),
+        sent_at TIMESTAMPTZ,
+        error TEXT NOT NULL DEFAULT '',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await client.query(`
+      INSERT INTO telegram_shop_config (id)
+      VALUES (1)
+      ON CONFLICT (id) DO NOTHING
     `);
 
     await client.query(
@@ -2703,6 +3035,49 @@ async function cleanupExpiredData() {
 
     await client.query(`DELETE FROM telegram_updates WHERE created_at < NOW() - INTERVAL '30 days'`);
     await client.query(`
+      DELETE FROM telegram_shop_sessions
+      WHERE updated_at < NOW() - INTERVAL '1 day'
+    `);
+    await client.query(`
+      DELETE FROM telegram_shop_amount_reservations
+      WHERE reserved_until <= NOW()
+    `);
+    await client.query(`
+      UPDATE license_keys l
+      SET telegram_chat_id=NULL,
+          telegram_user_id=NULL,
+          telegram_username=NULL,
+          telegram_display_name=NULL,
+          updated_at=NOW()
+      WHERE l.id IN (
+        SELECT o.license_id
+        FROM telegram_shop_orders o
+        WHERE o.license_id IS NOT NULL
+          AND (
+            (o.payment_status IN ('pending','expired','underpaid','late','manual')
+              AND o.updated_at < NOW() - ($1::int * INTERVAL '1 day'))
+            OR (o.payment_status='failed'
+              AND o.updated_at < NOW() - ($2::int * INTERVAL '1 day'))
+            OR (o.payment_status='paid' AND o.delivery_status='delivered'
+              AND o.updated_at < NOW() - ($1::int * INTERVAL '1 day'))
+          )
+      )
+    `, [SHOP_ORDER_RETENTION_DAYS, SHOP_FAILED_ORDER_RETENTION_DAYS]);
+    await client.query(`
+      DELETE FROM telegram_shop_orders
+      WHERE (
+        payment_status IN ('pending','expired','underpaid','late','manual')
+        AND updated_at < NOW() - ($1::int * INTERVAL '1 day')
+      ) OR (
+        payment_status='failed'
+        AND updated_at < NOW() - ($2::int * INTERVAL '1 day')
+      ) OR (
+        payment_status='paid'
+        AND delivery_status='delivered'
+        AND updated_at < NOW() - ($1::int * INTERVAL '1 day')
+      )
+    `, [SHOP_ORDER_RETENTION_DAYS, SHOP_FAILED_ORDER_RETENTION_DAYS]);
+    await client.query(`
       DELETE FROM license_generation_requests
       WHERE created_at < NOW() - INTERVAL '1 day'
     `);
@@ -2726,6 +3101,7 @@ async function cleanupExpiredData() {
     await client.query(`
       UPDATE call_sessions cs
       SET status='missed',
+          offer='{}'::jsonb,
           ended_at=COALESCE(cs.ended_at,cs.expires_at),
           end_reason='missed',
           updated_at=NOW(),
@@ -2738,6 +3114,7 @@ async function cleanupExpiredData() {
     await client.query(`
       UPDATE call_sessions cs
       SET status='failed',
+          offer='{}'::jsonb,
           ended_at=COALESCE(cs.ended_at,cs.expires_at),
           end_reason='network_timeout',
           duration_seconds=0,
@@ -3974,6 +4351,7 @@ const TENANT_HIGH_RISK_AUDIT_ACTIONS = new Set([
   'tenant.message.delete',
   'tenant.message.recall',
   'tenant.conversation.delete',
+  'tenant.conversations.clear_all',
 ]);
 
 const AUDIT_SUMMARIES = Object.freeze({
@@ -3983,6 +4361,7 @@ const AUDIT_SUMMARIES = Object.freeze({
   'tenant.message.delete': '租户永久删除了客服消息',
   'tenant.message.recall': '租户撤回了客服消息',
   'tenant.conversation.delete': '租户永久删除了访客会话',
+  'tenant.conversations.clear_all': '租户永久清空了当前商家的全部聊天记录',
   'tenant.login': '租户后台发生高风险登录失败',
   'license.create': '管理员批量生成普通卡密和超级卡密',
   'license.disable': '管理员禁用了普通卡密',
@@ -4629,6 +5008,49 @@ function safeFilename(value) {
       '_',
     ) || 'image'
   );
+}
+
+function chatFileDefinition(filename, size) {
+  const safeName = safeFilename(filename || 'file');
+  const extension = safeName.toLowerCase().match(/\.([a-z0-9]{1,10})$/)?.[1] || '';
+  const definition = CHAT_FILE_TYPES[extension];
+  if (!definition) {
+    throw requestError(
+      '暂不支持此文件类型。支持 APK、文档、表格、文本和常用压缩包。',
+      415,
+      'FILE_TYPE',
+    );
+  }
+  const bytes = Math.trunc(Number(size));
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    throw requestError('文件内容为空。', 400, 'EMPTY_FILE');
+  }
+  if (bytes > MAX_FILE_BYTES) {
+    throw requestError(
+      `单个文件不能超过 ${Math.round(MAX_FILE_BYTES / 1024 / 1024)}MB。`,
+      413,
+      'FILE_TOO_LARGE',
+    );
+  }
+  return {
+    filename: safeName,
+    extension,
+    mime: definition.mime,
+    label: definition.label,
+    size: bytes,
+  };
+}
+
+function attachmentContentDisposition(filename) {
+  const safeName = safeFilename(filename || 'download');
+  const asciiName = safeName
+    .replace(/[^\x20-\x7E]/g, '_')
+    .replace(/["\\]/g, '_') || 'download';
+  const encoded = encodeURIComponent(safeName).replace(
+    /[!'()*]/g,
+    (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`,
+  );
+  return `attachment; filename="${asciiName}"; filename*=UTF-8''${encoded}`;
 }
 
 function normalizeIp(value) {
@@ -5513,8 +5935,18 @@ async function queueObjectDeletes(objectKeys, client = pool) {
   await client.query(
     `
       INSERT INTO r2_delete_queue (object_key)
-      SELECT object_key
+      SELECT queued.object_key
       FROM unnest($1::text[]) AS queued(object_key)
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM attachments a
+        WHERE a.storage='r2' AND a.object_key=queued.object_key
+      )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM assets a
+          WHERE a.storage='r2' AND a.object_key=queued.object_key
+        )
       ON CONFLICT (object_key) DO NOTHING
     `,
     [unique],
@@ -5523,6 +5955,19 @@ async function queueObjectDeletes(objectKeys, client = pool) {
 
 async function processObjectDeleteQueue(limit = 50) {
   if (!R2_ENABLED) return;
+  await pool.query(`
+    DELETE FROM r2_delete_queue queued
+    WHERE EXISTS (
+      SELECT 1
+      FROM attachments a
+      WHERE a.storage='r2' AND a.object_key=queued.object_key
+    )
+       OR EXISTS (
+         SELECT 1
+         FROM assets a
+         WHERE a.storage='r2' AND a.object_key=queued.object_key
+       )
+  `);
   const result = await pool.query(
     `
       SELECT id, object_key, attempts
@@ -5582,6 +6027,39 @@ function mediaObjectKey(tenantId, conversationId, attachmentId, mime) {
     'audio/wav': 'wav',
   }[mime] || 'bin';
   return `chat/${tenantId}/${conversationId}/${attachmentId}.${extension}`;
+}
+
+function fileObjectKey(tenantId, conversationId, attachmentId, extension) {
+  return `chat-files/${tenantId}/${conversationId}/${attachmentId}.${extension}`;
+}
+
+async function signedFileUploadUrl(objectKey, mime) {
+  if (!R2_ENABLED) return '';
+  return getSignedUrl(
+    r2,
+    new PutObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: objectKey,
+      ContentType: mime,
+      CacheControl: 'private, no-store',
+    }),
+    { expiresIn: FILE_UPLOAD_URL_TTL_SECONDS },
+  );
+}
+
+async function signedFileDownloadUrl(row) {
+  if (!R2_ENABLED || row?.storage !== 'r2' || !row?.object_key) return '';
+  return getSignedUrl(
+    r2,
+    new GetObjectCommand({
+      Bucket: R2_BUCKET,
+      Key: row.object_key,
+      ResponseContentType: row.mime,
+      ResponseContentDisposition: attachmentContentDisposition(row.filename),
+      ResponseCacheControl: 'private, no-store',
+    }),
+    { expiresIn: FILE_DOWNLOAD_URL_TTL_SECONDS },
+  );
 }
 
 async function saveAsset({
@@ -5940,6 +6418,15 @@ function publicMessage(row) {
     type: row.type,
     text: row.text || '',
     attachmentId: row.attachment_id || row.asset_id || null,
+    attachment:
+      row.attachment_id && row.attachment_filename
+        ? {
+            id: row.attachment_id,
+            filename: row.attachment_filename,
+            mime: row.attachment_mime || 'application/octet-stream',
+            size: Number(row.attachment_size || 0),
+          }
+        : null,
     assetId: row.asset_id || null,
     albumId: row.album_id || null,
     albumPosition: Number(row.album_position || 0),
@@ -6266,6 +6753,7 @@ async function finalizeExpiredCallSessions(
     `
       UPDATE call_sessions cs
       SET status='missed',
+          offer='{}'::jsonb,
           ended_at=COALESCE(cs.ended_at,cs.expires_at),
           end_reason='missed',
           updated_at=NOW(),
@@ -6284,6 +6772,7 @@ async function finalizeExpiredCallSessions(
     `
       UPDATE call_sessions cs
       SET status='failed',
+          offer='{}'::jsonb,
           ended_at=COALESCE(cs.ended_at,cs.expires_at),
           end_reason='network_timeout',
           duration_seconds=0,
@@ -6507,6 +6996,79 @@ async function callIdentitySnapshot(client, tenantId, conversationId, callerKind
   };
 }
 
+async function idleTenantAdminDeviceIds(tenantId, client = pool) {
+  if (!isUuid(tenantId)) return [];
+  const online = [];
+  const seen = new Set();
+  const now = Date.now();
+  for (const liveClient of sseClients) {
+    if (liveClient.kind !== 'tenant_admin' || liveClient.tenantId !== tenantId) continue;
+    if (liveClient.lastSeenAt && now - liveClient.lastSeenAt > 45_000) continue;
+    const deviceId = cleanText(liveClient.deviceId, 120) || 'legacy';
+    const deviceKey = cleanText(liveClient.deviceHash, 100) || deviceId;
+    if (seen.has(deviceKey)) continue;
+    seen.add(deviceKey);
+    online.push(deviceId);
+  }
+  if (!online.length) return [];
+  const active = await client.query(
+    `
+      SELECT caller_kind,caller_device_id,assigned_device_id,claimed_by
+      FROM call_sessions
+      WHERE tenant_id=$1
+        AND status=ANY($2::text[])
+        AND expires_at > NOW()
+    `,
+    [tenantId, [...ACTIVE_CALL_STATUSES]],
+  );
+  const busy = new Set();
+  for (const row of active.rows) {
+    if (row.assigned_device_id) busy.add(row.assigned_device_id);
+    if (row.caller_kind === 'admin' && row.caller_device_id) {
+      busy.add(row.caller_device_id);
+    }
+    const claimedBy = cleanText(row.claimed_by, 160);
+    if (claimedBy.startsWith('admin:')) busy.add(claimedBy.slice(6));
+  }
+  return online.filter((deviceId) => !busy.has(deviceId));
+}
+
+async function reassignPendingCallsForDevice(tenantId, deviceId) {
+  const disconnectedDeviceId = cleanText(deviceId, 120);
+  if (!isUuid(tenantId) || !disconnectedDeviceId) return;
+  const pending = await pool.query(
+    `SELECT * FROM call_sessions
+     WHERE tenant_id=$1 AND caller_kind='user' AND status='ringing'
+       AND expires_at > NOW() AND claimed_by IS NULL
+       AND assigned_device_id=$2
+     ORDER BY created_at ASC`,
+    [tenantId, disconnectedDeviceId],
+  );
+  for (const row of pending.rows) {
+    const nextDeviceId = (await idleTenantAdminDeviceIds(tenantId))
+      .find((item) => item !== disconnectedDeviceId);
+    if (!nextDeviceId) continue;
+    const updated = await pool.query(
+      `UPDATE call_sessions
+       SET assigned_device_id=$3,updated_at=NOW()
+       WHERE id=$1 AND tenant_id=$2 AND status='ringing'
+         AND claimed_by IS NULL AND assigned_device_id=$4
+       RETURNING *`,
+      [row.id, tenantId, nextDeviceId, disconnectedDeviceId],
+    );
+    if (!updated.rows[0]) continue;
+    publishEvent(
+      pendingCallEvent(updated.rows[0]),
+      {
+        tenantId,
+        conversationId: updated.rows[0].conversation_id,
+        targetKind: 'tenant_admin',
+        targetDeviceIds: [nextDeviceId],
+      },
+    );
+  }
+}
+
 async function savePendingCallOffer(
   tenantId,
   conversationId,
@@ -6575,28 +7137,54 @@ async function savePendingCallOffer(
       conversationId,
       normalizedCallerKind,
     );
-    const activeResult = await client.query(
+    let assignedDeviceId = '';
+    let deviceBusy = false;
+    const activeConversationResult = await client.query(
       `
         SELECT id
         FROM call_sessions
-        WHERE tenant_id=$1
-          AND status=ANY($2::text[])
+        WHERE tenant_id=$1 AND conversation_id=$2
+          AND status=ANY($3::text[])
           AND expires_at > NOW()
         ORDER BY created_at DESC
         LIMIT 1
         FOR UPDATE
       `,
-      [tenantId, [...ACTIVE_CALL_STATUSES]],
+      [tenantId, conversationId, [...ACTIVE_CALL_STATUSES]],
     );
-    if (activeResult.rows[0]) {
+    deviceBusy = Boolean(activeConversationResult.rows[0]);
+    if (normalizedCallerKind === 'user') {
+      if (!deviceBusy) {
+        assignedDeviceId = (await idleTenantAdminDeviceIds(tenantId, client))[0] || '';
+        deviceBusy = !assignedDeviceId;
+      }
+    } else if (!deviceBusy) {
+      const activeDeviceResult = await client.query(
+        `
+          SELECT id
+          FROM call_sessions
+          WHERE tenant_id=$1
+            AND caller_kind='admin'
+            AND caller_device_id=$2
+            AND status=ANY($3::text[])
+            AND expires_at > NOW()
+          ORDER BY created_at DESC
+          LIMIT 1
+          FOR UPDATE
+        `,
+        [tenantId, callerDeviceId, [...ACTIVE_CALL_STATUSES]],
+      );
+      deviceBusy = Boolean(activeDeviceResult.rows[0]);
+    }
+    if (deviceBusy) {
       const busyResult = await client.query(
         `
           INSERT INTO call_sessions (
             id,tenant_id,conversation_id,mode,offer,caller_kind,caller_name,
-            caller_device_id,status,ended_at,end_reason,expires_at
+            caller_device_id,assigned_device_id,status,ended_at,end_reason,expires_at
           ) VALUES (
             $1,$2,$3,$4,$5::jsonb,$6,$7,
-            $8,'busy',NOW(),'busy',NOW() + ($9::int::text || ' hours')::interval
+            $8,$9,'busy',NOW(),'busy',NOW() + ($10::int::text || ' hours')::interval
           )
           RETURNING *
         `,
@@ -6609,6 +7197,7 @@ async function savePendingCallOffer(
           normalizedCallerKind,
           identity.callerName,
           callerDeviceId,
+          assignedDeviceId,
           identity.retentionHours,
         ],
       );
@@ -6620,10 +7209,10 @@ async function savePendingCallOffer(
       `
         INSERT INTO call_sessions (
           id,tenant_id,conversation_id,mode,offer,caller_kind,caller_name,
-          caller_device_id,status,expires_at
+          caller_device_id,assigned_device_id,status,expires_at
         ) VALUES (
           $1,$2,$3,$4,$5::jsonb,$6,$7,
-          $8,'ringing',NOW() + ($9::int::text || ' seconds')::interval
+          $8,$9,'ringing',NOW() + ($10::int::text || ' seconds')::interval
         )
         RETURNING *
       `,
@@ -6636,6 +7225,7 @@ async function savePendingCallOffer(
         normalizedCallerKind,
         identity.callerName,
         callerDeviceId,
+        assignedDeviceId,
         CALL_RING_TIMEOUT_SECONDS,
       ],
     );
@@ -6832,6 +7422,7 @@ async function finishPendingCall(
       `
         UPDATE call_sessions
         SET status=$4,
+            offer='{}'::jsonb,
             ended_at=NOW(),
             duration_seconds=$5,
             end_reason=$6,
@@ -6892,9 +7483,10 @@ async function getPendingCall(callId, tenantId, conversationId) {
   return pendingCallEvent(result.rows[0]);
 }
 
-async function getPendingAdminCall(tenantId) {
+async function getPendingAdminCall(tenantId, deviceId = '') {
   if (!isUuid(tenantId)) return null;
   await finalizeExpiredCallSessions(tenantId);
+  const normalizedDeviceId = cleanText(deviceId, 120) || 'legacy';
   const result = await pool.query(
     `
       SELECT * FROM call_sessions
@@ -6902,10 +7494,11 @@ async function getPendingAdminCall(tenantId) {
         AND caller_kind='user'
         AND status='ringing' AND expires_at > NOW()
         AND claimed_by IS NULL
+        AND (assigned_device_id='' OR assigned_device_id=$2)
       ORDER BY created_at DESC
       LIMIT 1
     `,
-    [tenantId],
+    [tenantId, normalizedDeviceId],
   );
   return pendingCallEvent(result.rows[0]);
 }
@@ -7022,8 +7615,10 @@ function conversationSummary(row) {
             ? row.latest_text || '[图片]'
             : row.latest_type === 'video'
               ? row.latest_text || '[视频]'
-              : row.latest_type === 'audio'
-                ? row.latest_text || '[语音]'
+            : row.latest_type === 'audio'
+              ? row.latest_text || '[语音]'
+              : row.latest_type === 'file'
+                ? row.latest_text || '[文件]'
                 : row.latest_text || '',
         role: row.latest_role,
         createdAt: new Date(row.latest_created_at).toISOString(),
@@ -7084,22 +7679,34 @@ async function ensureTenantTemplateDomain(
   ) {
     return null;
   }
-  const existing = await client.query(
-    `SELECT * FROM tenant_template_domains
-     WHERE tenant_id=$1 AND template_id=$2`,
+  const contextResult = await client.query(
+    `SELECT domains.*,
+            templates.id AS frontend_template_id,
+            templates.name AS frontend_template_name,
+            templates.base_url AS frontend_base_url,
+            templates.entry_host AS frontend_entry_host
+     FROM frontend_templates templates
+     LEFT JOIN tenant_template_domains domains
+       ON domains.tenant_id=$1 AND domains.template_id=templates.id
+     WHERE templates.id=$2`,
     [tenantId, templateId],
   );
-  if (existing.rows[0]) return existing.rows[0];
+  const context = contextResult.rows[0];
+  if (!context) return null;
+  // u/u1/u2... 是“高级自定义版”的共享入口。租户身份继续由链接中的
+  // tenant 参数区分，因此不再为它额外分配 kfmbXX 子域名；历史上已经
+  // 产生的租户专属域名仍保留在数据库中，并继续由 Worker 正常解析。
+  if (unifiedEntryHostSequence(context.frontend_entry_host)) return null;
+  if (context.tenant_id && context.template_id) return context;
   const rootDomain = normalizeTenantDomainSuffix(
     activeTenantEntryRootDomain || TENANT_ENTRY_DOMAIN_SUFFIXES[0],
   );
   if (!rootDomain) return null;
-  const templateResult = await client.query(
-    `SELECT id,name,base_url FROM frontend_templates WHERE id=$1`,
-    [templateId],
-  );
-  const template = templateResult.rows[0];
-  if (!template) return null;
+  const template = {
+    id: context.frontend_template_id,
+    name: context.frontend_template_name,
+    base_url: context.frontend_base_url,
+  };
   const prefix = tenantTemplateShortPrefix(template);
   // 优先分配 10–99 的短号码；紧凑号码用完后扩展到 3–9 位数字。
   // 已写入数据库的 (tenant_id, template_id) 映射始终直接复用，不会因扩容而改变。
@@ -7202,7 +7809,7 @@ async function createTenantConfig(tenantId, client = pool) {
       JSON.stringify(defaults.cannedReplies),
       JSON.stringify(defaults.autoReplies),
       JSON.stringify(defaults.settings),
-      DEFAULT_TEMPLATE_ID,
+      UNIFIED_TEMPLATE_ID,
     ],
   );
   await client.query(
@@ -7334,7 +7941,7 @@ async function getConfig(tenantId, client = pool) {
     };
   });
   const currentTemplateId =
-    result.rows[0].frontend_template_id || DEFAULT_TEMPLATE_ID;
+    result.rows[0].frontend_template_id || UNIFIED_TEMPLATE_ID;
   const currentDomain = tenantDomains.get(currentTemplateId);
   const currentDomainUrl = tenantTemplateDomainUrl(currentDomain?.hostname);
   const config = {
@@ -7871,8 +8478,13 @@ async function getPublicConversation(id, client = pool, tenantId) {
         FROM recent
         WHERE album_id IS NOT NULL
       )
-      SELECT m.*
+      SELECT
+        m.*,
+        a.filename AS attachment_filename,
+        a.mime AS attachment_mime,
+        a.size AS attachment_size
       FROM messages m
+      LEFT JOIN attachments a ON a.id=m.attachment_id
       WHERE m.conversation_id = $1
         AND (
           m.id IN (SELECT id FROM recent)
@@ -7948,8 +8560,12 @@ async function getConversationMessagePage(
       )
       SELECT
         m.*,
+        a.filename AS attachment_filename,
+        a.mime AS attachment_mime,
+        a.size AS attachment_size,
         ((SELECT COUNT(*) FROM page_base) > $2)::boolean AS _has_more
       FROM messages m
+      LEFT JOIN attachments a ON a.id=m.attachment_id
       WHERE m.conversation_id=$1
         AND (
           m.id IN (SELECT id FROM chosen)
@@ -8350,8 +8966,20 @@ async function validateAdminSettings(body, current, tenantId) {
     'welcomeText',
     'onlineStatusText',
     'pageTitle',
+    'visitorHeaderStyle',
+    'visitorTheme',
+    'visitorPlatformLabel',
+    'visitorServiceBadge',
+    'visitorBrandLogo',
+    'avatarAssetId',
+    'visitorBrandAssetId',
   ];
-  const changesBrand = brandFields.some(
+  const changesBrand =
+    (
+      input.visitorAppearanceEnabled !== undefined &&
+      Boolean(input.visitorAppearanceEnabled) !==
+        Boolean(current.settings.visitorAppearanceEnabled)
+    ) || brandFields.some(
     (field) =>
       input[field] !== undefined &&
       cleanText(input[field], field === 'welcomeText' ? 2000 : 80) !==
@@ -8372,7 +9000,7 @@ async function validateAdminSettings(body, current, tenantId) {
   const frontendTemplateId = cleanText(
     input.frontendTemplateId ??
       current.settings.frontendTemplateId ??
-      DEFAULT_TEMPLATE_ID,
+      UNIFIED_TEMPLATE_ID,
     80,
   );
   if (!isUuid(frontendTemplateId)) {
@@ -8426,6 +9054,74 @@ async function validateAdminSettings(body, current, tenantId) {
   if (!RETENTION_OPTIONS.has(retentionHours)) {
     throw requestError('消息保存时间无效。', 400, 'RETENTION');
   }
+  const visitorHeaderStyle = cleanText(
+    input.visitorHeaderStyle ?? current.settings.visitorHeaderStyle ?? 'light',
+    20,
+  );
+  if (!VISITOR_HEADER_STYLES.has(visitorHeaderStyle)) {
+    throw requestError('访客端顶部样式无效。', 400, 'VISITOR_HEADER_STYLE');
+  }
+  const visitorTheme = cleanText(
+    input.visitorTheme ?? current.settings.visitorTheme ?? 'ocean',
+    20,
+  );
+  if (!VISITOR_THEME_PRESETS.has(visitorTheme)) {
+    throw requestError('访客端配色无效。', 400, 'VISITOR_THEME');
+  }
+  const avatarAssetId = cleanText(
+    input.avatarAssetId ?? current.settings.avatarAssetId,
+    80,
+  );
+  if (avatarAssetId) {
+    if (!isUuid(avatarAssetId)) {
+      throw requestError('客服头像无效。', 400, 'AVATAR_ASSET');
+    }
+    const avatarAsset = await pool.query(
+      `SELECT id FROM assets
+       WHERE id=$1 AND tenant_id=$2 AND kind='brand_avatar'
+         AND mime='image/webp'`,
+      [avatarAssetId, tenantId],
+    );
+    if (!avatarAsset.rows[0]) {
+      throw requestError(
+        '客服头像不存在，或不属于当前客户。',
+        400,
+        'AVATAR_ASSET',
+      );
+    }
+  }
+  const visitorBrandLogo = cleanText(
+    input.visitorBrandLogo ?? current.settings.visitorBrandLogo ?? 'template',
+    24,
+  );
+  if (!VISITOR_BRAND_LOGOS.has(visitorBrandLogo)) {
+    throw requestError('访客端品牌图片选项无效。', 400, 'VISITOR_BRAND_LOGO');
+  }
+  const visitorBrandAssetId = cleanText(
+    input.visitorBrandAssetId ?? current.settings.visitorBrandAssetId,
+    80,
+  );
+  if (visitorBrandAssetId) {
+    if (!isUuid(visitorBrandAssetId)) {
+      throw requestError('自定义品牌图片无效。', 400, 'VISITOR_BRAND_ASSET');
+    }
+    const visitorBrandAsset = await pool.query(
+      `SELECT id FROM assets
+       WHERE id=$1 AND tenant_id=$2 AND kind='visitor_brand'
+         AND mime='image/webp'`,
+      [visitorBrandAssetId, tenantId],
+    );
+    if (!visitorBrandAsset.rows[0]) {
+      throw requestError(
+        '自定义品牌图片不存在，或不属于当前客户。',
+        400,
+        'VISITOR_BRAND_ASSET',
+      );
+    }
+  }
+  if (visitorBrandLogo === 'custom' && !visitorBrandAssetId) {
+      throw requestError('请先上传自定义品牌图片。', 400, 'VISITOR_BRAND_ASSET');
+  }
 
   const settings = {
     ...current.settings,
@@ -8433,7 +9129,7 @@ async function validateAdminSettings(body, current, tenantId) {
       input.siteName !== undefined
         ? cleanText(input.siteName, 80) || '在线客服'
         : current.settings.siteName,
-    avatarAssetId: cleanText(current.settings.avatarAssetId, 80),
+    avatarAssetId,
     qrTopText:
       input.qrTopText !== undefined
         ? cleanText(input.qrTopText, 120)
@@ -8453,12 +9149,28 @@ async function validateAdminSettings(body, current, tenantId) {
       input.onlineStatusText !== undefined
         ? cleanText(input.onlineStatusText, 40) || '客服在线'
         : current.settings.onlineStatusText || '客服在线',
-       pageTitle:
+    pageTitle:
       input.pageTitle !== undefined
         ? cleanText(input.pageTitle, 80) || '在线客服'
         : current.settings.pageTitle ||
           current.settings.siteName ||
           '在线客服',
+    visitorAppearanceEnabled:
+      input.visitorAppearanceEnabled !== undefined
+        ? Boolean(input.visitorAppearanceEnabled)
+        : Boolean(current.settings.visitorAppearanceEnabled),
+    visitorHeaderStyle,
+    visitorTheme,
+    visitorPlatformLabel:
+      input.visitorPlatformLabel !== undefined
+        ? cleanText(input.visitorPlatformLabel, 12)
+        : cleanText(current.settings.visitorPlatformLabel, 12),
+    visitorServiceBadge:
+      input.visitorServiceBadge !== undefined
+        ? cleanText(input.visitorServiceBadge, 12) || '官方客服'
+        : cleanText(current.settings.visitorServiceBadge, 12) || '官方客服',
+    visitorBrandLogo,
+    visitorBrandAssetId,
     quickReplyDirectSend:
       input.quickReplyDirectSend !== undefined
         ? Boolean(input.quickReplyDirectSend)
@@ -8523,6 +9235,12 @@ function clientAcceptsEvent(client, event) {
     client.kind === 'user' &&
     client.conversationId !== event.conversationId
   ) return false;
+  if (
+    Array.isArray(event.targetDeviceIds) &&
+    event.targetDeviceIds.length &&
+    client.kind === 'tenant_admin' &&
+    !event.targetDeviceIds.includes(client.deviceId || 'legacy')
+  ) return false;
   return true;
 }
 
@@ -8533,6 +9251,7 @@ function publishEvent(
     tenantId = null,
     distributorId = null,
     targetKind = null,
+    targetDeviceIds = null,
     apiVersion = null,
     keepHistory = true,
   } = {},
@@ -8544,6 +9263,9 @@ function publishEvent(
     tenantId,
     distributorId,
     targetKind,
+    targetDeviceIds: Array.isArray(targetDeviceIds)
+      ? [...new Set(targetDeviceIds.map((item) => cleanText(item, 120)).filter(Boolean))]
+      : null,
     apiVersion,
   };
   if (keepHistory) {
@@ -8738,9 +9460,10 @@ function updateTenantConnectionsAfterRenewal(
       } catch {}
       sseClients.delete(client);
       continue;
-    }
-    client.accessExpiresAt = expiry;
-    try {
+      }
+      client.accessExpiresAt = expiry;
+      client.lastSeenAt = Date.now();
+      try {
       sendSse(client.res, {
         type: 'tenant-renewed',
         accessExpiresAt: new Date(accessExpiresAt).toISOString(),
@@ -8766,12 +9489,119 @@ setInterval(() => {
         sseClients.delete(client);
         continue;
       }
+      client.lastSeenAt = Date.now();
+      if (
+        client.kind === 'tenant_admin' &&
+        client.licenseId &&
+        client.deviceHash &&
+        (!client.lastPresencePersistAt ||
+          client.lastPresencePersistAt < Date.now() - 30_000)
+      ) {
+        client.lastPresencePersistAt = Date.now();
+        pool.query(
+          `UPDATE license_devices
+           SET last_seen_at=NOW()
+           WHERE license_id=$1 AND access_kind='normal'
+             AND device_hash=$2 AND revoked_at IS NULL`,
+          [client.licenseId, client.deviceHash],
+        ).catch(() => {});
+      }
       client.res.write(': heartbeat\n\n');
     } catch {
       sseClients.delete(client);
     }
   }
 }, 20_000).unref();
+
+async function handleFileUploadInit(req, res, payload, conversation) {
+  if (payload.kind !== 'tenant_admin') {
+    return sendError(res, 403, '只有商家客服可以发送文件。', 'FILE_UPLOAD_FORBIDDEN');
+  }
+  if (conversation.status === 'closed') {
+    return sendError(res, 409, '此会话已结束。', 'CLOSED');
+  }
+  await requireTenantFeature('media_album', payload.tenantId);
+  if (!R2_ENABLED) {
+    return sendError(
+      res,
+      503,
+      '文件存储尚未配置，请联系管理员。',
+      'FILE_STORAGE_UNAVAILABLE',
+    );
+  }
+
+  const rateIdentity = `${payload.tenantId}:${conversation.id}`;
+  if (!rateLimit(req, res, 'file-upload-init', 20, 60_000, rateIdentity, {
+    tenantId: payload.tenantId,
+    conversationId: conversation.id,
+  })) return;
+
+  const body = await readJson(req, 64 * 1024);
+  const files = Array.isArray(body.files) ? body.files : [];
+  if (!files.length || files.length > MAX_FILES_PER_MESSAGE) {
+    return sendError(
+      res,
+      400,
+      `一次可以发送 1-${MAX_FILES_PER_MESSAGE} 个文件。`,
+      'FILE_COUNT',
+    );
+  }
+
+  const records = files.map((file) => {
+    const definition = chatFileDefinition(file?.name, file?.size);
+    const id = randomUUID();
+    return {
+      id,
+      ...definition,
+      objectKey: fileObjectKey(
+        payload.tenantId,
+        conversation.id,
+        id,
+        definition.extension,
+      ),
+    };
+  });
+  const uploadUrls = await Promise.all(
+    records.map((record) => signedFileUploadUrl(record.objectKey, record.mime)),
+  );
+  const result = await pool.query(
+    `
+      INSERT INTO attachments (
+        id, conversation_id, filename, mime, size, uploader, data,
+        storage, object_key, expires_at
+      )
+      SELECT
+        input.id,$6,input.filename,input.mime,input.size,'admin',NULL,
+        'r2',input.object_key,NOW() + INTERVAL '10 minutes'
+      FROM unnest(
+        $1::uuid[],$2::text[],$3::text[],$4::int[],$5::text[]
+      ) AS input(id,filename,mime,size,object_key)
+      RETURNING id,conversation_id,filename,mime,size,uploader,created_at
+    `,
+    [
+      records.map((record) => record.id),
+      records.map((record) => record.filename),
+      records.map((record) => record.mime),
+      records.map((record) => record.size),
+      records.map((record) => record.objectKey),
+      conversation.id,
+    ],
+  );
+  const rowsById = new Map(result.rows.map((row) => [row.id, row]));
+  return sendJson(res, 201, {
+    ok: true,
+    uploads: records.map((record, index) => ({
+      attachment: publicAttachment(rowsById.get(record.id)),
+      label: record.label,
+      uploadUrl: uploadUrls[index],
+      headers: {
+        'Content-Type': record.mime,
+        'Cache-Control': 'private, no-store',
+      },
+    })),
+    expiresIn: FILE_UPLOAD_URL_TTL_SECONDS,
+  });
+}
 
 async function handleUpload(req, res, payload, conversation) {
   if (conversation.status === 'closed') {
@@ -8961,7 +9791,7 @@ function requestError(message, statusCode, code) {
 
 function parseMessageInput(body = {}) {
   const requestedType = cleanText(body.type, 20) || 'text';
-  if (!['text', 'image', 'video', 'audio'].includes(requestedType)) {
+  if (!['text', 'image', 'video', 'audio', 'file'].includes(requestedType)) {
     throw requestError('消息类型无效。', 400, 'INVALID_MESSAGE_TYPE');
   }
   const suppliedClientRequestId = cleanText(body.clientRequestId, 128);
@@ -9025,6 +9855,13 @@ function parseMessageInput(body = {}) {
   if (requestedType === 'audio' && mediaCount !== 1) {
     throw requestError('一次只能发送一条语音。', 400, 'AUDIO_LIMIT');
   }
+  if (requestedType === 'file' && mediaCount > MAX_FILES_PER_MESSAGE) {
+    throw requestError(
+      `一次最多发送 ${MAX_FILES_PER_MESSAGE} 个文件。`,
+      400,
+      'FILE_LIMIT',
+    );
+  }
 
   return { type: requestedType, text, attachmentIds, assetIds, clientRequestId };
 }
@@ -9036,10 +9873,16 @@ async function findManualMessageReplay(
   clientRequestId,
 ) {
   const result = await client.query(
-    `SELECT * FROM messages
-     WHERE conversation_id=$1 AND role=$2 AND source='manual'
-       AND client_request_id=$3
-     ORDER BY album_position,created_at,id`,
+    `SELECT
+       m.*,
+       a.filename AS attachment_filename,
+       a.mime AS attachment_mime,
+       a.size AS attachment_size
+     FROM messages m
+     LEFT JOIN attachments a ON a.id=m.attachment_id
+     WHERE m.conversation_id=$1 AND m.role=$2 AND m.source='manual'
+       AND m.client_request_id=$3
+     ORDER BY m.album_position,m.created_at,m.id`,
     [conversationId, role, clientRequestId],
   );
   return result.rows;
@@ -9145,7 +9988,7 @@ async function lockPendingAttachments(
 ) {
   const result = await client.query(
     `
-      SELECT id, mime
+      SELECT id,filename,mime,size,storage,object_key
       FROM attachments
       WHERE id = ANY($1::uuid[])
         AND conversation_id = $2
@@ -9167,11 +10010,43 @@ async function lockPendingAttachments(
     const mime = byId.get(id)?.mime;
     if (type === 'image') return ALLOWED_IMAGE_TYPES.has(mime);
     if (type === 'video') return ALLOWED_VIDEO_TYPES.has(mime);
-    return ALLOWED_AUDIO_TYPES.has(mime);
+    if (type === 'audio') return ALLOWED_AUDIO_TYPES.has(mime);
+    return (
+      uploader === 'admin' &&
+      ALLOWED_FILE_TYPES.has(mime) &&
+      byId.get(id)?.storage === 'r2' &&
+      Boolean(byId.get(id)?.object_key)
+    );
   });
   if (!valid) {
     throw requestError('媒体附件类型不匹配。', 400, 'INVALID_ATTACHMENT_TYPE');
   }
+  if (type === 'file') {
+    try {
+      await Promise.all(result.rows.map(async (row) => {
+        const stored = await r2.send(
+          new HeadObjectCommand({ Bucket: R2_BUCKET, Key: row.object_key }),
+        );
+        const storedMime = String(stored.ContentType || '')
+          .split(';')[0]
+          .trim()
+          .toLowerCase();
+        if (
+          Number(stored.ContentLength) !== Number(row.size) ||
+          storedMime !== row.mime
+        ) {
+          throw new Error('uploaded file metadata mismatch');
+        }
+      }));
+    } catch {
+      throw requestError(
+        '文件尚未上传完成或内容不完整，请重新发送。',
+        409,
+        'FILE_UPLOAD_INCOMPLETE',
+      );
+    }
+  }
+  return attachmentIds.map((id) => byId.get(id));
 }
 
 async function insertMediaMessages(
@@ -9193,17 +10068,26 @@ async function insertMediaMessages(
   const positions = attachmentIds.map((_, index) => index);
   const result = await client.query(
     `
-      INSERT INTO messages (
-        id, conversation_id, role, source, type, text, attachment_id,
-        album_id, album_position, client_request_id, expires_at
+      WITH inserted AS (
+        INSERT INTO messages (
+          id, conversation_id, role, source, type, text, attachment_id,
+          album_id, album_position, client_request_id, expires_at
+        )
+        SELECT
+          input.id,$5,$6,'manual',$7,input.body_text,input.attachment_id,
+          $8,input.position,$10,NOW() + ($9::text || ' hours')::interval
+        FROM unnest(
+          $1::uuid[],$2::uuid[],$3::text[],$4::int[]
+        ) AS input(id,attachment_id,body_text,position)
+        RETURNING *
       )
       SELECT
-        input.id,$5,$6,'manual',$7,input.body_text,input.attachment_id,
-        $8,input.position,$10,NOW() + ($9::text || ' hours')::interval
-      FROM unnest(
-        $1::uuid[],$2::uuid[],$3::text[],$4::int[]
-      ) AS input(id,attachment_id,body_text,position)
-      RETURNING *
+        inserted.*,
+        a.filename AS attachment_filename,
+        a.mime AS attachment_mime,
+        a.size AS attachment_size
+      FROM inserted
+      LEFT JOIN attachments a ON a.id=inserted.attachment_id
     `,
     [
       messageIds,
@@ -9240,6 +10124,9 @@ async function createUserMessage(
   { includeConversation = true } = {},
 ) {
   const input = parseMessageInput(body);
+  if (input.type === 'file') {
+    throw requestError('访客不能向商家发送普通文件。', 403, 'FILE_UPLOAD_FORBIDDEN');
+  }
   if (input.assetIds.length) {
     throw requestError('访客不能发送后台预设素材。', 403, 'FORBIDDEN_ASSET');
   }
@@ -9658,6 +10545,291 @@ async function createAdminMessage(
   }
 }
 
+async function createAdminFileBroadcast(body, tenantId) {
+  const input = parseMessageInput({ ...body, type: 'file' });
+  if (input.assetIds.length) {
+    throw requestError('批量发送只支持已上传的文件。', 400, 'INVALID_ATTACHMENT');
+  }
+  const conversationIds = Array.isArray(body?.conversationIds)
+    ? [...new Set(
+        body.conversationIds
+          .map((value) => cleanText(value, 80))
+          .filter(Boolean),
+      )]
+    : [];
+  if (
+    conversationIds.length < 2 ||
+    conversationIds.length > MAX_FILE_BROADCAST_RECIPIENTS ||
+    conversationIds.some((id) => !isUuid(id))
+  ) {
+    throw requestError(
+      `批量发送请选择 2-${MAX_FILE_BROADCAST_RECIPIENTS} 个进行中的会话。`,
+      400,
+      'FILE_BROADCAST_RECIPIENTS',
+    );
+  }
+  const sourceConversationId = cleanText(body?.sourceConversationId, 80);
+  if (
+    !isUuid(sourceConversationId) ||
+    !conversationIds.includes(sourceConversationId)
+  ) {
+    throw requestError(
+      '文件上传会话不在接收列表中，请重新选择后发送。',
+      400,
+      'FILE_BROADCAST_SOURCE',
+    );
+  }
+
+  const [config, featureStates] = await Promise.all([
+    getConfig(tenantId),
+    getTenantFeatureStates(tenantId),
+  ]);
+  if (!featureStates.media_album) {
+    throw requestError(
+      '文件功能当前未向该租户开放。',
+      403,
+      'FEATURE_DISABLED',
+    );
+  }
+  const retentionHours = Number(config.settings.retentionHours || 24);
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+    const conversationResult = await client.query(
+      `
+        SELECT *
+        FROM conversations
+        WHERE tenant_id=$1 AND id=ANY($2::uuid[])
+        ORDER BY id
+        FOR UPDATE
+      `,
+      [tenantId, conversationIds],
+    );
+    if (conversationResult.rows.length !== conversationIds.length) {
+      throw requestError(
+        '部分会话不存在或不属于当前商家。',
+        404,
+        'FILE_BROADCAST_CONVERSATION',
+      );
+    }
+    if (conversationResult.rows.some((row) => row.status !== 'open')) {
+      throw requestError(
+        '接收列表中包含已结束的会话，请取消选择后重试。',
+        409,
+        'FILE_BROADCAST_CLOSED',
+      );
+    }
+
+    const replayResult = await client.query(
+      `
+        SELECT
+          m.*,
+          a.filename AS attachment_filename,
+          a.mime AS attachment_mime,
+          a.size AS attachment_size
+        FROM messages m
+        LEFT JOIN attachments a ON a.id=m.attachment_id
+        WHERE m.conversation_id=ANY($1::uuid[])
+          AND m.role='admin'
+          AND m.source='manual'
+          AND m.client_request_id=$2
+        ORDER BY m.conversation_id,m.album_position,m.created_at,m.id
+      `,
+      [conversationIds, input.clientRequestId],
+    );
+    const expectedMessages = conversationIds.length * input.attachmentIds.length;
+    if (replayResult.rows.length) {
+      if (replayResult.rows.length !== expectedMessages) {
+        throw requestError(
+          '批量发送状态不完整，请刷新后台后再试。',
+          409,
+          'FILE_BROADCAST_REPLAY_MISMATCH',
+        );
+      }
+      await client.query('COMMIT');
+      const conversationsById = new Map(
+        conversationResult.rows.map((row) => [row.id, row]),
+      );
+      const rowsByConversation = new Map();
+      for (const row of replayResult.rows) {
+        const rows = rowsByConversation.get(row.conversation_id) || [];
+        rows.push(row);
+        rowsByConversation.set(row.conversation_id, rows);
+      }
+      return {
+        idempotentReplay: true,
+        results: conversationIds.map((conversationId) => {
+          const rows = rowsByConversation.get(conversationId) || [];
+          const latest = rows.at(-1);
+          return {
+            conversationId,
+            messages: rows.map(publicMessage),
+            summary: conversationSummary({
+              ...conversationsById.get(conversationId),
+              latest_id: latest?.id,
+              latest_type: latest?.type,
+              latest_text: latest?.text,
+              latest_role: latest?.role,
+              latest_created_at: latest?.created_at,
+            }),
+          };
+        }),
+      };
+    }
+
+    const sourceAttachments = await lockPendingAttachments(
+      client,
+      sourceConversationId,
+      'admin',
+      'file',
+      input.attachmentIds,
+    );
+    const attachmentRecords = [];
+    for (const conversationId of conversationIds) {
+      for (const source of sourceAttachments) {
+        attachmentRecords.push({
+          id:
+            conversationId === sourceConversationId
+              ? source.id
+              : randomUUID(),
+          conversationId,
+          filename: source.filename,
+          mime: source.mime,
+          size: Number(source.size),
+          objectKey: source.object_key,
+        });
+      }
+    }
+    const clones = attachmentRecords.filter(
+      (record) => record.conversationId !== sourceConversationId,
+    );
+    if (clones.length) {
+      await client.query(
+        `
+          INSERT INTO attachments (
+            id,conversation_id,filename,mime,size,uploader,data,
+            storage,object_key,expires_at
+          )
+          SELECT
+            input.id,input.conversation_id,input.filename,input.mime,
+            input.size,'admin',NULL,'r2',input.object_key,
+            NOW() + ($7::text || ' hours')::interval
+          FROM unnest(
+            $1::uuid[],$2::uuid[],$3::text[],$4::text[],$5::int[],$6::text[]
+          ) AS input(id,conversation_id,filename,mime,size,object_key)
+        `,
+        [
+          clones.map((record) => record.id),
+          clones.map((record) => record.conversationId),
+          clones.map((record) => record.filename),
+          clones.map((record) => record.mime),
+          clones.map((record) => record.size),
+          clones.map((record) => record.objectKey),
+          retentionHours,
+        ],
+      );
+    }
+
+    const messageRecords = attachmentRecords.map((attachment, index) => ({
+      id: randomUUID(),
+      conversationId: attachment.conversationId,
+      attachmentId: attachment.id,
+      position: index % input.attachmentIds.length,
+    }));
+    const insertedMessages = await client.query(
+      `
+        WITH inserted AS (
+          INSERT INTO messages (
+            id,conversation_id,role,source,type,text,attachment_id,
+            album_position,client_request_id,created_at,expires_at
+          )
+          SELECT
+            input.id,input.conversation_id,'admin','manual','file','',
+            input.attachment_id,input.position,$5,
+            NOW() + ((input.position + 1)::text || ' milliseconds')::interval,
+            NOW() + ((input.position + 1)::text || ' milliseconds')::interval
+              + ($6::text || ' hours')::interval
+          FROM unnest(
+            $1::uuid[],$2::uuid[],$3::uuid[],$4::int[]
+          ) AS input(id,conversation_id,attachment_id,position)
+          RETURNING *
+        )
+        SELECT
+          inserted.*,
+          a.filename AS attachment_filename,
+          a.mime AS attachment_mime,
+          a.size AS attachment_size
+        FROM inserted
+        LEFT JOIN attachments a ON a.id=inserted.attachment_id
+        ORDER BY inserted.conversation_id,inserted.album_position
+      `,
+      [
+        messageRecords.map((record) => record.id),
+        messageRecords.map((record) => record.conversationId),
+        messageRecords.map((record) => record.attachmentId),
+        messageRecords.map((record) => record.position),
+        input.clientRequestId,
+        retentionHours,
+      ],
+    );
+    await client.query(
+      `
+        UPDATE attachments
+        SET linked_at=NOW(),
+            expires_at=NOW() + ($2::text || ' hours')::interval
+        WHERE id=ANY($1::uuid[])
+      `,
+      [attachmentRecords.map((record) => record.id), retentionHours],
+    );
+    const updatedConversations = await client.query(
+      `
+        UPDATE conversations
+        SET unread_user=unread_user + $3::int,
+            updated_at=NOW()
+        WHERE tenant_id=$1 AND id=ANY($2::uuid[])
+        RETURNING *
+      `,
+      [tenantId, conversationIds, input.attachmentIds.length],
+    );
+    await client.query('COMMIT');
+
+    minuteCounters.messages += insertedMessages.rows.length;
+    const conversationsById = new Map(
+      updatedConversations.rows.map((row) => [row.id, row]),
+    );
+    const rowsByConversation = new Map();
+    for (const row of insertedMessages.rows) {
+      const rows = rowsByConversation.get(row.conversation_id) || [];
+      rows.push(row);
+      rowsByConversation.set(row.conversation_id, rows);
+    }
+    return {
+      results: conversationIds.map((conversationId) => {
+        const rows = rowsByConversation.get(conversationId) || [];
+        const latest = rows.at(-1);
+        return {
+          conversationId,
+          messages: rows.map(publicMessage),
+          summary: conversationSummary({
+            ...conversationsById.get(conversationId),
+            latest_id: latest?.id,
+            latest_type: latest?.type,
+            latest_text: latest?.text,
+            latest_role: latest?.role,
+            latest_created_at: latest?.created_at,
+          }),
+        };
+      }),
+    };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function broadcastMessageResult(
   result,
   trigger,
@@ -9925,6 +11097,62 @@ async function deleteAdminMessage(
     messageIds,
     requestApiVersion,
   });
+}
+
+async function deleteAllTenantConversations(tenantId) {
+  if (!isUuid(tenantId)) {
+    throw requestError('当前商家身份无效。', 400, 'TENANT_INVALID');
+  }
+  const client = await pool.connect();
+  let result;
+  try {
+    await client.query('BEGIN');
+    const counts = await client.query(
+      `
+        SELECT
+          (SELECT COUNT(*)::int FROM conversations WHERE tenant_id=$1) AS conversations,
+          (SELECT COUNT(*)::int FROM messages m JOIN conversations c ON c.id=m.conversation_id WHERE c.tenant_id=$1) AS messages,
+          (SELECT COUNT(*)::int FROM attachments a JOIN conversations c ON c.id=a.conversation_id WHERE c.tenant_id=$1) AS attachments,
+          (SELECT COUNT(*)::int FROM call_sessions cs WHERE cs.tenant_id=$1) AS calls
+      `,
+      [tenantId],
+    );
+    const storedObjects = await client.query(
+      `
+        SELECT a.object_key
+        FROM attachments a
+        JOIN conversations c ON c.id=a.conversation_id
+        WHERE c.tenant_id=$1
+          AND a.storage='r2'
+          AND a.object_key IS NOT NULL
+      `,
+      [tenantId],
+    );
+    const deleted = await client.query(
+      `DELETE FROM conversations WHERE tenant_id=$1 RETURNING id`,
+      [tenantId],
+    );
+    await queueObjectDeletes(
+      [...new Set(storedObjects.rows.map((row) => row.object_key).filter(Boolean))],
+      client,
+    );
+    await client.query('COMMIT');
+    const row = counts.rows[0] || {};
+    result = {
+      conversationsDeleted: deleted.rowCount,
+      messagesDeleted: Number(row.messages || 0),
+      attachmentsDeleted: Number(row.attachments || 0),
+      callsDeleted: Number(row.calls || 0),
+    };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+  recentChatActivity.delete(tenantId);
+  processObjectDeleteQueue().catch(() => {});
+  return result;
 }
 
 async function recallAdminMessage(
@@ -10900,6 +12128,1588 @@ async function telegramApi(method, payload) {
   return result.result;
 }
 
+const TELEGRAM_SHOP_DURATION_CODES = Object.freeze([
+  '1d',
+  '7d',
+  '30d',
+  '180d',
+  '365d',
+]);
+
+const TELEGRAM_SHOP_PRODUCT_LABELS = Object.freeze({
+  '1d': '日卡',
+  '7d': '周卡',
+  '30d': '月卡',
+  '180d': '半年卡',
+  '365d': '年卡',
+});
+
+function defaultTelegramShopProducts() {
+  return Object.fromEntries(
+    TELEGRAM_SHOP_DURATION_CODES.map((code) => [
+      code,
+      { label: TELEGRAM_SHOP_PRODUCT_LABELS[code], price: '', enabled: false },
+    ]),
+  );
+}
+
+function normalizeShopProducts(value) {
+  const defaults = defaultTelegramShopProducts();
+  const source = value && typeof value === 'object' && !Array.isArray(value)
+    ? value
+    : {};
+  for (const code of TELEGRAM_SHOP_DURATION_CODES) {
+    const item = source[code] && typeof source[code] === 'object'
+      ? source[code]
+      : {};
+    const price = String(item.price || '').trim();
+    defaults[code] = {
+      label: TELEGRAM_SHOP_PRODUCT_LABELS[code],
+      price: /^\d{1,12}(?:\.\d{1,2})?$/.test(price) ? price : '',
+      enabled: Boolean(item.enabled && price),
+    };
+  }
+  return defaults;
+}
+
+function normalizeShopContact(item) {
+  if (!item || typeof item !== 'object') return null;
+  const name = cleanText(item.name, 40);
+  const value = cleanText(item.value || item.url, 200).trim();
+  if (!name || !value) return null;
+  const url = value.startsWith('@')
+    ? `https://t.me/${value.slice(1)}`
+    : /^https:\/\/t\.me\/[A-Za-z0-9_]{5,64}(?:\?.*)?$/i.test(value)
+      ? value
+      : '';
+  if (!url) return null;
+  return { name, value, url, enabled: item.enabled !== false };
+}
+
+function normalizeShopContacts(value) {
+  return (Array.isArray(value) ? value : [])
+    .slice(0, 3)
+    .map(normalizeShopContact)
+    .filter(Boolean);
+}
+
+function normalizeTronWallet(value) {
+  const text = cleanText(value, 80).trim();
+  return /^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(text) ? text : '';
+}
+
+async function getTelegramShopConfig(client = pool) {
+  if (
+    client === pool &&
+    telegramShopConfigCache &&
+    telegramShopConfigCacheExpiresAt > Date.now()
+  ) return telegramShopConfigCache;
+  const result = await client.query(
+    `SELECT products,tron_wallet_address,okpay_enabled,tron_enabled,contacts
+     FROM telegram_shop_config WHERE id=1`,
+  );
+  const row = result.rows[0] || {};
+  const config = {
+    products: normalizeShopProducts(row.products),
+    tronWalletAddress: normalizeTronWallet(row.tron_wallet_address),
+    okpayEnabled: row.okpay_enabled !== false && Boolean(OKPAY_SHOP_ID && OKPAY_TOKEN),
+    tronEnabled: Boolean(row.tron_enabled && TRONGRID_API_KEY),
+    configuredOkpay: Boolean(OKPAY_SHOP_ID && OKPAY_TOKEN),
+    configuredTronApi: Boolean(TRONGRID_API_KEY),
+    contacts: normalizeShopContacts(row.contacts),
+  };
+  if (client === pool) {
+    telegramShopConfigCache = config;
+    telegramShopConfigCacheExpiresAt = Date.now() + 30_000;
+  }
+  return config;
+}
+
+function invalidateTelegramShopConfig() {
+  telegramShopConfigCache = null;
+  telegramShopConfigCacheExpiresAt = 0;
+}
+
+async function updateTelegramShopConfig(patch, client = pool) {
+  const current = await getTelegramShopConfig(client);
+  const products = normalizeShopProducts(
+    patch.products === undefined ? current.products : patch.products,
+  );
+  const wallet = patch.tronWalletAddress === undefined
+    ? current.tronWalletAddress
+    : normalizeTronWallet(patch.tronWalletAddress);
+  const okpayEnabled = patch.okpayEnabled === undefined
+    ? current.okpayEnabled
+    : Boolean(patch.okpayEnabled);
+  const tronEnabled = patch.tronEnabled === undefined
+    ? current.tronEnabled
+    : Boolean(patch.tronEnabled);
+  const contacts = patch.contacts === undefined
+    ? current.contacts
+    : normalizeShopContacts(patch.contacts);
+  await client.query(
+    `INSERT INTO telegram_shop_config(
+       id,products,tron_wallet_address,okpay_enabled,tron_enabled,contacts,updated_at
+     ) VALUES(1,$1::jsonb,$2,$3,$4,$5::jsonb,NOW())
+     ON CONFLICT(id) DO UPDATE SET
+       products=EXCLUDED.products,
+       tron_wallet_address=EXCLUDED.tron_wallet_address,
+       okpay_enabled=EXCLUDED.okpay_enabled,
+       tron_enabled=EXCLUDED.tron_enabled,
+       contacts=EXCLUDED.contacts,
+       updated_at=NOW()` ,
+    [
+      JSON.stringify(products),
+      wallet,
+      okpayEnabled,
+      tronEnabled,
+      JSON.stringify(contacts),
+    ],
+  );
+  invalidateTelegramShopConfig();
+  return getTelegramShopConfig(client);
+}
+
+async function getTelegramShopSession(userId, client = pool) {
+  const result = await client.query(
+    `SELECT state,payload FROM telegram_shop_sessions WHERE user_id=$1`,
+    [String(userId || '')],
+  );
+  return result.rows[0]
+    ? { state: result.rows[0].state || '', payload: result.rows[0].payload || {} }
+    : { state: '', payload: {} };
+}
+
+async function setTelegramShopSession(userId, state, payload = {}, client = pool) {
+  await client.query(
+    `INSERT INTO telegram_shop_sessions(user_id,state,payload,updated_at)
+     VALUES($1,$2,$3::jsonb,NOW())
+     ON CONFLICT(user_id) DO UPDATE SET
+       state=EXCLUDED.state,payload=EXCLUDED.payload,updated_at=NOW()`,
+    [String(userId || ''), cleanText(state, 80), JSON.stringify(payload || {})],
+  );
+}
+
+async function clearTelegramShopSession(userId, client = pool) {
+  await client.query(
+    `DELETE FROM telegram_shop_sessions WHERE user_id=$1`,
+    [String(userId || '')],
+  );
+}
+
+function shopDecimalUnits(value, scale = 6) {
+  const text = String(value ?? '').trim();
+  const match = text.match(/^(\d+)(?:\.(\d+))?$/);
+  if (!match || match[1].length > 18) return null;
+  const fraction = match[2] || '';
+  if (fraction.length > scale) return null;
+  try {
+    const units = BigInt(match[1]) * (10n ** BigInt(scale)) +
+      BigInt((fraction + '0'.repeat(scale)).slice(0, scale) || '0');
+    return units > 0n ? units : null;
+  } catch {
+    return null;
+  }
+}
+
+function shopFormatUnits(value, scale = 6, trim = true) {
+  const units = typeof value === 'bigint' ? value : BigInt(value || 0);
+  const negative = units < 0n;
+  const absolute = negative ? -units : units;
+  const divisor = 10n ** BigInt(scale);
+  const whole = absolute / divisor;
+  let fraction = String(absolute % divisor).padStart(scale, '0');
+  if (trim) fraction = fraction.replace(/0+$/, '');
+  return `${negative ? '-' : ''}${whole}${fraction ? `.${fraction}` : ''}`;
+}
+
+function shopNormalizeBasePrice(value) {
+  const text = String(value ?? '').trim();
+  if (!/^\d{1,12}(?:\.\d{1,2})?$/.test(text)) return '';
+  const units = shopDecimalUnits(text, 6);
+  return units == null ? '' : shopFormatUnits(units, 6, true);
+}
+
+function shopBaseToFourUnits(value) {
+  const text = String(value ?? '').trim();
+  const match = text.match(/^(\d{1,12})(?:\.(\d{1,2}))?$/);
+  if (!match) return null;
+  try {
+    const whole = BigInt(match[1]);
+    const fraction = BigInt((match[2] || '').padEnd(4, '0'));
+    return whole * 10_000n + fraction;
+  } catch {
+    return null;
+  }
+}
+
+function shopAmountWithTag(basePrice, tag) {
+  const base = shopBaseToFourUnits(basePrice);
+  if (base == null || !Number.isInteger(tag) || tag < 1 || tag > 99) return '';
+  return shopFormatUnits(base + BigInt(tag), 4, false);
+}
+
+function shopTokenAmount(value) {
+  const units = shopDecimalUnits(value, 6);
+  return units == null ? null : units;
+}
+
+function shopOrderPublic(row) {
+  return {
+    id: row.id,
+    durationCode: row.duration_code,
+    packageLabel: row.package_label,
+    paymentMethod: row.payment_method,
+    amountUsdt: row.amount_usdt,
+    expiresAt: row.expires_at,
+    paymentStatus: row.payment_status,
+    deliveryStatus: row.delivery_status,
+  };
+}
+
+function okpayFlattenParams(value, prefix = '', output = {}) {
+  if (value === null || value === undefined || value === '') return output;
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    for (const key of Object.keys(value)) {
+      okpayFlattenParams(
+        value[key],
+        prefix ? `${prefix}.${key}` : key,
+        output,
+      );
+    }
+    return output;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => {
+      okpayFlattenParams(item, prefix ? `${prefix}.${index}` : String(index), output);
+    });
+    return output;
+  }
+  output[prefix] = typeof value === 'boolean' ? String(value) : String(value);
+  return output;
+}
+
+function okpaySignBase(params) {
+  const flat = okpayFlattenParams(params);
+  delete flat.sign;
+  return Object.keys(flat)
+    .sort()
+    .map((key) => `${key}=${flat[key]}`)
+    .join('&');
+}
+
+function okpaySignature(params) {
+  return createHmac('sha256', OKPAY_TOKEN)
+    .update(okpaySignBase(params), 'utf8')
+    .digest('hex')
+    .toUpperCase();
+}
+
+function okpaySignedParams(params) {
+  const payload = {
+    ...params,
+    id: OKPAY_SHOP_ID,
+    timestamp: Math.floor(Date.now() / 1000),
+    nonce: randomBytes(12).toString('hex'),
+  };
+  return { ...payload, sign: okpaySignature(payload) };
+}
+
+async function okpayRequest(pathname, params) {
+  if (!OKPAY_SHOP_ID || !OKPAY_TOKEN) {
+    throw new Error('OKPay 尚未配置商户ID和密钥。');
+  }
+  const payload = okpaySignedParams(params);
+  const response = await fetch(`${OKPAY_API_BASE}${pathname}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(payload).toString(),
+    signal: AbortSignal.timeout(15_000),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok || body?.status !== 'success') {
+    throw new Error(cleanText(body?.message || body?.error || `OKPay 返回状态 ${response.status}`, 240));
+  }
+  if (body.sign && !timingSafeTextEqual(String(body.sign), okpaySignature(body))) {
+    throw new Error('OKPay 返回签名校验失败。');
+  }
+  return body;
+}
+
+function verifyOkpayCallback(body) {
+  if (!body || typeof body !== 'object' || !body.sign) return false;
+  return timingSafeTextEqual(String(body.sign), okpaySignature(body));
+}
+
+async function createOkpayOrderLink(order) {
+  const callbackUrl = `${PUBLIC_API_BASE}/api/okpay/callback`;
+  const result = await okpayRequest('/shop/payLink', {
+    amount: String(order.amount_usdt),
+    coin: 'USDT',
+    unique_id: String(order.okpay_unique_id),
+    name: `${order.package_label}卡密`,
+    callback_url: callbackUrl,
+  });
+  const data = result.data || {};
+  if (!data.order_id || !data.pay_url) throw new Error('OKPay 未返回有效支付链接。');
+  await pool.query(
+    `UPDATE telegram_shop_orders
+     SET okpay_order_id=$2,updated_at=NOW()
+     WHERE id=$1 AND payment_status='pending'`,
+    [order.id, cleanText(data.order_id, 160)],
+  );
+  return { orderId: data.order_id, payUrl: data.pay_url };
+}
+
+async function lockShopAmountTag(client, orderId, walletAddress, baseAmount) {
+  await client.query(
+    `SELECT pg_advisory_xact_lock(hashtext($1))`,
+    [`tuojie-shop-amount:${walletAddress}:${baseAmount}`],
+  );
+  for (let tag = 1; tag <= 99; tag += 1) {
+    const amount = shopAmountWithTag(baseAmount, tag);
+    const inserted = await client.query(
+      `INSERT INTO telegram_shop_amount_reservations(
+         wallet_address,base_amount_usdt,tag,amount_usdt,order_id,reserved_until
+       ) VALUES($1,$2,$3,$4,$5,NOW()+($6::int*INTERVAL '1 hour'))
+       ON CONFLICT DO NOTHING
+       RETURNING amount_usdt`,
+      [walletAddress, baseAmount, tag, amount, orderId, SHOP_AMOUNT_RESERVATION_HOURS],
+    );
+    if (inserted.rows[0]) return inserted.rows[0].amount_usdt;
+  }
+  throw new Error('该套餐当前USDT金额编号已用完，请改用OKPay或稍后再试。');
+}
+
+async function createTelegramShopOrder(message, durationCode, paymentMethod) {
+  const user = message.from || {};
+  const userId = String(user.id || '');
+  if (!/^\d+$/.test(userId)) throw new Error('Telegram用户ID无效。');
+  const config = await getTelegramShopConfig();
+  const product = config.products[durationCode];
+  if (!product?.enabled || !product.price) throw new Error('该套餐当前未上架。');
+  if (paymentMethod === 'okpay_usdt' && !config.okpayEnabled) {
+    throw new Error(config.configuredOkpay ? 'OKPay当前已关闭。' : 'OKPay尚未配置。');
+  }
+  if (paymentMethod === 'usdt_trc20') {
+    if (!config.tronEnabled || !config.tronWalletAddress) {
+      throw new Error(config.configuredTronApi ? 'USDT-TRC20当前已关闭或未设置收款地址。' : 'USDT-TRC20尚未配置链上查询API。');
+    }
+  }
+  const orderId = randomUUID();
+  const client = await pool.connect();
+  let order;
+  try {
+    await client.query('BEGIN');
+    const baseAmount = shopNormalizeBasePrice(product.price);
+    if (!baseAmount) throw new Error('套餐价格配置无效。');
+    const inserted = await client.query(
+      `INSERT INTO telegram_shop_orders(
+         id,user_id,chat_id,username,display_name,duration_code,package_label,
+         payment_method,base_amount_usdt,amount_usdt,wallet_address,okpay_unique_id,
+         expires_at
+       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW()+($13::int*INTERVAL '1 minute'))
+       RETURNING *`,
+      [
+        orderId,
+        userId,
+        String(message.chat.id),
+        cleanText(user.username, 80),
+        telegramDisplayName(user),
+        durationCode,
+        product.label,
+        paymentMethod,
+        baseAmount,
+        baseAmount,
+        paymentMethod === 'usdt_trc20' ? config.tronWalletAddress : '',
+        paymentMethod === 'okpay_usdt' ? `YK${orderId.replace(/-/g, '')}` : null,
+        SHOP_ORDER_TTL_MINUTES,
+      ],
+    );
+    order = inserted.rows[0];
+    if (paymentMethod === 'usdt_trc20') {
+      const amount = await lockShopAmountTag(
+        client,
+        orderId,
+        config.tronWalletAddress,
+        baseAmount,
+      );
+      const updated = await client.query(
+        `UPDATE telegram_shop_orders SET amount_usdt=$2,updated_at=NOW()
+         WHERE id=$1 RETURNING *`,
+        [orderId, amount],
+      );
+      order = updated.rows[0] || order;
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+  if (paymentMethod === 'okpay_usdt') {
+    try {
+      const link = await createOkpayOrderLink(order);
+      const refreshed = await pool.query(`SELECT * FROM telegram_shop_orders WHERE id=$1`, [order.id]);
+      return { order: refreshed.rows[0] || order, link };
+    } catch (error) {
+      await pool.query(
+        `UPDATE telegram_shop_orders
+         SET payment_status='failed',updated_at=NOW()
+         WHERE id=$1 AND payment_status='pending'`,
+        [order.id],
+      );
+      throw error;
+    }
+  }
+  return { order };
+}
+
+function telegramShopMainKeyboard(isAdmin = false) {
+  const rows = [
+    [{ text: '🛒 购买卡密', callback_data: 'shop:buy' }],
+    [{ text: '🔎 查询新增访客', callback_data: 'shop:query' }],
+    [
+      { text: '📖 使用帮助', callback_data: 'shop:help' },
+      { text: '💬 联系客服', callback_data: 'shop:support' },
+    ],
+  ];
+  if (isAdmin) rows.push([{ text: '⚙️ 机器人设置', callback_data: 'shop:admin' }]);
+  return { inline_keyboard: rows };
+}
+
+function telegramShopContactKeyboard(contacts) {
+  const enabled = normalizeShopContacts(contacts).filter((item) => item.enabled);
+  if (!enabled.length) return { inline_keyboard: [] };
+  return {
+    inline_keyboard: [
+      ...enabled.map((item) => [{ text: `💬 ${item.name}`, url: item.url }]),
+      [{ text: '⬅️ 返回菜单', callback_data: 'shop:menu' }],
+    ],
+  };
+}
+
+function telegramShopAdminKeyboard(config) {
+  const rows = TELEGRAM_SHOP_DURATION_CODES.map((code) => {
+    const product = config.products[code];
+    return [{
+      text: `${product.label}：${product.price ? `${product.price} USDT` : '未设置'}${product.enabled ? ' ✅' : ' ⛔'}`,
+      callback_data: `admin:price:${code}`,
+    }];
+  });
+  rows.push(
+    [{ text: '📡 设置USDT-TRC20钱包', callback_data: 'admin:wallet' }],
+    [{ text: `OKPay：${config.okpayEnabled ? '开启' : '关闭'}`, callback_data: 'admin:toggle:okpay' }],
+    [{ text: `USDT-TRC20：${config.tronEnabled ? '开启' : '关闭'}`, callback_data: 'admin:toggle:tron' }],
+    [{ text: '👤 设置客服', callback_data: 'admin:contacts' }],
+    [{ text: '⚠️ 异常订单', callback_data: 'admin:orders' }],
+    [{ text: '⬅️ 返回菜单', callback_data: 'shop:menu' }],
+  );
+  return { inline_keyboard: rows };
+}
+
+function telegramShopPackageKeyboard(config) {
+  const rows = TELEGRAM_SHOP_DURATION_CODES
+    .filter((code) => config.products[code]?.enabled)
+    .map((code) => {
+      const product = config.products[code];
+      return [{
+        text: `${product.label}｜${product.price} USDT`,
+        callback_data: `shop:pkg:${code}`,
+      }];
+    });
+  if (!rows.length) rows.push([{ text: '暂无上架套餐', callback_data: 'shop:noop' }]);
+  rows.push([{ text: '⬅️ 返回菜单', callback_data: 'shop:menu' }]);
+  return { inline_keyboard: rows };
+}
+
+function telegramShopPaymentKeyboard(config, durationCode) {
+  const rows = [];
+  if (config.okpayEnabled) {
+    rows.push([{ text: '🟢 OKPay（USDT）', callback_data: `shop:pay:${durationCode}:okpay_usdt` }]);
+  }
+  if (config.tronEnabled && config.tronWalletAddress) {
+    rows.push([{ text: '🔵 USDT-TRC20（波场）', callback_data: `shop:pay:${durationCode}:usdt_trc20` }]);
+  }
+  rows.push([{ text: '⬅️ 返回套餐', callback_data: 'shop:buy' }]);
+  return { inline_keyboard: rows };
+}
+
+function telegramShopWindowKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '最近6小时', callback_data: 'shop:window:6' },
+        { text: '最近12小时', callback_data: 'shop:window:12' },
+      ],
+      [
+        { text: '最近24小时', callback_data: 'shop:window:24' },
+        { text: '最近3天', callback_data: 'shop:window:72' },
+      ],
+      [
+        { text: '最近7天', callback_data: 'shop:window:168' },
+        { text: '最近10天', callback_data: 'shop:window:240' },
+      ],
+      [{ text: '最近15天', callback_data: 'shop:window:360' }],
+      [{ text: '⬅️ 返回菜单', callback_data: 'shop:menu' }],
+    ],
+  };
+}
+
+async function sendTelegramShopMenu(chatId, userId, message = null) {
+  const isAdmin = TELEGRAM_ALLOWED_USER_IDS.has(String(userId || ''));
+  return telegramApi('sendMessage', {
+    chat_id: chatId,
+    text: [
+      '<b>🛍 拓界云服卡密服务</b>',
+      '',
+      '请选择你要使用的功能：',
+    ].join('\n'),
+    parse_mode: 'HTML',
+    reply_markup: telegramShopMainKeyboard(isAdmin),
+    ...(message ? telegramThread(message) : {}),
+  });
+}
+
+async function sendTelegramShopSupport(chatId) {
+  const config = await getTelegramShopConfig();
+  const contacts = config.contacts.filter((item) => item.enabled);
+  const text = contacts.length
+    ? '<b>💬 联系客服</b>\n\n请选择客服：'
+    : '当前暂无可用客服，请稍后再试。';
+  await telegramApi('sendMessage', {
+    chat_id: chatId,
+    text,
+    parse_mode: 'HTML',
+    reply_markup: contacts.length
+      ? telegramShopContactKeyboard(contacts)
+      : telegramShopMainKeyboard(TELEGRAM_ALLOWED_USER_IDS.has(String(chatId))),
+  });
+}
+
+function telegramShopHelpText() {
+  return [
+    '<b>📖 使用帮助</b>',
+    '',
+    '1. 点击“购买卡密”，选择套餐和支付方式。',
+    '2. OKPay使用USDT支付；USDT-TRC20需要向页面显示的波场地址转账。',
+    '3. 订单有效期为20分钟，少付不会自动发货。',
+    '4. 卡密成功生成后只在购买消息中显示一次，请立即保存。',
+    '5. 查询新增访客时发送已激活的普通卡密，再选择查询时间。',
+    '6. 如果商家后台保存时间不足你选择的范围，系统会按实际保留时间统计。',
+    '7. 多付、晚到账或异常订单会转人工核验，不会自动发错卡密。',
+  ].join('\n');
+}
+
+function telegramShopPurchaseText(product) {
+  return [
+    '<b>🛒 购买卡密</b>',
+    '',
+    '请选择套餐：',
+    '',
+    `当前仅显示已上架套餐，价格由管理员设置。`,
+  ].join('\n');
+}
+
+function telegramShopPaymentText(product) {
+  return [
+    `<b>套餐：${escapeTelegramHtml(product.label)}</b>`,
+    `有效期：${escapeTelegramHtml(product.label)}`,
+    `价格：<b>${escapeTelegramHtml(product.price)} USDT</b>`,
+    '',
+    '请选择支付方式。',
+    '订单有效期：20分钟。',
+  ].join('\n');
+}
+
+function telegramShopOrderText(order, link = null) {
+  const lines = [
+    '<b>✅ 订单已创建</b>',
+    '',
+    `套餐：${escapeTelegramHtml(order.package_label)}`,
+    `支付方式：${order.payment_method === 'okpay_usdt' ? 'OKPay（USDT）' : 'USDT-TRC20（波场）'}`,
+    `应付金额：<b>${escapeTelegramHtml(order.amount_usdt)} USDT</b>`,
+    `订单有效期：${escapeTelegramHtml(formatTelegramDate(order.expires_at))}`,
+  ];
+  if (link) {
+    lines.push('', '请点击下面按钮进入OKPay完成支付。');
+  } else {
+    lines.push(
+      '',
+      '<b>请只向下面这个地址转账准确金额：</b>',
+      `<code>${escapeTelegramHtml(order.wallet_address)}</code>`,
+      '',
+      '少付不会自动发货；多付或晚到账请联系人工处理。',
+    );
+  }
+  return lines.join('\n');
+}
+
+function telegramShopOrderKeyboard(order, link = null) {
+  const rows = [];
+  if (link) rows.push([{ text: '🟢 前往OKPay支付', url: link }]);
+  rows.push([{ text: '🔄 我已完成支付，查询订单', callback_data: `shop:check:${order.id}` }]);
+  rows.push([{ text: '💬 联系客服', callback_data: 'shop:support' }]);
+  return { inline_keyboard: rows };
+}
+
+function telegramShopDeliveredText(order, licenseKey, suffix) {
+  const paymentLabel = order.payment_method === 'okpay_usdt'
+    ? 'OKPay（USDT）'
+    : 'USDT-TRC20（波场）';
+  return [
+    '✅ 购买成功',
+    '',
+    `套餐：${escapeTelegramHtml(order.package_label)}`,
+    `<b>有效期：${escapeTelegramHtml(order.package_label)}</b>`,
+    `支付方式：${escapeTelegramHtml(paymentLabel)}`,
+    `实付金额：${escapeTelegramHtml(order.amount_usdt)} USDT`,
+    '',
+    '<b>卡密已生成！</b>',
+    '卡密（仅显示一次，请注意保存）',
+    `<code>${escapeTelegramHtml(licenseKey)}</code>`,
+    '',
+    '你的后台网站是 <b>YKF000.com</b>',
+    '为了你的隐私和客户安全',
+    '请保护好你的卡密，不要泄露！',
+    '',
+    '拓界云服不会向外展示或再次提供完整卡密。',
+    `卡密生效后，历史记录仅显示后五位：*****${escapeTelegramHtml(suffix)}`,
+    '',
+    '<b>请妥善保管；完整卡密不会再次自动展示，如需找回请联系平台管理员核验处理。</b>',
+  ].join('\n');
+}
+
+function telegramShopCopyKeyboard(licenseKey) {
+  return {
+    inline_keyboard: [[{
+      text: '📋 点击复制卡密',
+      copy_text: { text: licenseKey },
+    }]],
+  };
+}
+
+async function sendTelegramShopBlocked(chatId) {
+  const config = await getTelegramShopConfig().catch(() => ({ contacts: [] }));
+  await telegramApi('sendMessage', {
+    chat_id: chatId,
+    text: [
+      '<b>⛔ 检测到非法访问</b>',
+      '',
+      '你已被禁止使用本机器人。',
+      '如有疑问，请联系客服。',
+    ].join('\n'),
+    parse_mode: 'HTML',
+    reply_markup: telegramShopContactKeyboard(config.contacts),
+  }).catch(() => {});
+}
+
+async function sendTelegramShopAlert(text, replyMarkup = null) {
+  if (!TELEGRAM_ENABLED) return null;
+  const settings = await getPlatformSettings().catch(() => null);
+  if (!settings?.telegramGroupId) return null;
+  return sendTelegramNotification({
+    chat_id: settings.telegramGroupId,
+    text,
+    parse_mode: 'HTML',
+    link_preview_options: { is_disabled: true },
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+  }, { label: '售卡通知' });
+}
+
+async function sendTelegramShopSaleNotification(order) {
+  await sendTelegramShopAlert([
+    '<b>✅ 卡密销售成功</b>',
+    '',
+    `<b>用户</b>：${escapeTelegramHtml(order.display_name || '未设置姓名')}`,
+    `<b>Telegram ID</b>：<code>${escapeTelegramHtml(order.user_id)}</code>`,
+    `<b>套餐</b>：${escapeTelegramHtml(order.package_label)}`,
+    `<b>支付方式</b>：${order.payment_method === 'okpay_usdt' ? 'OKPay（USDT）' : 'USDT-TRC20（波场）'}`,
+    `<b>金额</b>：<code>${escapeTelegramHtml(order.amount_usdt)} USDT</code>`,
+    '<b>到账状态</b>：已到账',
+    '<b>发货状态</b>：已发货',
+    `<b>卡密</b>：<code>VIP-*****-*****-*****-${escapeTelegramHtml(order.license_suffix || '?????')}</code>`,
+    `<b>时间</b>：${escapeTelegramHtml(formatTelegramDate(order.delivered_at || order.paid_at))}`,
+  ].join('\n'));
+}
+
+async function sendTelegramShopOrderAlert(order, title, detail = '') {
+  const action = order?.id
+    ? [[
+        ...(order.payment_status !== 'underpaid'
+          ? [{ text: '✅ 人工确认发货', callback_data: `admin:order:approve:${order.id}` }]
+          : []),
+        { text: '❌ 标记不发货', callback_data: `admin:order:reject:${order.id}` },
+      ]]
+    : [];
+  await sendTelegramShopAlert([
+    `<b>${escapeTelegramHtml(title)}</b>`,
+    '',
+    `<b>订单</b>：<code>${escapeTelegramHtml(order?.id || '')}</code>`,
+    `<b>用户</b>：${escapeTelegramHtml(order?.display_name || '未设置姓名')}（<code>${escapeTelegramHtml(order?.user_id || '')}</code>）`,
+    `<b>套餐</b>：${escapeTelegramHtml(order?.package_label || '')}`,
+    `<b>金额</b>：<code>${escapeTelegramHtml(order?.amount_usdt || '')} USDT</code>`,
+    detail ? `<b>说明</b>：${escapeTelegramHtml(detail)}` : '',
+    `<b>时间</b>：${escapeTelegramHtml(formatTelegramDate(order?.updated_at || order?.created_at))}`,
+  ].filter(Boolean).join('\n'), action.length ? { inline_keyboard: action } : null);
+}
+
+async function fulfillTelegramShopOrder(orderId, { force = false } = {}) {
+  const client = await pool.connect();
+  let order;
+  let created;
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `SELECT * FROM telegram_shop_orders WHERE id=$1 FOR UPDATE`,
+      [orderId],
+    );
+    order = result.rows[0];
+    if (!order) {
+      await client.query('ROLLBACK');
+      return { state: 'missing' };
+    }
+    if (order.delivery_status === 'delivered') {
+      await client.query('COMMIT');
+      return { state: 'delivered' };
+    }
+    if (order.delivery_status === 'sending') {
+      await client.query('COMMIT');
+      return { state: 'sending' };
+    }
+    if (order.payment_status !== 'paid') {
+      await client.query('COMMIT');
+      return { state: order.payment_status };
+    }
+    const blocked = force ? { rows: [] } : await client.query(
+      `SELECT 1 FROM telegram_blocked_users WHERE user_id=$1 LIMIT 1`,
+      [order.user_id],
+    );
+    if (blocked.rows[0]) {
+      await client.query(
+        `UPDATE telegram_shop_orders SET delivery_status='paused',updated_at=NOW() WHERE id=$1`,
+        [order.id],
+      );
+      await client.query('COMMIT');
+      await sendTelegramShopOrderAlert(order, '⚠️ 被禁止用户付款已暂停发货', '用户已被封禁，等待管理员人工处理。');
+      return { state: 'paused' };
+    }
+    await client.query(
+      `UPDATE telegram_shop_orders SET delivery_status='sending',updated_at=NOW() WHERE id=$1`,
+      [order.id],
+    );
+    if (order.license_id) {
+      // A Telegram send can fail after the license transaction commits. Reuse
+      // that already-created card on manual retry; never generate a second
+      // card for one paid order.
+      const existingLicense = (await client.query(
+        `SELECT * FROM license_keys WHERE id=$1 FOR UPDATE`,
+        [order.license_id],
+      )).rows[0];
+      const existingKey = decryptLicenseKey(existingLicense?.key_ciphertext);
+      if (!existingLicense || !existingKey || existingLicense.status === 'revoked') {
+        throw new Error('订单已关联卡密，但完整卡密无法恢复，请管理员在后台核验。');
+      }
+      created = {
+        licenseKey: existingKey,
+        superLicenseKey: decryptLicenseKey(existingLicense.super_key_ciphertext),
+        row: existingLicense,
+        duration: LICENSE_DURATIONS[existingLicense.duration_code] || LICENSE_DURATIONS[order.duration_code],
+      };
+      order.license_suffix = existingLicense.key_suffix || existingKey.slice(-5);
+    } else {
+      created = await createLicenseRecord(order.duration_code, {
+        telegramChatId: order.chat_id,
+        telegramUserId: order.user_id,
+        telegramUsername: order.username,
+        telegramDisplayName: order.display_name,
+      }, client);
+      await client.query(
+        `UPDATE telegram_shop_orders
+         SET license_id=$2,license_suffix=$3,updated_at=NOW()
+         WHERE id=$1`,
+        [order.id, created.row.id, created.row.key_suffix || created.licenseKey.slice(-5)],
+      );
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+  if (!created) return { state: 'paused' };
+  try {
+    const sent = await telegramApi('sendMessage', {
+      chat_id: order.chat_id,
+      text: telegramShopDeliveredText(order, created.licenseKey, created.licenseKey.slice(-5)),
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+      reply_markup: telegramShopCopyKeyboard(created.licenseKey),
+    });
+    const result = await pool.query(
+      `UPDATE telegram_shop_orders
+       SET delivery_status='delivered',delivered_at=NOW(),updated_at=NOW()
+       WHERE id=$1 AND delivery_status='sending'
+       RETURNING *`,
+      [order.id],
+    );
+    const delivered = result.rows[0] || { ...order, ...result.rows[0] };
+    // Group notification is best-effort. It must never turn a successfully
+    // delivered customer message into a retryable delivery failure.
+    await sendTelegramShopSaleNotification(delivered).catch((notificationError) => {
+      console.error('售卡群通知发送失败：', cleanText(notificationError?.message, 240));
+    });
+    return { state: 'delivered', messageId: sent?.message_id || null };
+  } catch (error) {
+    await pool.query(
+      `UPDATE telegram_shop_orders SET delivery_status='failed',updated_at=NOW()
+       WHERE id=$1 AND delivery_status='sending'`,
+      [order.id],
+    ).catch(() => {});
+    await sendTelegramShopOrderAlert(order, '⚠️ 卡密已生成但私聊发货失败', '订单已暂停，管理员可以在后台核验后人工处理。');
+    // 不记录完整卡密；异常消息只保留通用错误。
+    console.error('售卡消息发送失败：', cleanText(error?.message, 240));
+    return { state: 'failed' };
+  }
+}
+
+async function markTelegramShopOrderPaid(orderId, payment = {}) {
+  const client = await pool.connect();
+  let order;
+  let shouldFulfill = false;
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `SELECT * FROM telegram_shop_orders WHERE id=$1 FOR UPDATE`,
+      [orderId],
+    );
+    order = result.rows[0];
+    if (!order) {
+      await client.query('COMMIT');
+      return { state: 'missing' };
+    }
+    if (order.payment_status === 'paid' || order.delivery_status === 'delivered') {
+      await client.query('COMMIT');
+      return { state: 'already_paid', order };
+    }
+    if (order.payment_method === 'okpay_usdt' && String(payment.userId || '') !== order.user_id) {
+      await client.query(
+        `UPDATE telegram_shop_orders
+         SET payment_status='manual',updated_at=NOW()
+         WHERE id=$1 AND payment_status='pending'`,
+        [order.id],
+      );
+      order.payment_status = 'manual';
+      await client.query('COMMIT');
+      await sendTelegramShopOrderAlert(order, '⚠️ OKPay付款用户不匹配', '已暂停自动发货，请管理员人工核验。');
+      return { state: 'manual' };
+    }
+    const expected = shopTokenAmount(order.amount_usdt);
+    const actual = shopTokenAmount(payment.amount);
+    if (expected == null || actual == null) throw new Error('支付金额格式无效。');
+    if (actual < expected) {
+      await client.query(`UPDATE telegram_shop_orders SET payment_status='underpaid',updated_at=NOW() WHERE id=$1`, [order.id]);
+      order.payment_status = 'underpaid';
+      await client.query('COMMIT');
+      await sendTelegramShopOrderAlert(order, '⚠️ 少付订单', `实际到账${payment.amount} USDT，订单要求不少于${order.amount_usdt} USDT。`);
+      return { state: 'underpaid' };
+    }
+    if (actual > expected) {
+      await client.query(
+        `UPDATE telegram_shop_orders SET payment_status='overpaid',txid=COALESCE($2,txid),updated_at=NOW() WHERE id=$1`,
+        [order.id, cleanText(payment.txid, 180) || null],
+      );
+      order.payment_status = 'overpaid';
+      await client.query('COMMIT');
+      await sendTelegramShopOrderAlert(order, '⚠️ 多付订单', '已暂停自动发货，可提交TxID或由管理员人工处理。');
+      return { state: 'overpaid' };
+    }
+    if (new Date(order.expires_at).getTime() <= Date.now()) {
+      await client.query(
+        `UPDATE telegram_shop_orders SET payment_status='late',txid=COALESCE($2,txid),updated_at=NOW() WHERE id=$1`,
+        [order.id, cleanText(payment.txid, 180) || null],
+      );
+      order.payment_status = 'late';
+      await client.query('COMMIT');
+      await sendTelegramShopOrderAlert(order, '⚠️ 晚到账订单', '订单已超过20分钟有效期，暂停自动发货。');
+      return { state: 'late' };
+    }
+    const updated = await client.query(
+      `UPDATE telegram_shop_orders
+       SET payment_status='paid',txid=COALESCE($2,txid),paid_at=NOW(),updated_at=NOW()
+       WHERE id=$1 AND payment_status='pending'
+       RETURNING *`,
+      [order.id, cleanText(payment.txid, 180) || null],
+    );
+    order = updated.rows[0] || order;
+    shouldFulfill = true;
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+  if (shouldFulfill) return fulfillTelegramShopOrder(order.id);
+  return { state: 'unchanged', order };
+}
+
+async function fetchTronUsdtTransfers(walletAddress) {
+  if (!TRONGRID_API_KEY) throw new Error('TRONGRID_API_KEY未配置。');
+  const url = new URL(
+    `/v1/accounts/${encodeURIComponent(walletAddress)}/transactions/trc20`,
+    TRONGRID_API_BASE,
+  );
+  url.searchParams.set('limit', '200');
+  url.searchParams.set('only_confirmed', 'true');
+  url.searchParams.set('contract_address', TRON_USDT_CONTRACT);
+  const response = await fetch(url, {
+    headers: {
+      Accept: 'application/json',
+      'TRON-PRO-API-KEY': TRONGRID_API_KEY,
+      'User-Agent': 'tuojie-cloud-sale-bot/1.0',
+    },
+    signal: AbortSignal.timeout(12_000),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    throw new Error(`TronGrid返回状态${response.status}`);
+  }
+  return Array.isArray(body?.data) ? body.data : [];
+}
+
+function tronTransferMatchesOrder(transfer, order) {
+  const contract = String(
+    transfer?.token_info?.address || transfer?.token_info?.contract_address || '',
+  );
+  if (contract && contract !== TRON_USDT_CONTRACT) return false;
+  if (String(transfer?.to || '') !== String(order.wallet_address || '')) return false;
+  let amount;
+  try {
+    amount = shopTokenAmount(
+      shopFormatUnits(BigInt(String(transfer?.value || '0')), 6, true),
+    );
+  } catch {
+    return false;
+  }
+  const expected = shopTokenAmount(order.amount_usdt);
+  if (amount == null || expected == null || amount !== expected) return false;
+  const timestamp = Number(transfer?.block_timestamp || 0);
+  const createdAt = new Date(order.created_at).getTime() - 60_000;
+  const expiresAt = new Date(order.expires_at).getTime() + 60_000;
+  return timestamp >= createdAt && timestamp <= expiresAt;
+}
+
+async function processTelegramShopTronPayments() {
+  if (telegramShopTronPollPromise) return telegramShopTronPollPromise;
+  telegramShopTronPollPromise = (async () => {
+    if (!TRONGRID_API_KEY) return;
+    const client = await pool.connect();
+    let locked = false;
+    try {
+      const lock = await client.query(
+        `SELECT pg_try_advisory_lock(hashtext('tuojie-shop-tron-poll')) AS locked`,
+      );
+      locked = Boolean(lock.rows[0]?.locked);
+      if (!locked) return;
+      await client.query(
+        `UPDATE telegram_shop_orders
+         SET payment_status='expired',updated_at=NOW()
+         WHERE payment_status='pending' AND expires_at<=NOW()`,
+      );
+      const pending = await client.query(
+        `SELECT * FROM telegram_shop_orders
+         WHERE payment_method='usdt_trc20' AND payment_status='pending'
+         ORDER BY created_at ASC LIMIT 500`,
+      );
+      const wallets = [...new Set(pending.rows.map((row) => row.wallet_address).filter(Boolean))];
+      for (const wallet of wallets) {
+        let transfers;
+        try {
+          transfers = await fetchTronUsdtTransfers(wallet);
+        } catch (error) {
+          console.error('TronGrid查询失败：', cleanText(error?.message, 240));
+          continue;
+        }
+        for (const order of pending.rows.filter((row) => row.wallet_address === wallet)) {
+          const transfer = transfers.find((item) => tronTransferMatchesOrder(item, order));
+          if (!transfer) continue;
+          const txid = cleanText(transfer.transaction_id || transfer.txID, 180);
+          if (!txid) continue;
+          await markTelegramShopOrderPaid(order.id, {
+            userId: order.user_id,
+            amount: order.amount_usdt,
+            txid,
+          }).catch((error) => {
+            console.error('USDT订单入账失败：', cleanText(error?.message, 240));
+          });
+        }
+      }
+    } finally {
+      if (locked) await client.query(`SELECT pg_advisory_unlock(hashtext('tuojie-shop-tron-poll'))`).catch(() => {});
+      client.release();
+    }
+  })().catch((error) => {
+    console.error('USDT轮询任务失败：', cleanText(error?.message, 240));
+  }).finally(() => {
+    telegramShopTronPollPromise = null;
+  });
+  return telegramShopTronPollPromise;
+}
+
+async function verifyTronTxidForShopOrder(orderId, userId, txid) {
+  const cleanTxid = cleanText(txid, 180).trim();
+  if (!/^[A-Fa-f0-9]{32,128}$/.test(cleanTxid)) {
+    throw new Error('TxID格式不正确。');
+  }
+  const result = await pool.query(
+    `SELECT * FROM telegram_shop_orders WHERE id=$1 AND user_id=$2`,
+    [orderId, String(userId || '')],
+  );
+  const order = result.rows[0];
+  if (!order) throw new Error('订单不存在或不属于当前用户。');
+  if (order.payment_method !== 'usdt_trc20') {
+    throw new Error('OKPay订单请联系客服人工核验，不需要提交波场TxID。');
+  }
+  if (!['expired', 'overpaid', 'late', 'manual'].includes(order.payment_status)) {
+    throw new Error('当前订单不需要提交TxID。');
+  }
+  const transfers = await fetchTronUsdtTransfers(order.wallet_address);
+  const transfer = transfers.find((item) =>
+    String(item.transaction_id || item.txID || '').toLowerCase() === cleanTxid.toLowerCase() &&
+    String(item.to || '') === String(order.wallet_address || '') &&
+    String(item.token_info?.address || '') === TRON_USDT_CONTRACT,
+  );
+  if (!transfer) throw new Error('暂未在已确认的USDT-TRC20记录中找到该TxID。');
+  const actual = shopFormatUnits(BigInt(String(transfer.value || '0')), 6, true);
+  await pool.query(
+    `UPDATE telegram_shop_orders
+     SET txid=$2,payment_status='manual',updated_at=NOW()
+     WHERE id=$1 AND txid IS NULL`,
+    [order.id, cleanTxid],
+  );
+  const refreshed = (await pool.query(`SELECT * FROM telegram_shop_orders WHERE id=$1`, [order.id])).rows[0] || order;
+  await sendTelegramShopOrderAlert(refreshed, '⚠️ 用户提交了USDT TxID', `链上确认金额：${actual} USDT，请管理员人工处理。`);
+  return refreshed;
+}
+
+async function handleOkpayShopCallback(req, res) {
+  const body = await readJson(req, 128 * 1024);
+  if (!verifyOkpayCallback(body)) {
+    return sendError(res, 400, 'OKPay回调签名无效。', 'OKPAY_SIGNATURE');
+  }
+  const data = body.data || {};
+  if (data.type !== 'deposit' || Number(data.status) !== 1) {
+    return sendJson(res, 200, { ok: true });
+  }
+  if (String(data.coin || '').toUpperCase() !== 'USDT') {
+    return sendJson(res, 200, { ok: true });
+  }
+  const uniqueId = cleanText(data.unique_id, 160);
+  const providerOrderId = cleanText(data.order_id, 160);
+  const found = await pool.query(
+    `SELECT id FROM telegram_shop_orders
+     WHERE okpay_unique_id=$1 OR okpay_order_id=$2
+     LIMIT 1`,
+    [uniqueId || null, providerOrderId || null],
+  );
+  if (!found.rows[0]) return sendJson(res, 200, { ok: true });
+  await pool.query(
+    `UPDATE telegram_shop_orders SET okpay_order_id=COALESCE(okpay_order_id,$2),updated_at=NOW()
+     WHERE id=$1`,
+    [found.rows[0].id, providerOrderId || null],
+  );
+  await markTelegramShopOrderPaid(found.rows[0].id, {
+    userId: String(data.pay_user_id || ''),
+    amount: String(data.amount || ''),
+  });
+  // 不保存OKPay原始回调JSON；只保留订单状态和必要的供应商订单号。
+  return sendJson(res, 200, { ok: true });
+}
+
+async function recordTelegramShopIllegalAttempt(callback, action) {
+  const target = callback?.from || {};
+  const userId = String(target.id || '');
+  if (!/^\d+$/.test(userId)) return;
+  const updated = await pool.query(
+    `INSERT INTO telegram_shop_illegal_attempts(
+       user_id,username,display_name,attempt_count,last_action,last_at,updated_at
+     ) VALUES($1,$2,$3,1,$4,NOW(),NOW())
+     ON CONFLICT(user_id) DO UPDATE SET
+       username=EXCLUDED.username,display_name=EXCLUDED.display_name,
+       attempt_count=telegram_shop_illegal_attempts.attempt_count+1,
+       last_action=EXCLUDED.last_action,last_at=NOW(),updated_at=NOW()
+     RETURNING *`,
+    [userId, cleanText(target.username, 80), telegramDisplayName(target), cleanText(action, 120)],
+  );
+  const row = updated.rows[0];
+  const settings = await getPlatformSettings().catch(() => null);
+  if (settings?.telegramGroupId) {
+    const sent = await telegramApi('sendMessage', {
+      chat_id: settings.telegramGroupId,
+      text: [
+        '<b>⚠️ 检测到未授权管理员操作</b>',
+        '',
+        `<b>用户</b>：${escapeTelegramHtml(row.display_name || '未设置姓名')}`,
+        `<b>用户名</b>：${row.username ? `@${escapeTelegramHtml(row.username)}` : '未设置'}`,
+        `<b>Telegram ID</b>：<code>${escapeTelegramHtml(userId)}</code>`,
+        `<b>尝试操作</b>：${escapeTelegramHtml(row.last_action)}`,
+        `<b>累计次数</b>：<code>${Number(row.attempt_count || 1)}</code>`,
+        `<b>时间</b>：${escapeTelegramHtml(formatTelegramDate(row.last_at))}`,
+      ].join('\n'),
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [[{
+          text: '🚫 禁止他访问机器人',
+          callback_data: `admin:block:${userId}`,
+        }]],
+      },
+    }).catch(() => null);
+    if (sent?.message_id) {
+      await pool.query(
+        `UPDATE telegram_shop_illegal_attempts
+         SET telegram_chat_id=$2,telegram_message_id=$3,updated_at=NOW()
+         WHERE user_id=$1`,
+        [userId, String(settings.telegramGroupId), sent.message_id],
+      ).catch(() => {});
+    }
+  }
+  await telegramApi('answerCallbackQuery', {
+    callback_query_id: callback.id,
+    text: '检测到未授权操作，已通知管理员。',
+    show_alert: true,
+  }).catch(() => {});
+}
+
+async function telegramShopAdminAuthorized(callback, action) {
+  const chat = callback?.message?.chat;
+  const userId = callback?.from?.id;
+  if (await telegramOperatorAllowedAsync(chat, userId)) return true;
+  await recordTelegramShopIllegalAttempt(callback, action);
+  return false;
+}
+
+async function blockTelegramShopUser(operatorCallback, targetUserId) {
+  const target = String(targetUserId || '');
+  if (!/^\d+$/.test(target)) throw new Error('目标用户ID无效。');
+  const userChat = await telegramApi('getChat', { chat_id: target }).catch(() => ({}));
+  await pool.query(
+    `INSERT INTO telegram_blocked_users(
+       user_id,username,display_name,reason,blocked_by_telegram_user_id,
+       illegal_attempts,last_attempt_at,updated_at
+     ) VALUES($1,$2,$3,$4,$5,0,NOW(),NOW())
+     ON CONFLICT(user_id) DO UPDATE SET
+       username=EXCLUDED.username,display_name=EXCLUDED.display_name,
+       reason=EXCLUDED.reason,
+       blocked_by_telegram_user_id=EXCLUDED.blocked_by_telegram_user_id,
+       updated_at=NOW()`,
+    [
+      target,
+      cleanText(userChat.username, 80),
+      telegramDisplayName(userChat),
+      '管理员封禁未授权管理员操作',
+      String(operatorCallback?.from?.id || ''),
+    ],
+  );
+  telegramBlockedUserCache.set(target, {
+    blocked: true,
+    expiresAt: Number.POSITIVE_INFINITY,
+  });
+  await pool.query(
+    `UPDATE telegram_shop_orders
+     SET delivery_status='paused',updated_at=NOW()
+     WHERE user_id=$1 AND payment_status='paid' AND delivery_status IN ('pending','sending')`,
+    [target],
+  );
+  await sendTelegramShopBlocked(target);
+  await telegramApi('answerCallbackQuery', {
+    callback_query_id: operatorCallback.id,
+    text: '已禁止该用户访问机器人。',
+    show_alert: true,
+  }).catch(() => {});
+  await telegramApi('editMessageReplyMarkup', {
+    chat_id: operatorCallback.message.chat.id,
+    message_id: operatorCallback.message.message_id,
+    reply_markup: { inline_keyboard: [[{ text: '✅ 已禁止访问', callback_data: 'admin:no-op' }]] },
+  }).catch(() => {});
+}
+
+async function sendTelegramShopAdminContacts(chatId) {
+  const config = await getTelegramShopConfig();
+  const lines = [
+    '<b>👤 客服设置</b>',
+    '',
+    '发送格式：客服名称|@用户名 或 客服名称|https://t.me/用户名',
+    '例如：售前客服|@example',
+    '选择“关闭”可停用该客服位。',
+    '',
+  ];
+  for (let index = 0; index < 3; index += 1) {
+    const item = config.contacts[index];
+    lines.push(`${index + 1}. ${item?.enabled ? `${item.name}｜${item.value}` : '未设置'}`);
+  }
+  await telegramApi('sendMessage', {
+    chat_id: chatId,
+    text: lines.join('\n'),
+    parse_mode: 'HTML',
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: '客服1', callback_data: 'admin:contact:1' },
+          { text: '客服2', callback_data: 'admin:contact:2' },
+          { text: '客服3', callback_data: 'admin:contact:3' },
+        ],
+        [{ text: '⬅️ 返回设置', callback_data: 'shop:admin' }],
+      ],
+    },
+  });
+}
+
+async function sendTelegramShopAbnormalOrders(chatId) {
+  const result = await pool.query(
+    `SELECT * FROM telegram_shop_orders
+     WHERE payment_status IN ('overpaid','late','manual','underpaid')
+        OR delivery_status IN ('paused','failed','sending')
+     ORDER BY updated_at DESC LIMIT 20`,
+  );
+  const lines = ['<b>⚠️ 异常订单（最近20条）</b>', ''];
+  if (!result.rows.length) lines.push('暂无异常订单。');
+  for (const row of result.rows) {
+    lines.push(
+      `订单：<code>${escapeTelegramHtml(row.id)}</code>`,
+      `用户：${escapeTelegramHtml(row.display_name || '未设置姓名')}（${escapeTelegramHtml(row.user_id)}）`,
+      `套餐：${escapeTelegramHtml(row.package_label)}｜金额：${escapeTelegramHtml(row.amount_usdt)} USDT`,
+      `支付：${escapeTelegramHtml(row.payment_status)}｜发货：${escapeTelegramHtml(row.delivery_status)}`,
+      '',
+    );
+  }
+  await telegramApi('sendMessage', {
+    chat_id: chatId,
+    text: lines.join('\n'),
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [[{ text: '⬅️ 返回设置', callback_data: 'shop:admin' }]] },
+  });
+}
+
+async function handleTelegramShopAdminText(message) {
+  const userId = String(message.from?.id || '');
+  if (!TELEGRAM_ALLOWED_USER_IDS.has(userId)) return false;
+  const session = await getTelegramShopSession(userId);
+  if (!session.state.startsWith('admin_')) return false;
+  const raw = String(message.text || '').trim();
+  if (session.state === 'admin_price') {
+    const code = session.payload?.durationCode;
+    if (!TELEGRAM_SHOP_DURATION_CODES.includes(code)) return false;
+    if (/^(关闭|下架|停用)$/i.test(raw)) {
+      const config = await getTelegramShopConfig();
+      config.products[code].enabled = false;
+      await updateTelegramShopConfig({ products: config.products });
+      await clearTelegramShopSession(userId);
+      await telegramApi('sendMessage', { chat_id: message.chat.id, text: `${TELEGRAM_SHOP_PRODUCT_LABELS[code]}已下架。`, reply_markup: telegramShopAdminKeyboard(await getTelegramShopConfig()) });
+      return true;
+    }
+    const price = shopNormalizeBasePrice(raw);
+    if (!price) {
+      await telegramApi('sendMessage', { chat_id: message.chat.id, text: '价格格式不正确，请输入最多两位小数的USDT金额，例如 10 或 10.50。' });
+      return true;
+    }
+    const config = await getTelegramShopConfig();
+    config.products[code] = { label: TELEGRAM_SHOP_PRODUCT_LABELS[code], price, enabled: true };
+    await updateTelegramShopConfig({ products: config.products });
+    await clearTelegramShopSession(userId);
+    await telegramApi('sendMessage', { chat_id: message.chat.id, text: `✅ ${TELEGRAM_SHOP_PRODUCT_LABELS[code]}价格已设置为 ${price} USDT，并已上架。`, reply_markup: telegramShopAdminKeyboard(await getTelegramShopConfig()) });
+    return true;
+  }
+  if (session.state === 'admin_wallet') {
+    if (/^(清空|关闭|停用)$/i.test(raw)) {
+      await updateTelegramShopConfig({ tronWalletAddress: '', tronEnabled: false });
+      await clearTelegramShopSession(userId);
+      await telegramApi('sendMessage', { chat_id: message.chat.id, text: 'USDT-TRC20钱包已清空并关闭。', reply_markup: telegramShopAdminKeyboard(await getTelegramShopConfig()) });
+      return true;
+    }
+    const wallet = normalizeTronWallet(raw);
+    if (!wallet) {
+      await telegramApi('sendMessage', { chat_id: message.chat.id, text: '波场地址格式不正确，请发送T开头的TRC20地址。' });
+      return true;
+    }
+    await updateTelegramShopConfig({ tronWalletAddress: wallet });
+    await clearTelegramShopSession(userId);
+    await telegramApi('sendMessage', { chat_id: message.chat.id, text: `✅ USDT-TRC20收款地址已更新：\n<code>${escapeTelegramHtml(wallet)}</code>\n\n旧订单仍使用旧地址，新订单使用新地址。`, parse_mode: 'HTML', reply_markup: telegramShopAdminKeyboard(await getTelegramShopConfig()) });
+    return true;
+  }
+  if (session.state === 'admin_contact') {
+    const slot = Number(session.payload?.slot || 0);
+    if (!Number.isInteger(slot) || slot < 1 || slot > 3) return false;
+    const config = await getTelegramShopConfig();
+    const contacts = [...config.contacts];
+    while (contacts.length < slot) contacts.push(null);
+    if (/^(关闭|停用|清空)$/i.test(raw)) {
+      contacts[slot - 1] = null;
+    } else {
+      const [name, value] = raw.split('|').map((item) => item.trim());
+      const contact = normalizeShopContact({ name, value, enabled: true });
+      if (!contact) {
+        await telegramApi('sendMessage', { chat_id: message.chat.id, text: '格式不正确，请使用：客服名称|@用户名 或 客服名称|https://t.me/用户名' });
+        return true;
+      }
+      contacts[slot - 1] = contact;
+    }
+    await updateTelegramShopConfig({ contacts });
+    await clearTelegramShopSession(userId);
+    await sendTelegramShopAdminContacts(message.chat.id);
+    return true;
+  }
+  return false;
+}
+
+async function handleTelegramShopPrivateInbound(message) {
+  if (message?.chat?.type !== 'private' || message?.from?.is_bot) return false;
+  const userId = String(message.from?.id || '');
+  if (!/^\d+$/.test(userId)) return true;
+  if (await telegramUserIsBlocked(userId)) {
+    await sendTelegramShopBlocked(message.chat.id);
+    return true;
+  }
+  if (TELEGRAM_ALLOWED_USER_IDS.has(userId)) {
+    if (await handleTelegramShopAdminText(message)) return true;
+  }
+  const raw = String(message.text || '').trim();
+  if (['/start', '/help', '开始', '菜单', '购买卡密'].includes(raw.toLowerCase())) {
+    if (raw.toLowerCase() === '/help') {
+      await telegramApi('sendMessage', {
+        chat_id: message.chat.id,
+        text: telegramShopHelpText(),
+        parse_mode: 'HTML',
+        reply_markup: telegramShopMainKeyboard(TELEGRAM_ALLOWED_USER_IDS.has(userId)),
+      });
+    } else {
+      await sendTelegramShopMenu(message.chat.id, userId, message);
+    }
+    return true;
+  }
+  const session = await getTelegramShopSession(userId);
+  if (session.state === 'query_key') {
+    const key = normalizeLicenseKey(raw);
+    const hash = hashLicenseKey(key);
+    const result = await pool.query(
+      `SELECT id,tenant_id,status,expires_at,duration_code
+       FROM license_keys WHERE key_hash=$1 OR super_key_hash=$1 LIMIT 1`,
+      [hash],
+    );
+    const license = result.rows[0];
+    if (!license || license.status !== 'active' || !license.tenant_id ||
+        (license.expires_at && new Date(license.expires_at).getTime() <= Date.now())) {
+      await telegramApi('sendMessage', { chat_id: message.chat.id, text: '卡密无效、未激活或已到期，请发送已激活的普通卡密。' });
+      return true;
+    }
+    await setTelegramShopSession(userId, 'query_window', { licenseId: license.id });
+    await telegramApi('sendMessage', {
+      chat_id: message.chat.id,
+      text: '✅ 卡密验证成功，请选择要查询的时间范围：',
+      reply_markup: telegramShopWindowKeyboard(),
+    });
+    return true;
+  }
+  if (session.state.startsWith('txid:')) {
+    const orderId = session.state.slice(5);
+    try {
+      await verifyTronTxidForShopOrder(orderId, userId, raw);
+      await clearTelegramShopSession(userId);
+      await telegramApi('sendMessage', { chat_id: message.chat.id, text: '✅ TxID已记录，订单已转管理员人工核验，请等待通知。', reply_markup: telegramShopMainKeyboard(false) });
+    } catch (error) {
+      await telegramApi('sendMessage', { chat_id: message.chat.id, text: `❌ ${cleanText(error.message, 240)}` });
+    }
+    return true;
+  }
+  if (['购买卡密', '买卡', '购买'].includes(raw)) {
+    const config = await getTelegramShopConfig();
+    await telegramApi('sendMessage', { chat_id: message.chat.id, text: telegramShopPurchaseText(config.products), parse_mode: 'HTML', reply_markup: telegramShopPackageKeyboard(config) });
+    return true;
+  }
+  return false;
+}
+
+async function handleTelegramShopCallback(callback) {
+  const data = String(callback?.data || '');
+  const chat = callback?.message?.chat;
+  const chatId = chat?.id;
+  const userId = String(callback?.from?.id || '');
+  if (!data.startsWith('shop:') && !data.startsWith('admin:')) return false;
+  if (await telegramUserIsBlocked(userId)) {
+    await telegramApi('answerCallbackQuery', { callback_query_id: callback.id, text: '你已被禁止使用本机器人。', show_alert: true }).catch(() => {});
+    await sendTelegramShopBlocked(chatId);
+    return true;
+  }
+  if (data.startsWith('admin:')) {
+    if (!(await telegramShopAdminAuthorized(callback, data.slice(6)))) return true;
+    const parts = data.split(':');
+    if (data === 'admin:no-op') return true;
+    if (parts[1] === 'price' && TELEGRAM_SHOP_DURATION_CODES.includes(parts[2])) {
+      await setTelegramShopSession(userId, 'admin_price', { durationCode: parts[2] });
+      await telegramApi('answerCallbackQuery', { callback_query_id: callback.id }).catch(() => {});
+      await telegramApi('sendMessage', { chat_id: chatId, text: `请输入${TELEGRAM_SHOP_PRODUCT_LABELS[parts[2]]}价格（USDT，最多两位小数）。\n发送“下架”可关闭该套餐。` });
+      return true;
+    }
+    if (data === 'admin:wallet') {
+      await setTelegramShopSession(userId, 'admin_wallet');
+      await telegramApi('answerCallbackQuery', { callback_query_id: callback.id }).catch(() => {});
+      await telegramApi('sendMessage', { chat_id: chatId, text: '请发送新的USDT-TRC20收款地址。\n发送“清空”可关闭链上收款。' });
+      return true;
+    }
+    if (data === 'admin:contacts') {
+      await telegramApi('answerCallbackQuery', { callback_query_id: callback.id }).catch(() => {});
+      await sendTelegramShopAdminContacts(chatId);
+      return true;
+    }
+    if (parts[1] === 'contact' && /^[123]$/.test(parts[2])) {
+      await setTelegramShopSession(userId, 'admin_contact', { slot: Number(parts[2]) });
+      await telegramApi('answerCallbackQuery', { callback_query_id: callback.id }).catch(() => {});
+      await telegramApi('sendMessage', { chat_id: chatId, text: `请发送客服${parts[2]}，格式：客服名称|@用户名\n发送“关闭”停用该客服。` });
+      return true;
+    }
+    if (parts[1] === 'toggle' && ['okpay', 'tron'].includes(parts[2])) {
+      const config = await getTelegramShopConfig();
+      if (parts[2] === 'tron' && !config.configuredTronApi) {
+        await telegramApi('answerCallbackQuery', { callback_query_id: callback.id, text: '尚未配置TRONGRID_API_KEY。', show_alert: true });
+        return true;
+      }
+      await updateTelegramShopConfig(parts[2] === 'okpay'
+        ? { okpayEnabled: !config.okpayEnabled }
+        : { tronEnabled: !config.tronEnabled });
+      await telegramApi('answerCallbackQuery', { callback_query_id: callback.id, text: '设置已更新。' }).catch(() => {});
+      await telegramApi('sendMessage', { chat_id: chatId, text: '✅ 支付设置已更新。', reply_markup: telegramShopAdminKeyboard(await getTelegramShopConfig()) });
+      return true;
+    }
+    if (parts[1] === 'block' && /^\d+$/.test(parts[2])) {
+      await blockTelegramShopUser(callback, parts[2]);
+      return true;
+    }
+    if (parts[1] === 'order' && ['approve', 'reject'].includes(parts[2]) && isUuid(parts[3])) {
+      const result = await pool.query(`SELECT * FROM telegram_shop_orders WHERE id=$1`, [parts[3]]);
+      const order = result.rows[0];
+      if (!order) {
+        await telegramApi('answerCallbackQuery', { callback_query_id: callback.id, text: '订单不存在。', show_alert: true });
+        return true;
+      }
+      if (parts[2] === 'reject') {
+        await pool.query(`UPDATE telegram_shop_orders SET payment_status='failed',delivery_status='paused',updated_at=NOW() WHERE id=$1 AND delivery_status<>'delivered'`, [order.id]);
+        await telegramApi('answerCallbackQuery', { callback_query_id: callback.id, text: '已标记不发货。', show_alert: true });
+        return true;
+      }
+      const approvable =
+        (['overpaid', 'late', 'manual'].includes(order.payment_status)) ||
+        (order.payment_status === 'paid' && ['paused', 'failed'].includes(order.delivery_status));
+      if (!approvable || order.payment_status === 'underpaid') {
+        await telegramApi('answerCallbackQuery', { callback_query_id: callback.id, text: '少付或未确认到账的订单不能人工发货。', show_alert: true });
+        return true;
+      }
+      await pool.query(`UPDATE telegram_shop_orders SET payment_status='paid',delivery_status='pending',paid_at=COALESCE(paid_at,NOW()),updated_at=NOW() WHERE id=$1 AND delivery_status<>'delivered'`, [order.id]);
+      const resultState = await fulfillTelegramShopOrder(order.id, { force: true });
+      await telegramApi('answerCallbackQuery', { callback_query_id: callback.id, text: resultState.state === 'delivered' ? '已确认并发货。' : `处理结果：${resultState.state}`, show_alert: true });
+      return true;
+    }
+    return true;
+  }
+  const parts = data.split(':');
+  await telegramApi('answerCallbackQuery', { callback_query_id: callback.id }).catch(() => {});
+  if (data === 'shop:menu') {
+    await sendTelegramShopMenu(chatId, userId);
+    return true;
+  }
+  if (data === 'shop:buy') {
+    const config = await getTelegramShopConfig();
+    await telegramApi('sendMessage', { chat_id: chatId, text: telegramShopPurchaseText(config.products), parse_mode: 'HTML', reply_markup: telegramShopPackageKeyboard(config) });
+    return true;
+  }
+  if (data === 'shop:help') {
+    await telegramApi('sendMessage', { chat_id: chatId, text: telegramShopHelpText(), parse_mode: 'HTML', reply_markup: telegramShopMainKeyboard(TELEGRAM_ALLOWED_USER_IDS.has(userId)) });
+    return true;
+  }
+  if (data === 'shop:support') {
+    await sendTelegramShopSupport(chatId);
+    return true;
+  }
+  if (data === 'shop:admin') {
+    if (!(await telegramShopAdminAuthorized(callback, '打开机器人设置'))) return true;
+    await telegramApi('sendMessage', { chat_id: chatId, text: '<b>⚙️ 机器人设置</b>\n\n价格只对新订单生效；未付款旧订单保留原金额。', parse_mode: 'HTML', reply_markup: telegramShopAdminKeyboard(await getTelegramShopConfig()) });
+    return true;
+  }
+  if (data === 'shop:query') {
+    await setTelegramShopSession(userId, 'query_key');
+    await telegramApi('sendMessage', { chat_id: chatId, text: '请发送你要查询的已激活普通卡密。' });
+    return true;
+  }
+  if (parts[1] === 'pkg' && TELEGRAM_SHOP_DURATION_CODES.includes(parts[2])) {
+    const config = await getTelegramShopConfig();
+    const product = config.products[parts[2]];
+    if (!product?.enabled) {
+      await telegramApi('answerCallbackQuery', { callback_query_id: callback.id, text: '该套餐已下架。', show_alert: true });
+      return true;
+    }
+    await telegramApi('sendMessage', { chat_id: chatId, text: telegramShopPaymentText(product), parse_mode: 'HTML', reply_markup: telegramShopPaymentKeyboard(config, parts[2]) });
+    return true;
+  }
+  if (parts[1] === 'pay' && TELEGRAM_SHOP_DURATION_CODES.includes(parts[2]) && ['okpay_usdt', 'usdt_trc20'].includes(parts[3])) {
+    try {
+      const result = await createTelegramShopOrder({ from: callback.from, chat: callback.message.chat }, parts[2], parts[3]);
+      await telegramApi('sendMessage', { chat_id: chatId, text: telegramShopOrderText(result.order, result.link?.payUrl), parse_mode: 'HTML', reply_markup: telegramShopOrderKeyboard(result.order, result.link?.payUrl) });
+    } catch (error) {
+      await telegramApi('sendMessage', { chat_id: chatId, text: `❌ ${cleanText(error.message, 240)}` });
+    }
+    return true;
+  }
+  if (parts[1] === 'check' && isUuid(parts[2])) {
+    const result = await pool.query(`SELECT * FROM telegram_shop_orders WHERE id=$1 AND user_id=$2`, [parts[2], userId]);
+    const order = result.rows[0];
+    if (!order) {
+      await telegramApi('sendMessage', { chat_id: chatId, text: '订单不存在或不属于当前用户。' });
+      return true;
+    }
+    if (order.payment_status === 'expired' || order.payment_status === 'overpaid' || order.payment_status === 'late' || order.payment_status === 'manual') {
+      if (order.payment_method !== 'usdt_trc20') {
+        await telegramApi('sendMessage', { chat_id: chatId, text: '该OKPay订单已转人工核验，请联系客服；无需提交波场TxID。' });
+        return true;
+      }
+      await setTelegramShopSession(userId, `txid:${order.id}`);
+      await telegramApi('sendMessage', { chat_id: chatId, text: '如有TxID，请直接发送TxID；不提交也可以等待管理员人工处理。' });
+    } else {
+      await telegramApi('sendMessage', { chat_id: chatId, text: `订单状态：${order.payment_status === 'pending' ? '等待到账' : order.delivery_status === 'delivered' ? '已发货' : order.payment_status}` });
+    }
+    return true;
+  }
+  if (parts[1] === 'window' && /^\d+$/.test(parts[2])) {
+    const hours = Number(parts[2]);
+    const session = await getTelegramShopSession(userId);
+    if (session.state !== 'query_window' || !isUuid(session.payload?.licenseId)) {
+      await telegramApi('sendMessage', { chat_id: chatId, text: '查询会话已过期，请重新点击查询新增访客。' });
+      return true;
+    }
+    const license = (await pool.query(`SELECT tenant_id FROM license_keys WHERE id=$1 AND status='active'`, [session.payload.licenseId])).rows[0];
+    if (!license?.tenant_id) {
+      await telegramApi('sendMessage', { chat_id: chatId, text: '卡密当前没有可查询的商家。' });
+      return true;
+    }
+    const retention = (await pool.query(`SELECT retention_hours FROM tenant_config WHERE tenant_id=$1`, [license.tenant_id])).rows[0]?.retention_hours;
+    const actualHours = Math.min(hours, Math.max(1, Number(retention || 24)));
+    const count = (await pool.query(
+      `SELECT COUNT(*)::int AS count FROM conversations
+       WHERE tenant_id=$1 AND created_at >= NOW()-($2::int*INTERVAL '1 hour')`,
+      [license.tenant_id, actualHours],
+    )).rows[0]?.count || 0;
+    await clearTelegramShopSession(userId);
+    const requestedLabel = hours >= 24 ? `${Math.round(hours / 24)}天` : `${hours}小时`;
+    const actualLabel = actualHours >= 24 && actualHours % 24 === 0 ? `${actualHours / 24}天` : `${actualHours}小时`;
+    const lines = [`<b>📊 新增访客统计</b>`, '', `你选择查询最近${requestedLabel}的新增访客。`];
+    if (actualHours < hours) lines.push(`当前商家后台仅保留最近${actualLabel}的访客记录，超过部分已按设置清理，因此本次只能统计最近${actualLabel}。`);
+    lines.push(`统计结果：新增访客 <b>${Number(count)}</b> 人。`);
+    await telegramApi('sendMessage', { chat_id: chatId, text: lines.join('\n'), parse_mode: 'HTML', reply_markup: telegramShopMainKeyboard(TELEGRAM_ALLOWED_USER_IDS.has(userId)) });
+    return true;
+  }
+  return true;
+}
+
 function telegramGenerateKeyboard() {
   return {
     inline_keyboard: [
@@ -10943,7 +13753,7 @@ function claimTelegramGeneration(callback) {
 
 function telegramGeneratedLicenseText(created) {
   return [
-    '<b>普通卡密和管理员超级卡密已生成</b>',
+    '<b>卡密已生成！</b>',
     '你的后台网站是 <b>YKF000.com</b>',
     '为了你的隐私和客户安全',
     '请保护好你的卡密 不要泄露！',
@@ -10951,17 +13761,12 @@ function telegramGeneratedLicenseText(created) {
     `卡密类型：${created.duration.label}`,
     `有效时长：首次登录后台后 ${licenseUnusedDurationLabel(created.row)}`,
     '',
-    '<b>普通卡密（发给租户）</b>',
+    '<b>你的卡密是（点击即可复制）</b>',
     `<code>${created.licenseKey}</code>`,
-    '',
-    '<b>管理员超级卡密（禁止发给租户）</b>',
-    `<code>${created.superLicenseKey || '历史卡密未生成'}</code>`,
-    '',
-    `普通卡密设备上限：电脑 ${Number(created.row.max_desktop_devices || LICENSE_DESKTOP_DEVICE_DEFAULT)} 台｜手机/平板 ${Number(created.row.max_mobile_devices || LICENSE_MOBILE_DEVICE_DEFAULT)} 台`,
   ].join('\n');
 }
 
-function telegramGeneratedLicenseKeyboard(licenseKey, superLicenseKey = '') {
+function telegramGeneratedLicenseKeyboard(licenseKey) {
   return {
     inline_keyboard: [
       [
@@ -10970,12 +13775,6 @@ function telegramGeneratedLicenseKeyboard(licenseKey, superLicenseKey = '') {
           copy_text: { text: licenseKey },
         },
       ],
-      ...(superLicenseKey
-        ? [[{
-            text: '🔐 复制管理员超级卡密',
-            copy_text: { text: superLicenseKey },
-          }]]
-        : []),
     ],
   };
 }
@@ -10987,10 +13786,7 @@ async function showTelegramGeneratedLicense(callback, created) {
     text: telegramGeneratedLicenseText(created),
     parse_mode: 'HTML',
     link_preview_options: { is_disabled: true },
-    reply_markup: telegramGeneratedLicenseKeyboard(
-      created.licenseKey,
-      created.superLicenseKey,
-    ),
+    reply_markup: telegramGeneratedLicenseKeyboard(created.licenseKey),
   };
   if (chatId != null && messageId != null) {
     await telegramApi('editMessageText', {
@@ -11205,7 +14001,6 @@ async function sendAllLicenses(chatId, message, requestedPage = 1) {
       ), page_rows AS (
         SELECT
           id,key_prefix,key_suffix,duration_code,duration_days,
-          super_key_suffix,
           status,telegram_user_id,telegram_username,telegram_display_name,
           activated_at,expires_at,revoked_at,created_at
         FROM license_keys
@@ -11237,7 +14032,6 @@ async function sendAllLicenses(chatId, message, requestedPage = 1) {
         : formatTelegramDate(row.expires_at);
     lines.push(
       `${offset + index + 1}. ${licenseHint(row)} · ${telegramLicenseStatus(row)}`,
-      `管理员超级卡密：${superLicenseHint(row) || '历史卡密未生成'}`,
       `生成者：${telegramLicenseCreator(row)}`,
       `生成：${formatTelegramDate(row.created_at)}｜到期：${expiry}`,
       ...(row.revoked_at
@@ -11328,6 +14122,24 @@ async function sendTelegramReply(message, text, extra = {}) {
     ...telegramThread(message),
     ...extra,
   });
+}
+
+// Telegram 通知属于结果回报，不应覆盖已经完成的业务操作。
+// 网络抖动时仅做一次窄范围重试，仍失败也只记录日志并保留主流程结果。
+async function sendTelegramNotification(payload, { label = 'Telegram 通知' } = {}) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await telegramApi('sendMessage', payload);
+    } catch (error) {
+      lastError = error;
+      if (attempt === 0) {
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      }
+    }
+  }
+  console.error(`${label}发送失败，不影响主流程：`, lastError);
+  return null;
 }
 
 async function cloudflareApi(pathname, { method = 'GET', body } = {}) {
@@ -12082,8 +14894,9 @@ async function handleTenantEntryDomainCallback(callback) {
     text: '正在配置和验收，请稍候…',
   }).catch(() => {});
   await clearTelegramCallbackKeyboard(callback.message);
+  let result;
   try {
-    const result = await switchTenantEntryRootDomain(row.domain, {
+    result = await switchTenantEntryRootDomain(row.domain, {
       telegramUserId: String(userId || ''),
       requestId,
     });
@@ -12093,7 +14906,31 @@ async function handleTenantEntryDomainCallback(callback) {
        WHERE id=$1`,
       [requestId, result.previousDomain],
     );
-    await telegramApi('sendMessage', {
+  } catch (error) {
+    await pool.query(
+      `UPDATE tenant_entry_domain_switch_requests
+       SET status='failed',error=$2,updated_at=NOW()
+       WHERE id=$1`,
+      [requestId, cleanText(error.message, 500)],
+    ).catch(() => {});
+    await sendTelegramNotification({
+      chat_id: chat.id,
+      text: [
+        '<b>❌ 客服入口域名切换失败</b>',
+        '',
+        `<b>目标域名</b>：<code>${escapeTelegramHtml(row.domain)}</code>`,
+        `<b>原因</b>：${escapeTelegramHtml(cleanText(error.message, 300))}`,
+        '',
+        '系统已停止切换；如果数据库已进入新域名阶段，也已自动恢复原域名。',
+      ].join('\n'),
+      parse_mode: 'HTML',
+      ...telegramThread(callback.message),
+    }, { label: '域名切换失败通知' });
+    return true;
+  }
+
+  // 只有上面的切换/数据库流程失败才算切换失败；Telegram 成功通知失败不能回滚或改写状态。
+  await sendTelegramNotification({
       chat_id: chat.id,
       text: [
         '<b>✅ 客服入口域名切换完成</b>',
@@ -12114,28 +14951,7 @@ async function handleTenantEntryDomainCallback(callback) {
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
       ...telegramThread(callback.message),
-    });
-  } catch (error) {
-    await pool.query(
-      `UPDATE tenant_entry_domain_switch_requests
-       SET status='failed',error=$2,updated_at=NOW()
-       WHERE id=$1`,
-      [requestId, cleanText(error.message, 500)],
-    ).catch(() => {});
-    await telegramApi('sendMessage', {
-      chat_id: chat.id,
-      text: [
-        '<b>❌ 域名切换失败</b>',
-        '',
-        `<b>目标域名</b>：<code>${escapeTelegramHtml(row.domain)}</code>`,
-        `<b>原因</b>：${escapeTelegramHtml(cleanText(error.message, 300))}`,
-        '',
-        '系统已停止切换；如果数据库已进入新域名阶段，也已自动恢复原域名。',
-      ].join('\n'),
-      parse_mode: 'HTML',
-      ...telegramThread(callback.message),
-    });
-  }
+    }, { label: '域名切换完成通知' });
   return true;
 }
 
@@ -12189,6 +15005,51 @@ function incrementNetlifyDomain(domain, offset = 1) {
   return normalizeNetlifyDomain(`${nextLabel}${suffix}`);
 }
 
+async function filterQrDomainCandidates(candidates, templateId) {
+  const unique = [...new Set(
+    (Array.isArray(candidates) ? candidates : [])
+      .map((value) => normalizeNetlifyDomain(value))
+      .filter(Boolean),
+  )];
+  if (!unique.length || !isUuid(templateId)) return [];
+  // Store/compare canonical origins without a trailing slash. Older rows may
+  // contain either form, so the query trims trailing slashes before matching.
+  const origins = unique.map((domain) => `https://${domain}`);
+  const hosts = unique
+    .map((domain) => tenantEntryHostFromNetlifyUrl(`https://${domain}/`))
+    .filter(Boolean);
+  const collisions = await pool.query(
+    `
+      SELECT LOWER(base_url) AS value
+      FROM frontend_templates
+      WHERE LOWER(regexp_replace(base_url,'/+$',''))=ANY($1::text[]) AND id<>$2
+      UNION ALL
+      SELECT LOWER(entry_host) AS value
+      FROM frontend_templates
+      WHERE LOWER(entry_host)=ANY($3::text[]) AND id<>$2
+      UNION ALL
+      SELECT LOWER(hostname) AS value
+      FROM frontend_template_entry_aliases
+      WHERE LOWER(hostname)=ANY($3::text[]) AND template_id<>$2
+      UNION ALL
+      SELECT LOWER(hostname) AS value
+      FROM tenant_template_domains
+      WHERE LOWER(hostname)=ANY($3::text[])
+      UNION ALL
+      SELECT LOWER(hostname) AS value
+      FROM tenant_template_domain_aliases
+      WHERE LOWER(hostname)=ANY($3::text[])
+    `,
+    [origins.map((value) => value.toLowerCase()), templateId, hosts.map((value) => value.toLowerCase())],
+  );
+  const occupied = new Set(collisions.rows.map((row) => String(row.value || '').toLowerCase()));
+  return unique.filter((domain) => {
+    const url = `https://${domain}`.toLowerCase();
+    const host = tenantEntryHostFromNetlifyUrl(`https://${domain}/`).toLowerCase();
+    return !occupied.has(url) && (!host || !occupied.has(host));
+  });
+}
+
 async function qrDomainCandidates(currentDomain, templateId, limit = 40) {
   const candidates = [];
   for (let offset = 1; offset <= limit; offset += 1) {
@@ -12196,16 +15057,7 @@ async function qrDomainCandidates(currentDomain, templateId, limit = 40) {
     if (!domain) break;
     candidates.push(domain);
   }
-  if (!candidates.length) return [];
-  const urls = candidates.map((domain) => `https://${domain}/`);
-  const collisions = await pool.query(
-    `SELECT base_url
-     FROM frontend_templates
-     WHERE base_url=ANY($1::text[]) AND id<>$2`,
-    [urls, templateId],
-  );
-  const occupied = new Set(collisions.rows.map((row) => row.base_url));
-  return candidates.filter((domain) => !occupied.has(`https://${domain}/`));
+  return filterQrDomainCandidates(candidates, templateId);
 }
 
 function qrIncidentKeyboard(incidentId) {
@@ -12349,6 +15201,63 @@ function tenantEntryHostFromNetlifyUrl(value) {
   return normalizeTenantEntryHost(
     `${label}.${activeTenantEntryRootDomain || TENANT_ENTRY_DOMAIN_SUFFIXES[0]}`,
   );
+}
+
+function normalizeTenantEntryPrefix(value) {
+  const prefix = cleanText(value, 32).trim().toLowerCase();
+  return /^[a-z](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(prefix)
+    ? prefix
+    : '';
+}
+
+function tenantEntryHostFromPrefix(value) {
+  if (!TENANT_ENTRY_ENABLED) return '';
+  const prefix = normalizeTenantEntryPrefix(value);
+  const rootDomain =
+    activeTenantEntryRootDomain || TENANT_ENTRY_DOMAIN_SUFFIXES[0] || '';
+  return prefix && rootDomain
+    ? normalizeTenantEntryHost(`${prefix}.${rootDomain}`)
+    : '';
+}
+
+function unifiedEntryHostSequence(value) {
+  const host = normalizeTenantEntryHost(value);
+  if (!host) return null;
+  const [label, ...rootParts] = host.split('.');
+  const match = label.match(/^u(\d*)$/);
+  if (!match || !rootParts.length) return null;
+  return {
+    current: match[1] ? Number(match[1]) : 0,
+    rootDomain: rootParts.join('.'),
+  };
+}
+
+async function nextUnifiedEntryHost(client, value) {
+  const sequence = unifiedEntryHostSequence(value);
+  if (!sequence || !Number.isSafeInteger(sequence.current)) return '';
+  for (let offset = 1; offset <= 1000; offset += 1) {
+    const candidate = normalizeTenantEntryHost(
+      `u${sequence.current + offset}.${sequence.rootDomain}`,
+    );
+    if (!candidate) continue;
+    const occupied = await client.query(
+      `SELECT 1
+       FROM (
+         SELECT entry_host AS hostname FROM frontend_templates
+         UNION ALL
+         SELECT hostname FROM frontend_template_entry_aliases
+         UNION ALL
+         SELECT hostname FROM tenant_template_domains
+         UNION ALL
+         SELECT hostname FROM tenant_template_domain_aliases
+       ) reserved
+       WHERE LOWER(hostname)=LOWER($1)
+       LIMIT 1`,
+      [candidate],
+    );
+    if (!occupied.rows[0]) return candidate;
+  }
+  return '';
 }
 
 function tenantEntryOrigin(value) {
@@ -12599,20 +15508,26 @@ async function resolveQrIncidentDomain(
       ),
     };
   }
-  if (!NETLIFY_AUTH_TOKEN) throw new Error('服务器尚未配置 NETLIFY_AUTH_TOKEN。');
-  if (!normalizeNetlifySiteId(incident.netlify_site_id)) {
-    throw new Error('请先在超级后台为该模板填写 Netlify Site ID。');
-  }
   const oldNetlifyDomain = displayTemplateDomain(incident.current_base_url);
   const oldDomain = displayTenantEntryDomain(
     incident.current_base_url,
     incident.current_entry_host,
   );
-  if (!normalizeNetlifyDomain(oldNetlifyDomain)) {
-    throw new Error(`当前后台域名 ${oldNetlifyDomain} 不是可自动更换的 netlify.app 域名。`);
-  }
   const manualDomain = targetDomain ? normalizeNetlifyDomain(targetDomain) : '';
   if (targetDomain && !manualDomain) throw new Error('目标域名格式无效。');
+  const unifiedAutomaticChange =
+    !manualDomain && Boolean(unifiedEntryHostSequence(incident.current_entry_host));
+  if (!unifiedAutomaticChange) {
+    if (!NETLIFY_AUTH_TOKEN) {
+      throw new Error('服务器尚未配置 NETLIFY_AUTH_TOKEN。');
+    }
+    if (!normalizeNetlifySiteId(incident.netlify_site_id)) {
+      throw new Error('请先在超级后台为该模板填写 Netlify Site ID。');
+    }
+    if (!normalizeNetlifyDomain(oldNetlifyDomain)) {
+      throw new Error(`当前后台域名 ${oldNetlifyDomain} 不是可自动更换的 netlify.app 域名。`);
+    }
+  }
 
   const claimed = await pool.query(
     `
@@ -12638,12 +15553,118 @@ async function resolveQrIncidentDomain(
     throw new Error('异常状态已经变化，请刷新后重试。');
   }
 
+  if (unifiedAutomaticChange) {
+    const client = await pool.connect();
+    let nextEntryHost = '';
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtext('tenant-entry-host-registry'))`,
+      );
+      const currentTemplate = await client.query(
+        `SELECT entry_host,base_url
+         FROM frontend_templates
+         WHERE id=$1
+         FOR UPDATE`,
+        [incident.template_id],
+      );
+      const currentEntryHost = normalizeTenantEntryHost(
+        currentTemplate.rows[0]?.entry_host,
+      );
+      if (!unifiedEntryHostSequence(currentEntryHost)) {
+        throw new Error('该模板当前入口已经变化，请刷新后重试。');
+      }
+      nextEntryHost = await nextUnifiedEntryHost(client, currentEntryHost);
+      if (!nextEntryHost) {
+        throw new Error('没有找到可用的 u 系列入口域名。');
+      }
+      await storeTemplateEntryAlias(
+        client,
+        incident.template_id,
+        currentEntryHost,
+      );
+      await client.query(
+        `UPDATE frontend_templates
+         SET entry_host=$2,updated_at=NOW()
+         WHERE id=$1`,
+        [incident.template_id, nextEntryHost],
+      );
+      await client.query(
+        `UPDATE qr_incidents
+         SET status='resolved',requested_base_url=$2,resolved_at=NOW(),
+             error='',updated_at=NOW()
+         WHERE id=$1`,
+        [incident.id, currentTemplate.rows[0].base_url],
+      );
+      await client.query(
+        `INSERT INTO audit_logs (
+           action,target_type,target_id,metadata,risk_level,summary
+         ) VALUES (
+           'frontend_template.entry_domain_change','frontend_template',
+           $1,$2::jsonb,'critical','商家上报二维码异常并递增了 u 系列入口域名'
+         )`,
+        [
+          incident.template_id,
+          JSON.stringify({
+            incidentId: incident.id,
+            tenantId: incident.tenant_id,
+            oldDomain: currentEntryHost,
+            newDomain: nextEntryHost,
+            source,
+          }),
+        ],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      await pool.query(
+        `UPDATE qr_incidents
+         SET status='failed',error=$2,updated_at=NOW()
+         WHERE id=$1`,
+        [incident.id, cleanText(error.message, 500)],
+      ).catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+    invalidateTenantCaches();
+    invalidateTenantEntryCaches();
+    invalidateApprovedOrigins();
+    await refreshApprovedOrigins(true).catch((error) =>
+      console.error('u 系列入口更换后来源缓存刷新失败：', error.message),
+    );
+    publishEvent(
+      { type: 'frontend_catalog_updated' },
+      { targetKind: 'tenant_admin' },
+    );
+    await publishDomainChange(incident, oldDomain, nextEntryHost).catch((error) =>
+      console.error('u 系列入口更换通知保存失败：', error.message),
+    );
+    await clearQrIncidentKeyboard(incident).catch(() => {});
+    await sendQrResolvedTelegram(
+      incident,
+      oldDomain,
+      nextEntryHost,
+      source,
+    ).catch((error) =>
+      console.error('u 系列入口更换 Telegram 回执失败：', error.message),
+    );
+    broadcastSuper({ type: 'qr-incident-updated' });
+    return { oldDomain, newDomain: nextEntryHost, duplicate: false };
+  }
+
   let selectedDomain = '';
   let netlifyRenamed = false;
   let databaseCommitted = false;
   try {
     const candidates = manualDomain
-      ? [manualDomain]
+      ? await filterQrDomainCandidates(
+          [
+            manualDomain,
+            ...(await qrDomainCandidates(manualDomain, incident.template_id)),
+          ],
+          incident.template_id,
+        )
       : await qrDomainCandidates(oldNetlifyDomain, incident.template_id);
     if (!candidates.length) throw new Error('没有找到可用的递增域名。');
     let nextBaseUrl = '';
@@ -12658,7 +15679,6 @@ async function resolveQrIncidentDomain(
         break;
       } catch (error) {
         lastError = error;
-        if (manualDomain) break;
       }
     }
     if (!nextBaseUrl || !selectedDomain) {
@@ -13046,7 +16066,7 @@ async function handleQrIncidentCallback(callback) {
       const incident = await blockQrIncidentReporter(match[2], String(userId || ''));
       await telegramApi('sendMessage', {
         chat_id: chat.id,
-        text: `⛔ 已封禁报告普通卡密，管理员超级卡密仍可使用：${incident.public_code}`,
+        text: `⛔ 已封禁报告卡密：${incident.public_code}`,
         ...telegramThread(callback.message),
       });
     }
@@ -13227,7 +16247,7 @@ async function handleSecurityEventCallback(callback) {
       } finally {
         client.release();
       }
-      resultText = `⛔ 已封禁普通卡密 ${event.key_prefix || 'VIP'}-***-${event.key_suffix || '?????'}${disconnectedTenantId ? '，并中断该普通卡密后台会话；管理员超级卡密仍可使用' : ''}。`;
+      resultText = `⛔ 已封禁卡密 ${event.key_prefix || 'VIP'}-***-${event.key_suffix || '?????'}${disconnectedTenantId ? '，并中断该卡密后台会话' : ''}。`;
     } else if (match[1] === 'ip') {
       if (!securityIpBlockable(event.ip_address)) {
         throw new Error(
@@ -13354,13 +16374,17 @@ async function telegramUserIsBlocked(userId) {
 }
 
 function telegramPrivateContent(message) {
-  const text = cleanText(message.text || message.caption, 1500);
+  const redact = (value) => String(value || '').replace(
+    /\b(VIP|SVIP)-([A-Z0-9]{5})(?:-([A-Z0-9]{5})){3}\b/gi,
+    (full, prefix, first, last) => `${prefix}-*****-*****-*****-${last}`,
+  );
+  const text = redact(cleanText(message.text || message.caption, 1500));
   if (text) return text;
   if (message.photo) return '[图片]';
   if (message.video) return '[视频]';
   if (message.voice) return '[语音]';
   if (message.audio) return '[音频]';
-  if (message.document) return `[文件] ${cleanText(message.document.file_name, 200)}`;
+  if (message.document) return redact(`[文件] ${cleanText(message.document.file_name, 200)}`);
   if (message.sticker) return `[贴纸] ${cleanText(message.sticker.emoji, 20)}`;
   if (message.contact) return '[联系人]';
   if (message.location) return '[位置]';
@@ -13374,19 +16398,280 @@ function telegramUserChatUrl(user) {
     : `tg://user?id=${encodeURIComponent(String(user?.id || ''))}`;
 }
 
+function telegramLedgerGroupAllowed(chat, userId) {
+  return Boolean(
+    userId != null && TELEGRAM_ALLOWED_USER_IDS.has(String(userId)) &&
+    chat &&
+    ['group', 'supergroup'].includes(chat.type) &&
+    TELEGRAM_ALLOWED_GROUP_IDS.has(String(chat.id)),
+  );
+}
+
+function parseTelegramLedgerCommand(raw) {
+  const value = String(raw || '').trim();
+  const match = value.match(/^([+-])\s*(\d{1,16}(?:\.\d{1,2})?)\s+(.{1,500})$/u);
+  if (!match) return null;
+  const amount = match[2];
+  if (!Number.isFinite(Number(amount)) || Number(amount) <= 0) return null;
+  return {
+    operationType: match[1],
+    amount,
+    note: match[3].trim(),
+  };
+}
+
+function currencyCents(value) {
+  const text = String(value ?? '').trim();
+  const match = text.match(/^(-?)(\d+)(?:\.(\d{1,2}))?$/);
+  if (!match) return null;
+  const whole = BigInt(match[2]);
+  const fraction = BigInt(String(match[3] || '').padEnd(2, '0') || '0');
+  const cents = whole * 100n + fraction;
+  return match[1] ? -cents : cents;
+}
+
+function formatCurrencyCents(value) {
+  const cents = typeof value === 'bigint' ? value : currencyCents(value);
+  if (cents == null) return '0';
+  const negative = cents < 0n;
+  const absolute = negative ? -cents : cents;
+  const whole = absolute / 100n;
+  const fraction = absolute % 100n;
+  const suffix = fraction ? `.${String(fraction).padStart(2, '0').replace(/0$/, '')}` : '';
+  return `${negative ? '-' : ''}${whole}${suffix}`;
+}
+
+function telegramLedgerKeyboard(chatId, confirm = false) {
+  const value = String(chatId);
+  return {
+    inline_keyboard: confirm
+      ? [[
+          { text: '⚠️ 确认永久删除', callback_data: `ledger:confirm:${value}` },
+          { text: '取消', callback_data: `ledger:cancel:${value}` },
+        ]]
+      : [[{ text: '🗑 删除全部账单', callback_data: `ledger:delete:${value}` }]],
+  };
+}
+
+async function writeTelegramGroupLedger(message, entry) {
+  const chatId = String(message.chat.id);
+  const amountCents = currencyCents(entry.amount);
+  if (amountCents == null || amountCents <= 0n) {
+    throw new Error('金额格式无效。');
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO telegram_group_accounts (chat_id)
+       VALUES ($1) ON CONFLICT (chat_id) DO NOTHING`,
+      [chatId],
+    );
+    const account = await client.query(
+      `SELECT balance::text AS balance FROM telegram_group_accounts
+       WHERE chat_id=$1 FOR UPDATE`,
+      [chatId],
+    );
+    const currentCents = currencyCents(account.rows[0]?.balance || '0') || 0n;
+    const nextCents = entry.operationType === '+'
+      ? currentCents + amountCents
+      : currentCents - amountCents;
+    const maxCents = 99999999999999999999n;
+    if (nextCents > maxCents || nextCents < -maxCents) {
+      throw new Error('账户余额超出允许范围。');
+    }
+    const operator = message.from || {};
+    await client.query(
+      `INSERT INTO telegram_group_ledger (
+         chat_id,operation_type,amount,note,operator_user_id,
+         operator_username,operator_display_name,balance_after
+       ) VALUES ($1,$2,$3::numeric,$4,$5,$6,$7,$8::numeric)`,
+      [
+        chatId,
+        entry.operationType,
+        entry.amount,
+        entry.note,
+        String(operator.id || ''),
+        cleanText(operator.username, 80),
+        telegramDisplayName(operator),
+        formatCurrencyCents(nextCents),
+      ],
+    );
+    await client.query(
+      `UPDATE telegram_group_accounts
+       SET balance=$2::numeric,updated_at=NOW() WHERE chat_id=$1`,
+      [chatId, formatCurrencyCents(nextCents)],
+    );
+    await client.query('COMMIT');
+    return { balance: formatCurrencyCents(nextCents) };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function telegramGroupLedgerText(chatId) {
+  // Read the balance and its ledger rows from one snapshot so a concurrent
+  // write cannot produce a message with a new bill and an old balance.
+  const client = await pool.connect();
+  let account;
+  let ledger;
+  try {
+    await client.query('BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+    account = await client.query(
+      `SELECT balance::text AS balance FROM telegram_group_accounts WHERE chat_id=$1`,
+      [String(chatId)],
+    );
+    ledger = await client.query(
+      `SELECT operation_type,amount::text AS amount,note,
+              operator_display_name,operator_username,created_at
+       FROM telegram_group_ledger
+       WHERE chat_id=$1 ORDER BY created_at DESC,id DESC LIMIT 20`,
+      [String(chatId)],
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+  const balance = account.rows[0]?.balance || '0';
+  const lines = [
+    '💰 <b>账户余额</b>',
+    `当前余额：<code>${escapeTelegramHtml(formatCurrencyCents(currencyCents(balance) || 0n))}</code>`,
+  ];
+  if (!ledger.rows.length) {
+    lines.push('', '📋 暂无账单记录');
+    return lines.join('\n');
+  }
+  lines.push('', '📋 <b>最近账单</b>');
+  for (const row of ledger.rows) {
+    const sign = row.operation_type === '+' ? '+' : '-';
+    const icon = row.operation_type === '+' ? '🟢' : '🔴';
+    const operator = row.operator_display_name ||
+      (row.operator_username ? `@${row.operator_username}` : '未设置姓名');
+    lines.push(
+      `${icon} <code>${sign}${escapeTelegramHtml(formatCurrencyCents(currencyCents(row.amount) || 0n))}</code> ｜ ${escapeTelegramHtml(row.note || '')}`,
+      `👤 ${escapeTelegramHtml(operator)}`,
+      `🕐 ${escapeTelegramHtml(formatTelegramDate(row.created_at))}`,
+      '',
+    );
+  }
+  lines.push('━━━━━━━━━━━━━━', `💰 当前余额：<code>${escapeTelegramHtml(formatCurrencyCents(currencyCents(balance) || 0n))}</code>`);
+  return lines.join('\n');
+}
+
+async function handleTelegramGroupLedgerMessage(message, entry = null) {
+  if (!telegramLedgerGroupAllowed(message?.chat, message?.from?.id)) return false;
+  const chatId = message.chat.id;
+  if (entry) {
+    try {
+      const result = await writeTelegramGroupLedger(message, entry);
+      const operator = telegramDisplayName(message.from) || '未设置姓名';
+      const icon = entry.operationType === '+' ? '➕' : '➖';
+      await telegramApi('sendMessage', {
+        chat_id: chatId,
+        text: [
+          '✅ <b>记账成功</b>',
+          `${icon} 金额：${escapeTelegramHtml(entry.amount)}`,
+          `📝 备注：${escapeTelegramHtml(entry.note)}`,
+          `👤 操作人：${escapeTelegramHtml(operator)}`,
+          `💰 当前余额：${escapeTelegramHtml(result.balance)}`,
+        ].join('\n'),
+        parse_mode: 'HTML',
+        ...telegramThread(message),
+      });
+    } catch (error) {
+      await telegramApi('sendMessage', {
+        chat_id: chatId,
+        text: `❌ 记账失败：${escapeTelegramHtml(error.message || '金额格式无效。')}`,
+        ...telegramThread(message),
+      });
+    }
+    return true;
+  }
+  await telegramApi('sendMessage', {
+    chat_id: chatId,
+    text: await telegramGroupLedgerText(chatId),
+    parse_mode: 'HTML',
+    reply_markup: telegramLedgerKeyboard(chatId),
+    ...telegramThread(message),
+  });
+  return true;
+}
+
+async function handleTelegramGroupLedgerCallback(callback) {
+  const match = String(callback?.data || '').match(/^ledger:(delete|confirm|cancel):(-?\d+)$/);
+  const chat = callback?.message?.chat;
+  if (!match || !telegramLedgerGroupAllowed(chat, callback?.from?.id)) return false;
+  const chatId = match[2];
+  const messageId = callback?.message?.message_id;
+  await telegramApi('answerCallbackQuery', { callback_query_id: callback.id }).catch(() => {});
+  if (match[1] === 'delete') {
+    await telegramApi('editMessageReplyMarkup', {
+      chat_id: chat.id,
+      message_id: messageId,
+      reply_markup: telegramLedgerKeyboard(chatId, true),
+    });
+    return true;
+  }
+  if (match[1] === 'cancel') {
+    await telegramApi('editMessageReplyMarkup', {
+      chat_id: chat.id,
+      message_id: messageId,
+      reply_markup: telegramLedgerKeyboard(chatId),
+    });
+    return true;
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `DELETE FROM telegram_group_ledger WHERE chat_id=$1`,
+      [chatId],
+    );
+    await client.query(
+      `DELETE FROM telegram_group_accounts WHERE chat_id=$1`,
+      [chatId],
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+  await telegramApi('editMessageText', {
+    chat_id: chat.id,
+    message_id: messageId,
+    text: '🗑 <b>账单已永久删除</b>\n全部账单记录已删除。\n💰 当前余额：<code>0</code>\n此操作不可恢复。',
+    parse_mode: 'HTML',
+  });
+  return true;
+}
+
 async function handleTelegramPrivateInbound(message) {
   if (message?.chat?.type !== 'private' || message?.from?.is_bot) return false;
   const userId = String(message.from?.id || '');
-  if (!/^\d+$/.test(userId) || TELEGRAM_ALLOWED_USER_IDS.has(userId)) {
+  if (!/^\d+$/.test(userId)) {
     return false;
   }
   if (await telegramUserIsBlocked(userId)) {
-    await telegramApi('sendMessage', {
-      chat_id: message.chat.id,
-      text: '你已被管理员禁止访问机器人。你的 Telegram 用户 ID 和相关记录已被保留；Telegram 机器人无法获取你的 IP。',
-    }).catch(() => {});
+    await sendTelegramShopBlocked(message.chat.id);
     return true;
   }
+  if (!TELEGRAM_ALLOWED_USER_IDS.has(userId)) {
+    const handled = await handleTelegramShopPrivateInbound(message);
+    if (handled) return true;
+  } else if (await handleTelegramShopPrivateInbound(message)) {
+    // Whitelisted administrators may use the same customer menu. Unknown
+    // legacy commands continue through processTelegramUpdate below.
+    return true;
+  }
+  if (TELEGRAM_ALLOWED_USER_IDS.has(userId)) return false;
   const settings = await getPlatformSettings().catch(() => null);
   if (!settings?.telegramGroupId) {
     await telegramApi('sendMessage', {
@@ -13492,12 +16777,27 @@ async function processTelegramUpdate(update) {
   const callback = update?.callback_query;
 
   if (message && (await handleTelegramPrivateInbound(message))) return;
+  if (callback && await telegramUserIsBlocked(String(callback.from?.id || ''))) {
+    await telegramApi('answerCallbackQuery', {
+      callback_query_id: callback.id,
+      text: '你已被禁止使用本机器人。',
+      show_alert: true,
+    }).catch(() => {});
+    await sendTelegramShopBlocked(callback.message?.chat?.id);
+    return;
+  }
 
   if (message?.text) {
     const chat = message.chat;
     const chatId = chat?.id;
     const userId = message.from?.id;
     const raw = String(message.text || '').trim();
+    const ledgerEntry = parseTelegramLedgerCommand(raw);
+    const isLedgerBalance = ['账户余额', '余额'].includes(raw);
+    if (telegramLedgerGroupAllowed(chat, userId) && (ledgerEntry || isLedgerBalance)) {
+      await handleTelegramGroupLedgerMessage(message, ledgerEntry);
+      return;
+    }
     const command = (raw.split(/\s+/)[0] || '')
       .replace(/@[A-Za-z0-9_]+$/i, '')
       .toLowerCase();
@@ -13572,6 +16872,8 @@ async function processTelegramUpdate(update) {
           '域名池：发送“查看可用域名”或 /domains',
           '切换根域名：发送“更换域名 6687878.xyz”并点击确认',
           '二维码异常：回复异常消息并发送“更换域名wxmb2.netlify.app”',
+          '群账户记账：发送“+38 周卡”或“-10 买号”',
+          '查询余额：发送“账户余额”或“余额”',
         ].join('\n'),
         ...telegramThread(message),
       });
@@ -13653,7 +16955,7 @@ async function processTelegramUpdate(update) {
               revokedTenantId = row.tenant_id;
               revokedLicenseId = row.id;
             }
-            text = `✅ 已禁用普通卡密：${displayKey}\n管理员超级卡密仍可登录。`;
+            text = `✅ 已禁用卡密：${displayKey}`;
           }
         }
         await client.query('COMMIT');
@@ -13684,6 +16986,12 @@ async function processTelegramUpdate(update) {
     }
   }
 
+  if (callback && await handleTelegramShopCallback(callback)) return;
+
+  if (callback?.data?.startsWith('ledger:')) {
+    if (await handleTelegramGroupLedgerCallback(callback)) return;
+  }
+
   if (callback?.data?.startsWith('qr:')) {
     if (await handleQrIncidentCallback(callback)) return;
   }
@@ -13706,14 +17014,7 @@ async function processTelegramUpdate(update) {
     const userId = callback.from?.id;
     const code = callback.data.slice(8);
 
-    if (!(await telegramOperatorAllowedAsync(chat, userId))) {
-      await telegramApi('answerCallbackQuery', {
-        callback_query_id: callback.id,
-        text: '当前用户或群组未被授权。',
-        show_alert: true,
-      });
-      return;
-    }
+    if (!(await telegramShopAdminAuthorized(callback, '生成卡密'))) return;
 
     if (!LICENSE_DURATIONS[code]) {
       await telegramApi('answerCallbackQuery', {
@@ -15291,6 +18592,113 @@ async function scheduleNextExpiredTenantPurge() {
   expiredTenantPurgeTimer.unref();
 }
 
+async function runTelegramShopDailyReport() {
+  if (!TELEGRAM_ENABLED) return;
+  const lock = await pool.query(
+    `SELECT pg_try_advisory_lock(hashtext('tuojie-shop-daily-report')) AS locked`,
+  );
+  if (!lock.rows[0]?.locked) return;
+  try {
+  const settings = await getPlatformSettings().catch(() => null);
+  if (!settings?.telegramGroupId) return;
+  const result = await pool.query(`
+    SELECT
+      COUNT(*) FILTER (WHERE payment_status='paid')::int AS total_orders,
+      COUNT(*) FILTER (WHERE payment_status='paid' AND payment_method='okpay_usdt')::int AS okpay_orders,
+      COUNT(*) FILTER (WHERE payment_status='paid' AND payment_method='usdt_trc20')::int AS tron_orders,
+      COALESCE(SUM(CASE WHEN payment_status='paid' AND payment_method='okpay_usdt'
+        THEN base_amount_usdt::numeric ELSE 0 END),0)::text AS okpay_amount,
+      COALESCE(SUM(CASE WHEN payment_status='paid' AND payment_method='usdt_trc20'
+        THEN amount_usdt::numeric ELSE 0 END),0)::text AS tron_amount
+    FROM telegram_shop_orders
+    WHERE paid_at IS NOT NULL
+      AND (paid_at AT TIME ZONE $1)::date = ((NOW() AT TIME ZONE $1)::date - 1)
+  `, [SHOP_REPORT_TIMEZONE]);
+  const products = await pool.query(`
+    SELECT package_label,COUNT(*)::int AS count
+    FROM telegram_shop_orders
+    WHERE payment_status='paid' AND paid_at IS NOT NULL
+      AND (paid_at AT TIME ZONE $1)::date = ((NOW() AT TIME ZONE $1)::date - 1)
+    GROUP BY package_label ORDER BY count DESC,package_label
+  `, [SHOP_REPORT_TIMEZONE]);
+  const day = (await pool.query(`SELECT ((NOW() AT TIME ZONE $1)::date - 1)::text AS report_date`, [SHOP_REPORT_TIMEZONE])).rows[0]?.report_date;
+  const claim = await pool.query(
+    `INSERT INTO telegram_shop_daily_reports(report_date,status)
+     VALUES($1,'pending')
+     ON CONFLICT(report_date) DO UPDATE SET
+       status=CASE WHEN telegram_shop_daily_reports.status='sent'
+         THEN telegram_shop_daily_reports.status ELSE 'pending' END,
+       error=CASE WHEN telegram_shop_daily_reports.status='sent'
+         THEN telegram_shop_daily_reports.error ELSE '' END,
+       updated_at=NOW()
+     RETURNING report_date,status`,
+    [day],
+  );
+  if (!claim.rows[0] || claim.rows[0].status === 'sent') return;
+  const row = result.rows[0] || {};
+  const lines = [
+    '<b>📊 昨日销售汇总</b>',
+    `日期：${escapeTelegramHtml(day)}`,
+    '',
+    `总计售出：<b>${Number(row.total_orders || 0)}张</b>`,
+    `OKPay（USDT）：${Number(row.okpay_orders || 0)}单，共${escapeTelegramHtml(row.okpay_amount || '0')} USDT`,
+    `USDT-TRC20：${Number(row.tron_orders || 0)}单，共${escapeTelegramHtml(row.tron_amount || '0')} USDT`,
+    '',
+    ...(products.rows.length
+      ? products.rows.map((item) => `${escapeTelegramHtml(item.package_label)}：${Number(item.count)}张`)
+      : ['暂无成功订单']),
+  ];
+  try {
+    await telegramApi('sendMessage', {
+      chat_id: settings.telegramGroupId,
+      text: lines.join('\n'),
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+    });
+    await pool.query(
+      `UPDATE telegram_shop_daily_reports SET status='sent',sent_at=NOW(),updated_at=NOW() WHERE report_date=$1`,
+      [day],
+    );
+  } catch (error) {
+    await pool.query(
+      `UPDATE telegram_shop_daily_reports SET status='failed',error=$2,updated_at=NOW() WHERE report_date=$1`,
+      [day, cleanText(error?.message, 240)],
+    ).catch(() => {});
+    throw error;
+  }
+  } finally {
+    await pool.query(
+      `SELECT pg_advisory_unlock(hashtext('tuojie-shop-daily-report'))`,
+    ).catch(() => {});
+  }
+}
+
+function nextTelegramShopReportDelay() {
+  const now = new Date();
+  for (let minute = 1; minute <= 24 * 60 + 1; minute += 1) {
+    const candidate = new Date(now.getTime() + minute * 60_000);
+    const parts = timezoneParts(candidate, SHOP_REPORT_TIMEZONE);
+    if (Number(parts.hour) === 1 && Number(parts.minute) === 0) {
+      return Math.max(1000, candidate.getTime() - Date.now());
+    }
+  }
+  return 60 * 60_000;
+}
+
+function scheduleTelegramShopDailyReport() {
+  if (telegramShopReportTimer) clearTimeout(telegramShopReportTimer);
+  telegramShopReportTimer = setTimeout(async () => {
+    try {
+      await runTelegramShopDailyReport();
+    } catch (error) {
+      console.error('售卡日报发送失败：', cleanText(error?.message, 240));
+    } finally {
+      scheduleTelegramShopDailyReport();
+    }
+  }, nextTelegramShopReportDelay());
+  telegramShopReportTimer.unref();
+}
+
 function startBackgroundJobs() {
   processObjectDeleteQueue().catch(() => {});
   scheduleLegacySuperKeyBackfill();
@@ -15303,6 +18711,11 @@ function startBackgroundJobs() {
   scheduleNextReport().catch((error) =>
     console.error('Telegram 报告调度失败：', error.message),
   );
+  scheduleTelegramShopDailyReport();
+  const tronPollTimer = setInterval(() => {
+    processTelegramShopTronPayments().catch(() => {});
+  }, SHOP_TRON_POLL_INTERVAL_MS);
+  tronPollTimer.unref();
 }
 
 function effectiveLicenseStatus(row) {
@@ -15344,6 +18757,11 @@ function publicLicenseRow(row) {
     ),
     desktopDevices: Number(row.desktop_devices || 0),
     mobileDevices: Number(row.mobile_devices || 0),
+    onlineDesktopDevices: Number(row.online_desktop_devices || 0),
+    onlineMobileDevices: Number(row.online_mobile_devices || 0),
+    onlineDevices:
+      Number(row.online_desktop_devices || 0) +
+      Number(row.online_mobile_devices || 0),
     generator:
       row.generated_by_username ||
       (row.generated_by_distributor_username
@@ -15639,7 +19057,9 @@ async function getSuperLicenses(
       t.name AS tenant_name, sa.username AS generated_by_username,
       d.username AS generated_by_distributor_username,
       COALESCE(device_counts.desktop_devices,0)::int AS desktop_devices,
-      COALESCE(device_counts.mobile_devices,0)::int AS mobile_devices
+      COALESCE(device_counts.mobile_devices,0)::int AS mobile_devices,
+      COALESCE(device_counts.online_desktop_devices,0)::int AS online_desktop_devices,
+      COALESCE(device_counts.online_mobile_devices,0)::int AS online_mobile_devices
     FROM license_keys l
     LEFT JOIN tenants t ON t.id = l.tenant_id
     LEFT JOIN super_admins sa ON sa.id = l.generated_by_admin_id
@@ -15647,7 +19067,15 @@ async function getSuperLicenses(
     LEFT JOIN LATERAL (
       SELECT
         COUNT(*) FILTER (WHERE device_type='desktop') AS desktop_devices,
-        COUNT(*) FILTER (WHERE device_type='mobile') AS mobile_devices
+        COUNT(*) FILTER (WHERE device_type='mobile') AS mobile_devices,
+        COUNT(*) FILTER (
+          WHERE device_type='desktop'
+            AND last_seen_at >= NOW() - INTERVAL '45 seconds'
+        ) AS online_desktop_devices,
+        COUNT(*) FILTER (
+          WHERE device_type='mobile'
+            AND last_seen_at >= NOW() - INTERVAL '45 seconds'
+        ) AS online_mobile_devices
       FROM license_devices ld
       WHERE ld.license_id=l.id
         AND ld.access_kind='normal'
@@ -17899,7 +21327,7 @@ async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
    const oldOwnerDistributorId =
   tenantOwnerResult.rows[0].owner_distributor_id;
 const currentFrontendTemplateId =
-  tenantOwnerResult.rows[0].frontend_template_id || DEFAULT_TEMPLATE_ID;
+  tenantOwnerResult.rows[0].frontend_template_id || UNIFIED_TEMPLATE_ID;
 let nextOwnerDistributorId = oldOwnerDistributorId;
 
 if (body.action === 'assignDistributor') {
@@ -18854,7 +22282,20 @@ return sendJson(res, 200, { ok: true });
     }
     parsed.hash = '';
     const baseUrl = parsed.toString();
-    const entryHost = tenantEntryHostFromNetlifyUrl(baseUrl);
+    const requestedEntryPrefix = body.entryPrefix === undefined
+      ? ''
+      : normalizeTenantEntryPrefix(body.entryPrefix);
+    if (body.entryPrefix !== undefined && !requestedEntryPrefix) {
+      return sendError(
+        res,
+        400,
+        '入口前缀只能使用小写字母、数字和短横线，并且必须以字母开头。',
+        'TENANT_ENTRY_PREFIX',
+      );
+    }
+    const entryHost = requestedEntryPrefix
+      ? tenantEntryHostFromPrefix(requestedEntryPrefix)
+      : tenantEntryHostFromNetlifyUrl(baseUrl);
     const netlifySiteId = normalizeNetlifySiteId(body.netlifySiteId);
     if (body.netlifySiteId && !netlifySiteId) {
       return sendError(
@@ -19106,6 +22547,20 @@ return sendJson(res, 200, { ok: true });
         } catch {
           return sendError(res, 400, '模板必须使用有效 HTTPS 地址。', 'TEMPLATE_URL');
         }
+      }
+      if (body.entryPrefix !== undefined) {
+        const requestedEntryPrefix = normalizeTenantEntryPrefix(
+          body.entryPrefix,
+        );
+        if (!requestedEntryPrefix) {
+          return sendError(
+            res,
+            400,
+            '入口前缀只能使用小写字母、数字和短横线，并且必须以字母开头。',
+            'TENANT_ENTRY_PREFIX',
+          );
+        }
+        entryHost = tenantEntryHostFromPrefix(requestedEntryPrefix);
       }
       if (body.netlifySiteId !== undefined) {
         netlifySiteId = normalizeNetlifySiteId(body.netlifySiteId);
@@ -19727,6 +23182,10 @@ async function router(req, res, parsedRequestUrl = null) {
     return sendJson(res,200,{ok:true});
   }
 
+  if (req.method === 'POST' && pathname === '/api/okpay/callback') {
+    return handleOkpayShopCallback(req, res);
+  }
+
   if (req.method === 'POST' && pathname === '/api/admin/login') {
     return handleTenantLogin(req, res);
   }
@@ -20107,6 +23566,10 @@ async function router(req, res, parsedRequestUrl = null) {
         : payload.kind === 'tenant_admin'
           ? `${payload.tenantId}:${payload.licenseId}`
           : `${payload.tenantId}:${payload.conversationId}`;
+    const requestedDeviceId =
+      payload.kind === 'tenant_admin'
+        ? cleanText(url.searchParams.get('deviceId'), 120) || 'legacy'
+        : '';
     if (
       !rateLimit(
         req,
@@ -20160,6 +23623,9 @@ async function router(req, res, parsedRequestUrl = null) {
       tenantId: payload.tenantId,
       conversationId: payload.conversationId || null,
       licenseId: payload.licenseId || null,
+      deviceId: requestedDeviceId,
+      deviceHash: cleanText(payload.deviceHash, 100),
+      lastSeenAt: Date.now(),
       accessKind:
         payload.kind === 'tenant_admin'
           ? tenantAdminAccessKind(payload)
@@ -20231,6 +23697,11 @@ async function router(req, res, parsedRequestUrl = null) {
       ) {
         scheduleSuperPresenceUpdate();
         scheduleDistributorPresenceUpdate(tenant?.owner_distributor_id);
+      }
+      if (removed && payload.kind === 'tenant_admin') {
+        reassignPendingCallsForDevice(payload.tenantId, client.deviceId).catch((error) =>
+          console.error('后台设备离线后的来电转移失败：', error.message),
+        );
       }
       if (payload.kind !== 'user') return;
       setTimeout(() => {
@@ -20427,12 +23898,15 @@ async function router(req, res, parsedRequestUrl = null) {
             ...signal,
             at: nowIso(),
           },
-          {
-            tenantId: payload.tenantId,
-            conversationId: conversation.id,
-            targetKind: 'tenant_admin',
-          },
-        );
+            {
+              tenantId: payload.tenantId,
+              conversationId: conversation.id,
+              targetKind: 'tenant_admin',
+              targetDeviceIds: saved.call.assigned_device_id
+                ? [saved.call.assigned_device_id]
+                : null,
+            },
+          );
         return sendJson(res, 200, {
           ok: true,
           busy: false,
@@ -20939,8 +24413,86 @@ async function router(req, res, parsedRequestUrl = null) {
     if (req.method === 'GET' && pathname === '/api/admin/pending-call') {
       return sendJson(res, 200, {
         ok: true,
-        call: await getPendingAdminCall(payload.tenantId),
+        call: await getPendingAdminCall(
+          payload.tenantId,
+          url.searchParams.get('deviceId'),
+        ),
       });
+    }
+
+    if (req.method === 'DELETE' && pathname === '/api/admin/conversations') {
+      if (!rateLimit(
+        req,
+        res,
+        'tenant-clear-all-conversations',
+        3,
+        60_000,
+        payload.tenantId,
+        { tenantId: payload.tenantId },
+      )) return;
+      const body = await readJson(req, 4096);
+      if (body.confirmation !== 'DELETE_ALL_CHAT_RECORDS') {
+        return sendError(
+          res,
+          400,
+          '请确认永久删除当前商家的全部聊天记录。',
+          'DELETE_CONFIRMATION_REQUIRED',
+        );
+      }
+      const deleted = await deleteAllTenantConversations(payload.tenantId);
+      await writeTenantAudit(req, payload, 'tenant.conversations.clear_all', {
+        targetType: 'tenant',
+        targetId: payload.tenantId,
+        metadata: deleted,
+      }).catch((error) =>
+        console.error('租户全部聊天记录删除审计写入失败：', error.message),
+      );
+      broadcast(
+        {
+          type: 'tenant-conversations-cleared',
+          ...deleted,
+          at: nowIso(),
+        },
+        null,
+        payload.tenantId,
+      );
+      return sendJson(res, 200, { ok: true, ...deleted });
+    }
+
+    const draftBrandAssetMatch = pathname.match(
+      /^\/api\/admin\/brand\/draft-asset\/([0-9a-f-]{36})$/i,
+    );
+    if (req.method === 'DELETE' && draftBrandAssetMatch) {
+      await requireTenantFeature('tenant_branding', payload.tenantId);
+      const assetId = draftBrandAssetMatch[1];
+      if (!isUuid(assetId)) {
+        return sendError(res, 400, '暂存图片标识无效。', 'INVALID_ASSET');
+      }
+      const [assetResult, current] = await Promise.all([
+        pool.query(
+          `SELECT id FROM assets
+           WHERE id=$1 AND tenant_id=$2
+             AND kind IN ('brand_avatar','visitor_brand')`,
+          [assetId, payload.tenantId],
+        ),
+        getConfig(payload.tenantId),
+      ]);
+      if (!assetResult.rows[0]) {
+        return sendJson(res, 200, { ok: true, deleted: false });
+      }
+      if (
+        assetId === cleanText(current.settings.avatarAssetId, 80) ||
+        assetId === cleanText(current.settings.visitorBrandAssetId, 80)
+      ) {
+        return sendError(
+          res,
+          409,
+          '这张图片已经保存，不能按草稿删除。',
+          'ASSET_ALREADY_APPLIED',
+        );
+      }
+      await deleteAsset(assetId, payload.tenantId);
+      return sendJson(res, 200, { ok: true, deleted: true });
     }
 
     if (req.method === 'PUT' && pathname === '/api/admin/settings') {
@@ -21010,6 +24562,20 @@ async function router(req, res, parsedRequestUrl = null) {
       } finally {
         databaseClient.release();
       }
+      const supersededBrandAssets = [
+        [current.settings.avatarAssetId, validated.settings.avatarAssetId],
+        [
+          current.settings.visitorBrandAssetId,
+          validated.settings.visitorBrandAssetId,
+        ],
+      ]
+        .filter(([oldId, newId]) => isUuid(oldId) && oldId !== newId)
+        .map(([oldId]) => oldId);
+      for (const assetId of new Set(supersededBrandAssets)) {
+        await deleteAsset(assetId, payload.tenantId).catch((error) =>
+          console.error('旧品牌图片清理失败：', error.message),
+        );
+      }
       await writeTenantAudit(req, payload, 'tenant.config.update', {
         targetType: 'tenant',
         targetId: payload.tenantId,
@@ -21068,6 +24634,14 @@ async function router(req, res, parsedRequestUrl = null) {
         mime: 'image/webp',
         data,
       });
+      if (url.searchParams.get('draft') === '1') {
+        return sendJson(res, 201, {
+          ok: true,
+          draft: true,
+          avatarAssetId: asset.id,
+          avatarUrl: `${PUBLIC_API_BASE}/api/public/assets/${asset.id}`,
+        });
+      }
       await pool.query(
         `
           UPDATE tenant_config
@@ -21137,6 +24711,119 @@ async function router(req, res, parsedRequestUrl = null) {
         payload.tenantId,
       );
       return sendJson(res, 200, { ok: true });
+    }
+
+    if (
+      req.method === 'POST' &&
+      pathname === '/api/admin/brand/visitor-logo'
+    ) {
+      await requireTenantFeature('tenant_branding', payload.tenantId);
+      if (
+        !rateLimit(
+          req,
+          res,
+          'tenant-visitor-brand-upload',
+          12,
+          10 * 60_000,
+          payload.tenantId,
+          { tenantId: payload.tenantId, licenseId: payload.licenseId },
+        )
+      ) return;
+      const data = await prepareImageUpload(req, {
+        maxBytes: MAX_VISITOR_BRAND_BYTES,
+        width: 900,
+        height: 260,
+        fit: 'inside',
+      });
+      const current = await getConfig(payload.tenantId);
+      const oldAssetId = cleanText(
+        current.settings.visitorBrandAssetId,
+        80,
+      );
+      const asset = await saveAsset({
+        tenantId: payload.tenantId,
+        kind: 'visitor_brand',
+        filename: 'visitor-brand.webp',
+        mime: 'image/webp',
+        data,
+      });
+      if (url.searchParams.get('draft') === '1') {
+        return sendJson(res, 201, {
+          ok: true,
+          draft: true,
+          visitorBrandAssetId: asset.id,
+          visitorBrandUrl: `${PUBLIC_API_BASE}/api/public/assets/${asset.id}`,
+        });
+      }
+      await pool.query(
+        `UPDATE tenant_config
+         SET settings=jsonb_set(
+               COALESCE(settings,'{}'::jsonb),
+               '{visitorBrandAssetId}',
+               to_jsonb($2::text),
+               true
+             ),updated_at=NOW()
+         WHERE tenant_id=$1`,
+        [payload.tenantId, asset.id],
+      );
+      if (isUuid(oldAssetId)) {
+        await deleteAsset(oldAssetId, payload.tenantId);
+      }
+      invalidateTenantCaches(payload.tenantId);
+      const settings = (await getConfig(payload.tenantId)).settings;
+      broadcast(
+        { type: 'settings-updated', settings },
+        null,
+        payload.tenantId,
+      );
+      await writeTenantAudit(req, payload, 'tenant.visitor_brand.update', {
+        targetType: 'tenant',
+        targetId: payload.tenantId,
+      }).catch(() => {});
+      return sendJson(res, 201, {
+        ok: true,
+        visitorBrandAssetId: asset.id,
+        visitorBrandUrl: `${PUBLIC_API_BASE}/api/public/assets/${asset.id}`,
+        settings,
+      });
+    }
+
+    if (
+      req.method === 'DELETE' &&
+      pathname === '/api/admin/brand/visitor-logo'
+    ) {
+      await requireTenantFeature('tenant_branding', payload.tenantId);
+      const current = await getConfig(payload.tenantId);
+      const oldAssetId = cleanText(
+        current.settings.visitorBrandAssetId,
+        80,
+      );
+      await pool.query(
+        `UPDATE tenant_config
+         SET settings=(COALESCE(settings,'{}'::jsonb) - 'visitorBrandAssetId') ||
+             CASE WHEN settings->>'visitorBrandLogo'='custom'
+               THEN '{"visitorBrandLogo":"none"}'::jsonb
+               ELSE '{}'::jsonb
+             END,
+             updated_at=NOW()
+         WHERE tenant_id=$1`,
+        [payload.tenantId],
+      );
+      if (isUuid(oldAssetId)) {
+        await deleteAsset(oldAssetId, payload.tenantId);
+      }
+      invalidateTenantCaches(payload.tenantId);
+      const settings = (await getConfig(payload.tenantId)).settings;
+      broadcast(
+        { type: 'settings-updated', settings },
+        null,
+        payload.tenantId,
+      );
+      await writeTenantAudit(req, payload, 'tenant.visitor_brand.delete', {
+        targetType: 'tenant',
+        targetId: payload.tenantId,
+      }).catch(() => {});
+      return sendJson(res, 200, { ok: true, settings });
     }
 
     if (req.method === 'POST' && pathname === '/api/admin/qr/logo') {
@@ -21455,6 +25142,39 @@ async function router(req, res, parsedRequestUrl = null) {
         ...(await getTenantNotices(payload.tenantId)),
       });
     }
+    if (req.method === 'POST' && pathname === '/api/admin/file-broadcasts') {
+      if (
+        !rateLimit(
+          req,
+          res,
+          'admin-file-broadcast',
+          20,
+          60_000,
+          payload.tenantId,
+        )
+      ) return;
+      const body = await readJson(req, 256 * 1024);
+      const result = await createAdminFileBroadcast(body, payload.tenantId);
+      for (const item of result.results) {
+        await broadcastMessageResult(
+          {
+            messages: item.messages,
+            summary: item.summary,
+            conversation: item.summary,
+          },
+          'admin-file-broadcast',
+          item.conversationId,
+          payload.tenantId,
+          apiVersion,
+        );
+      }
+      return sendJson(res, 201, {
+        ok: true,
+        recipientCount: result.results.length,
+        idempotentReplay: Boolean(result.idempotentReplay),
+        results: result.results,
+      });
+    }
     const announcementRead = pathname.match(
       /^\/api\/admin\/announcements\/([0-9a-f-]+)\/read$/i,
     );
@@ -21554,7 +25274,7 @@ async function router(req, res, parsedRequestUrl = null) {
     }
 
     const match = pathname.match(
-      /^\/api\/admin\/conversations\/([^/]+)(?:\/(messages|uploads|read|call))?$/,
+      /^\/api\/admin\/conversations\/([^/]+)(?:\/(messages|uploads|file-uploads|read|call))?$/,
     );
 
     if (match) {
@@ -21788,13 +25508,13 @@ async function router(req, res, parsedRequestUrl = null) {
             `,
             [conversationId],
           );
-          await queueObjectDeletes(
-            stored.rows.map((row) => row.object_key),
-            databaseClient,
-          );
           await databaseClient.query(
             `DELETE FROM conversations WHERE id=$1 AND tenant_id=$2`,
             [conversationId, payload.tenantId],
+          );
+          await queueObjectDeletes(
+            stored.rows.map((row) => row.object_key),
+            databaseClient,
           );
           await databaseClient.query('COMMIT');
         } catch (error) {
@@ -21860,11 +25580,12 @@ async function router(req, res, parsedRequestUrl = null) {
                 mode: signal.mode,
                 at: nowIso(),
               },
-              {
-                tenantId: payload.tenantId,
-                conversationId,
-                targetKind: 'tenant_admin',
-              },
+            {
+              tenantId: payload.tenantId,
+              conversationId,
+              targetKind: 'tenant_admin',
+              targetDeviceIds: [signal.deviceId || 'legacy'],
+            },
             );
             return sendJson(res, 200, {
               ok: true,
@@ -21998,6 +25719,10 @@ async function router(req, res, parsedRequestUrl = null) {
         return handleUpload(req, res, payload, conversation);
       }
 
+      if (req.method === 'POST' && action === 'file-uploads') {
+        return handleFileUploadInit(req, res, payload, conversation);
+      }
+
       if (req.method === 'POST' && action === 'messages') {
         if (
           !rateLimit(
@@ -22031,6 +25756,98 @@ async function router(req, res, parsedRequestUrl = null) {
         });
       }
     }
+  }
+
+  const fileDownloadMatch = pathname.match(
+    /^\/api\/files\/([0-9a-f-]+)\/download$/i,
+  );
+  if (req.method === 'GET' && fileDownloadMatch) {
+    const payload = authenticate(req);
+    if (!payload) {
+      return sendError(res, 401, '没有权限下载文件。', 'AUTH');
+    }
+    if (
+      payload.kind === 'user' &&
+      await rejectInvalidUserTokenOrigin(req, res, payload, pathname)
+    ) return;
+    if (!['user', 'tenant_admin'].includes(payload.kind)) {
+      return sendError(res, 403, '没有权限下载文件。', 'FORBIDDEN');
+    }
+    const attachmentId = fileDownloadMatch[1];
+    if (!isUuid(attachmentId)) {
+      return sendError(res, 404, '文件不存在。', 'NOT_FOUND');
+    }
+    const result = await pool.query(
+      `
+        SELECT
+          a.*,
+          c.visitor_key_hash,
+          c.tenant_id
+        FROM attachments a
+        JOIN messages m ON m.attachment_id=a.id
+        JOIN conversations c ON c.id=a.conversation_id
+        WHERE a.id=$1
+          AND a.storage='r2'
+          AND a.linked_at IS NOT NULL
+          AND m.type='file'
+          AND m.recalled_at IS NULL
+        LIMIT 1
+      `,
+      [attachmentId],
+    );
+    const row = result.rows[0];
+    if (!row) return sendError(res, 404, '文件不存在。', 'NOT_FOUND');
+    if (!authorizeConversation(payload, {
+      id: row.conversation_id,
+      tenant_id: row.tenant_id,
+      visitor_key_hash: row.visitor_key_hash,
+    })) {
+      return sendError(res, 403, '没有权限下载文件。', 'FORBIDDEN');
+    }
+    const tenant = payload.kind === 'tenant_admin'
+      ? await getTenantForAdminToken(payload)
+      : await getTenantById(row.tenant_id);
+    if (!tenant && payload.kind === 'tenant_admin') {
+      const tenantState = await getTenantById(payload.tenantId);
+      if (tenantAccessIssue(tenantState) === 'LICENSE_REVOKED') {
+        return sendTenantAccessError(res, tenantState, 'admin');
+      }
+      return sendError(res, 401, '后台登录已失效。', 'LICENSE_REPLACED');
+    }
+    if (tenantAccessIssue(tenant)) {
+      return sendTenantAccessError(
+        res,
+        tenant,
+        payload.kind === 'tenant_admin' ? 'admin' : 'user',
+      );
+    }
+    if (!rateLimit(
+      req,
+      res,
+      'file-download-url',
+      60,
+      60_000,
+      `${payload.kind}:${payload.tenantId}:${attachmentId}`,
+    )) return;
+    const downloadUrl = await signedFileDownloadUrl(row);
+    if (!downloadUrl) {
+      return sendError(
+        res,
+        503,
+        '文件存储暂时不可用。',
+        'FILE_STORAGE_UNAVAILABLE',
+      );
+    }
+    return sendJson(res, 200, {
+      ok: true,
+      downloadUrl,
+      filename: row.filename,
+      mime: row.mime,
+      size: Number(row.size),
+      expiresAt: new Date(
+        Date.now() + FILE_DOWNLOAD_URL_TTL_SECONDS * 1000,
+      ).toISOString(),
+    });
   }
 
   if (req.method === 'GET' && pathname.startsWith('/api/media/')) {
@@ -22186,11 +26003,16 @@ const server = http.createServer((req, res) => {
   }
   res.once('finish', () => {
     const duration = performance.now() - requestStartedAt;
+    const operationalError = isOperationalApiErrorStatus(res.statusCode);
+    const expectedClientMiss = isExpectedClientMiss(
+      res.statusCode,
+      requestPath,
+    );
     requestLatencies.push(duration);
     if (requestLatencies.length > 5000) {
       requestLatencies.splice(0, requestLatencies.length - 5000);
     }
-    if (res.statusCode >= 400) minuteCounters.errors += 1;
+    if (operationalError) minuteCounters.errors += 1;
     let routeKey = monitoredRouteKey(req.method, rawRequestPath);
     if (!routeCounters.has(routeKey) && routeCounters.size >= 200) {
       routeKey = `${String(req.method || 'GET').toUpperCase()} /api/:other`;
@@ -22201,13 +26023,21 @@ const server = http.createServer((req, res) => {
       responseBytes: 0,
     };
     routeMetric.requests += 1;
-    if (res.statusCode >= 400) routeMetric.errors += 1;
+    if (operationalError) routeMetric.errors += 1;
     routeMetric.responseBytes += Number(res.getHeader('Content-Length') || 0);
     routeCounters.set(routeKey, routeMetric);
-    if (duration >= SLOW_API_MS || res.statusCode >= 400) {
+    if (
+      duration >= SLOW_API_MS ||
+      operationalError ||
+      (res.statusCode >= 400 && !expectedClientMiss)
+    ) {
       const logger = res.statusCode >= 500 ? console.error : console.warn;
       logger(JSON.stringify({
-        event: res.statusCode >= 400 ? 'api_request_error' : 'slow_api_request',
+        event: operationalError
+          ? 'api_request_error'
+          : res.statusCode >= 400
+            ? 'api_client_error'
+            : 'slow_api_request',
         requestId,
         traceId,
         method: String(req.method || 'GET').toUpperCase(),
