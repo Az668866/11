@@ -12696,9 +12696,9 @@ function telegramShopHelpText() {
     '2. OKPay使用USDT支付；USDT-TRC20需要向页面显示的波场地址转账。',
     '3. 订单有效期为20分钟，少付不会自动发货。',
     '4. 卡密成功生成后只在购买消息中显示一次，请立即保存。',
-    '5. 查询新增访客时发送已激活的普通卡密，再选择查询时间。',
+    '5. 查询新增访客时发送已激活的卡密，再选择查询时间。',
     '6. 如果商家后台保存时间不足你选择的范围，系统会按实际保留时间统计。',
-    '7. 多付、晚到账或异常订单会转人工核验，不会自动发错卡密。',
+    '7. 多付、晚到账或异常订单会转人工核验，不会自动发卡密。',
   ].join('\n');
 }
 
@@ -13501,7 +13501,7 @@ async function handleTelegramShopPrivateInbound(message) {
     const license = result.rows[0];
     if (!license || license.status !== 'active' || !license.tenant_id ||
         (license.expires_at && new Date(license.expires_at).getTime() <= Date.now())) {
-      await telegramApi('sendMessage', { chat_id: message.chat.id, text: '卡密无效、未激活或已到期，请发送已激活的普通卡密。' });
+      await telegramApi('sendMessage', { chat_id: message.chat.id, text: '卡密无效、未激活或已到期，请发送已激活的卡密。' });
       return true;
     }
     await setTelegramShopSession(userId, 'query_window', { licenseId: license.id });
@@ -13638,7 +13638,7 @@ async function handleTelegramShopCallback(callback) {
   }
   if (data === 'shop:query') {
     await setTelegramShopSession(userId, 'query_key');
-    await telegramApi('sendMessage', { chat_id: chatId, text: '请发送你要查询的已激活普通卡密。' });
+    await telegramApi('sendMessage', { chat_id: chatId, text: '请发送你要查询的已激活卡密。' });
     return true;
   }
   if (parts[1] === 'pkg' && TELEGRAM_SHOP_DURATION_CODES.includes(parts[2])) {
@@ -21035,7 +21035,7 @@ async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
             Number(activeCounts.mobile || 0) > maxMobileDevices
           ) {
             throw requestError(
-              '新上限低于当前已登记设备数，请先点击“清空普通卡密设备”。',
+              '新上限低于当前已登记设备数，请先点击“清空卡密设备”。',
               409,
               'DEVICE_LIMIT_BELOW_ACTIVE',
             );
@@ -21091,7 +21091,7 @@ async function handleSuperRoutes(req, res, url, pathname, apiVersion = 1) {
         if (row?.tenant_id) {
           disconnectTenantLicense(row.tenant_id, licenseId, {
             type: 'device-authorization-reset',
-            message: '管理员已清空普通卡密设备，请重新登录登记。',
+            message: '管理员已清空卡密设备，请重新登录登记。',
             at: nowIso(),
           });
         }
