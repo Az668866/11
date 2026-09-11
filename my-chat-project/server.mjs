@@ -12635,6 +12635,18 @@ async function checkOkpayTransfer(uniqueId) {
   });
 }
 
+async function checkOkpayDeposit(uniqueId) {
+  return okpayRequest('/shop/checkDeposit', {
+    unique_id: String(uniqueId),
+  });
+}
+
+async function checkOkpayDepositByOrderId(orderId) {
+  return okpayRequest('/shop/checkTransferByTxid', {
+    txid: String(orderId),
+  });
+}
+
 async function createOkpayOrderLink(order) {
   const callbackUrl = `${PUBLIC_API_BASE}/api/okpay/callback`;
   const result = await okpayRequest('/shop/payLink', {
@@ -13293,6 +13305,62 @@ async function markTelegramShopOrderPaid(orderId, payment = {}) {
   }
   if (shouldFulfill) return fulfillTelegramShopOrder(order.id);
   return { state: 'unchanged', order };
+}
+
+async function reconcileOkpayShopOrder(order) {
+  if (!order || order.payment_method !== 'okpay_usdt') {
+    throw new Error('该订单不是OKPay订单。');
+  }
+  if (!order.okpay_unique_id) {
+    throw new Error('OKPay商户订单号缺失，已停止自动发货。');
+  }
+  const checked = await checkOkpayDeposit(order.okpay_unique_id);
+  const deposit = checked.data || {};
+  const checkedUniqueId = cleanText(deposit.unique_id, 160);
+  if (checkedUniqueId && checkedUniqueId !== order.okpay_unique_id) {
+    throw new Error('OKPay返回的商户订单号不一致，已停止自动发货。');
+  }
+  if (Number(deposit.status) !== 1) {
+    return { state: 'pending', order };
+  }
+  const providerOrderId = cleanText(
+    deposit.order_id || order.okpay_order_id,
+    160,
+  );
+  if (!providerOrderId) {
+    throw new Error('OKPay已支付订单缺少平台订单号，已停止自动发货。');
+  }
+  if (order.okpay_order_id && order.okpay_order_id !== providerOrderId) {
+    throw new Error('OKPay返回的平台订单号不一致，已停止自动发货。');
+  }
+  // checkDeposit 的精简响应可能不含付款人。按协议再按平台订单号查询，
+  // 只有付款 Telegram ID、金额和订单号均可核对时才允许自动发卡。
+  const detailed = await checkOkpayDepositByOrderId(providerOrderId);
+  const payment = { ...deposit, ...(detailed.data || {}) };
+  if (Number(payment.status) !== 1) return { state: 'pending', order };
+  if (cleanText(payment.unique_id, 160) !== order.okpay_unique_id) {
+    throw new Error('OKPay查单返回的商户订单号不一致，已停止自动发货。');
+  }
+  if (cleanText(payment.order_id, 160) !== providerOrderId) {
+    throw new Error('OKPay查单返回的平台订单号不一致，已停止自动发货。');
+  }
+  if (String(payment.coin || '').toUpperCase() !== 'USDT') {
+    throw new Error('OKPay查单返回的币种不是USDT，已停止自动发货。');
+  }
+  if (!/^\d+$/.test(String(payment.pay_user_id || ''))) {
+    throw new Error('OKPay查单缺少付款Telegram ID，已转人工核验。');
+  }
+  await pool.query(
+    `UPDATE telegram_shop_orders
+     SET okpay_order_id=COALESCE(okpay_order_id,$2),updated_at=NOW()
+     WHERE id=$1`,
+    [order.id, providerOrderId],
+  );
+  return markTelegramShopOrderPaid(order.id, {
+    userId: String(payment.pay_user_id),
+    amount: String(payment.amount || ''),
+    txid: providerOrderId,
+  });
 }
 
 async function fetchTronUsdtTransfers(walletAddress) {
@@ -14006,6 +14074,31 @@ async function handleTelegramShopCallback(callback) {
     const order = result.rows[0];
     if (!order) {
       await telegramApi('sendMessage', { chat_id: chatId, text: '订单不存在或不属于当前用户。' });
+      return true;
+    }
+    if (order.payment_method === 'okpay_usdt' && order.payment_status === 'pending') {
+      try {
+        const checked = await reconcileOkpayShopOrder(order);
+        if (['delivered', 'already_paid'].includes(checked.state)) {
+          await editTelegramShopCallbackMessage(
+            callback,
+            '<b>✅ OKPay支付已确认</b>\n\n卡密已经发送，请在当前聊天中查看并立即保存。',
+            telegramShopMainKeyboard(TELEGRAM_ALLOWED_USER_IDS.has(userId)),
+          );
+        } else {
+          await editTelegramShopCallbackMessage(
+            callback,
+            `${telegramShopOrderText(order, true)}\n\n⏳ OKPay暂未确认到账，请完成支付后稍候再查询。`,
+            callback.message.reply_markup,
+          );
+        }
+      } catch (error) {
+        await editTelegramShopCallbackMessage(
+          callback,
+          `${telegramShopOrderText(order, true)}\n\n⚠️ 暂时无法完成OKPay查单：${escapeTelegramHtml(cleanText(error.message, 240))}`,
+          callback.message.reply_markup,
+        );
+      }
       return true;
     }
     if (order.payment_status === 'expired' || order.payment_status === 'overpaid' || order.payment_status === 'late' || order.payment_status === 'manual') {
@@ -17028,7 +17121,7 @@ async function applyOkpayTransferResult(data, { fallbackMessage = false } = {}) 
          error_message=$5,
          submitted_at=COALESCE(submitted_at,NOW()),
          completed_at=CASE WHEN $6::boolean THEN COALESCE(completed_at,NOW()) ELSE completed_at END,
-         next_check_at=CASE WHEN $6::boolean THEN NULL ELSE $7 END,
+         next_check_at=CASE WHEN $6::boolean THEN NULL::timestamptz ELSE $7::timestamptz END,
          last_checked_at=NOW(),updated_at=NOW()
      WHERE id=$1 AND status NOT IN ('succeeded','failed','cancelled','expired')
      RETURNING *`,
@@ -24014,6 +24107,7 @@ async function router(req, res, parsedRequestUrl = null) {
     apiVersion === 1 &&
     pathname.startsWith('/api/') &&
     pathname !== '/api/telegram/webhook' &&
+    pathname !== '/api/okpay/callback' &&
     !pathname.startsWith('/api/public/') &&
     !requireLegacyApi(res, apiVersion)
   ) return;

@@ -149,6 +149,24 @@ test('signed success responses and withdrawal callbacks are verified', () => {
   assert.match(source, /providerAmount !== expectedAmount/);
 });
 
+test('OKPay deposits have a reachable signed callback and a safe manual lookup fallback', () => {
+  assert.match(source, /pathname !== '\/api\/okpay\/callback'/);
+  assert.match(source, /return okpayRequest\('\/shop\/checkDeposit'/);
+  assert.match(source, /return okpayRequest\('\/shop\/checkTransferByTxid'/);
+  assert.match(source, /async function reconcileOkpayShopOrder\(order\)/);
+  assert.match(source, /Number\(payment\.status\) !== 1/);
+  assert.match(source, /payment\.pay_user_id/);
+  assert.match(source, /markTelegramShopOrderPaid\(order\.id/);
+  assert.match(source, /await reconcileOkpayShopOrder\(order\)/);
+});
+
+test('OKPay transfer status update casts nullable timestamps explicitly', () => {
+  assert.match(
+    source,
+    /NULL::timestamptz ELSE \$7::timestamptz/,
+  );
+});
+
 test('shop navigation uses a persistent menu and edits ordinary callback pages', () => {
   assert.match(source, /function telegramShopPersistentKeyboard/);
   assert.match(source, /is_persistent: true/);
