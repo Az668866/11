@@ -144,6 +144,13 @@ const INSTANCE_MEMORY_MB = envNumber(
 );
 const INSTANCE_CPU_CORES = envNumber('INSTANCE_CPU_CORES', 1, 0.1, 256);
 const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
+// Telegram 的 update_id 只用于同一个机器人内部去重。更换机器人后编号可能
+// 从另一段序列重新开始，因此必须同时带上机器人 ID，不能跨机器人共用主键。
+// Bot Token 冒号前的数字就是公开的机器人 ID；任何位置都不保存完整 Token。
+const TELEGRAM_BOT_ID = TELEGRAM_BOT_TOKEN.match(/^(\d+):/)?.[1] ||
+  (TELEGRAM_BOT_TOKEN
+    ? `token-${createHash('sha256').update(TELEGRAM_BOT_TOKEN).digest('hex').slice(0, 24)}`
+    : 'disabled');
 const TELEGRAM_WEBHOOK_SECRET = String(process.env.TELEGRAM_WEBHOOK_SECRET || '').trim();
 // Telegram 自动售卡支付配置。OKPay 的密钥和 TronGrid 的只读 API Key
 // 只从服务器环境变量读取，绝不进入机器人消息、数据库订单正文或日志。
@@ -1838,6 +1845,14 @@ async function initDatabase() {
       )
     `);
     await client.query(`
+      CREATE TABLE IF NOT EXISTS telegram_bot_updates (
+        bot_id TEXT NOT NULL,
+        update_id BIGINT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (bot_id, update_id)
+      )
+    `);
+    await client.query(`
       CREATE TABLE IF NOT EXISTS telegram_group_accounts (
         chat_id TEXT PRIMARY KEY,
         balance NUMERIC(20,2) NOT NULL DEFAULT 0,
@@ -2008,6 +2023,7 @@ async function initDatabase() {
     await client.query(`ALTER TABLE license_keys ADD COLUMN IF NOT EXISTS telegram_username TEXT`);
     await client.query(`ALTER TABLE license_keys ADD COLUMN IF NOT EXISTS telegram_display_name TEXT`);
     await client.query(`ALTER TABLE license_keys ADD COLUMN IF NOT EXISTS key_ciphertext TEXT`);
+    await client.query(`ALTER TABLE license_keys ADD COLUMN IF NOT EXISTS telegram_bot_id TEXT`);
     await client.query(`ALTER TABLE license_keys ADD COLUMN IF NOT EXISTS telegram_update_id BIGINT`);
     await client.query(`ALTER TABLE license_keys ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ`);
 
@@ -2432,10 +2448,11 @@ async function initDatabase() {
     await client.query(`CREATE INDEX IF NOT EXISTS license_keys_created_at_idx ON license_keys (created_at DESC)`);
     await client.query(`CREATE INDEX IF NOT EXISTS license_keys_page_idx ON license_keys (created_at DESC, id DESC)`);
     await client.query(`CREATE INDEX IF NOT EXISTS license_keys_suffix_idx ON license_keys (key_suffix)`);
+    await client.query(`DROP INDEX IF EXISTS license_keys_telegram_update_unique_idx`);
     await client.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS license_keys_telegram_update_unique_idx
-      ON license_keys (telegram_update_id)
-      WHERE telegram_update_id IS NOT NULL
+      CREATE UNIQUE INDEX IF NOT EXISTS license_keys_telegram_bot_update_unique_idx
+      ON license_keys (telegram_bot_id, telegram_update_id)
+      WHERE telegram_bot_id IS NOT NULL AND telegram_update_id IS NOT NULL
     `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS messages_conversation_created_idx
@@ -2480,6 +2497,10 @@ async function initDatabase() {
     await client.query(`
       CREATE INDEX IF NOT EXISTS telegram_updates_created_at_idx
       ON telegram_updates (created_at)
+    `);
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS telegram_bot_updates_created_at_idx
+      ON telegram_bot_updates (created_at)
     `);
     await client.query(`
       CREATE INDEX IF NOT EXISTS tenants_expiry_reminder_idx
@@ -3076,6 +3097,7 @@ async function cleanupExpiredData() {
     );
 
     await client.query(`DELETE FROM telegram_updates WHERE created_at < NOW() - INTERVAL '30 days'`);
+    await client.query(`DELETE FROM telegram_bot_updates WHERE created_at < NOW() - INTERVAL '30 days'`);
     await client.query(`
       DELETE FROM telegram_shop_sessions
       WHERE updated_at < NOW() - INTERVAL '1 day'
@@ -11523,12 +11545,16 @@ async function createLicenseRecord(
   if (!duration) throw new Error('卡密时长无效。');
   const updateId = Number(metadata.telegramUpdateId);
   const telegramUpdateId = Number.isSafeInteger(updateId) ? updateId : null;
+  const telegramBotId = telegramUpdateId == null
+    ? null
+    : cleanText(metadata.telegramBotId, 80) || null;
 
   async function existingForUpdate() {
-    if (telegramUpdateId == null) return null;
+    if (telegramUpdateId == null || !telegramBotId) return null;
     const result = await queryClient.query(
-      `SELECT * FROM license_keys WHERE telegram_update_id = $1`,
-      [telegramUpdateId],
+      `SELECT * FROM license_keys
+       WHERE telegram_bot_id = $1 AND telegram_update_id = $2`,
+      [telegramBotId, telegramUpdateId],
     );
     const row = result.rows[0];
     if (!row) return null;
@@ -11577,10 +11603,10 @@ async function createLicenseRecord(
             max_desktop_devices,max_mobile_devices,
             duration_code, duration_days,
             telegram_chat_id, telegram_user_id, telegram_username,
-            telegram_display_name, telegram_update_id, generated_by_admin_id,
-            generated_by_distributor_id
+            telegram_display_name, telegram_bot_id, telegram_update_id,
+            generated_by_admin_id, generated_by_distributor_id
           ) VALUES (
-            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19
+            $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20
           )
           ON CONFLICT DO NOTHING
           RETURNING *
@@ -11593,6 +11619,7 @@ async function createLicenseRecord(
          cleanText(metadata.telegramUserId, 50),
          cleanText(metadata.telegramUsername, 64),
          cleanText(metadata.telegramDisplayName, 120),
+         telegramBotId,
          telegramUpdateId,
          isUuid(metadata.generatedByAdminId)
            ? metadata.generatedByAdminId
@@ -16752,8 +16779,8 @@ function telegramOkpayTransferText(transfer) {
   return lines.join('\n');
 }
 
-async function editTelegramOkpayTransferMessage(transfer, fallback = false) {
-  if (!transfer?.telegram_message_id || !transfer?.chat_id) return;
+async function editTelegramOkpayTransferMessage(transfer, fallback = true) {
+  if (!transfer?.chat_id) return;
   const payload = {
     chat_id: transfer.chat_id,
     message_id: transfer.telegram_message_id,
@@ -16764,16 +16791,32 @@ async function editTelegramOkpayTransferMessage(transfer, fallback = false) {
       ? telegramOkpayTransferKeyboard(transfer.id)
       : { inline_keyboard: [] },
   };
-  try {
-    await telegramApi('editMessageText', payload);
-  } catch (error) {
+  const sendFallback = async () => {
     if (!fallback) return;
     await telegramApi('sendMessage', {
       chat_id: transfer.chat_id,
       text: payload.text,
       parse_mode: 'HTML',
       link_preview_options: payload.link_preview_options,
-    }).catch(() => {});
+    }).catch((error) => {
+      console.error(
+        'Telegram 转账备用状态消息发送失败：',
+        cleanText(error?.message || '未知错误', 160),
+      );
+    });
+  };
+  if (!transfer.telegram_message_id) {
+    await sendFallback();
+    return;
+  }
+  try {
+    await telegramApi('editMessageText', payload);
+  } catch (error) {
+    console.error(
+      'Telegram 转账状态消息更新失败：',
+      cleanText(error?.message || '未知错误', 160),
+    );
+    await sendFallback();
   }
 }
 
@@ -17854,6 +17897,7 @@ async function processTelegramUpdate(update) {
         telegramUserId: userId,
         telegramUsername: callback.from?.username || '',
         telegramDisplayName: telegramDisplayName(callback.from),
+        telegramBotId: TELEGRAM_BOT_ID,
         telegramUpdateId: update.update_id,
       });
       await showTelegramGeneratedLicense(callback, created);
@@ -23976,7 +24020,13 @@ async function router(req, res, parsedRequestUrl = null) {
     const update=await readJson(req,512*1024);
     const updateId=Number(update.update_id);
     if (Number.isSafeInteger(updateId)) {
-      const claimed=await pool.query(`INSERT INTO telegram_updates(update_id) VALUES($1) ON CONFLICT DO NOTHING RETURNING update_id`,[updateId]);
+      const claimed=await pool.query(
+        `INSERT INTO telegram_bot_updates(bot_id,update_id)
+         VALUES($1,$2)
+         ON CONFLICT DO NOTHING
+         RETURNING update_id`,
+        [TELEGRAM_BOT_ID,updateId],
+      );
       if (!claimed.rows[0]) return sendJson(res,200,{ok:true});
     }
     try {
@@ -23986,8 +24036,8 @@ async function router(req, res, parsedRequestUrl = null) {
       minuteCounters.telegramWebhookFailures += 1;
       if (Number.isSafeInteger(updateId)) {
         await pool.query(
-          `DELETE FROM telegram_updates WHERE update_id=$1`,
-          [updateId],
+          `DELETE FROM telegram_bot_updates WHERE bot_id=$1 AND update_id=$2`,
+          [TELEGRAM_BOT_ID,updateId],
         ).catch(() => {});
       }
       return sendError(res,500,'Telegram 更新处理失败，请重新发送指令。','TELEGRAM_PROCESSING');

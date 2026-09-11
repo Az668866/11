@@ -85,6 +85,28 @@ test('transfer flow keeps authorization, confirmation and idempotency barriers',
   assert.match(source, /WHERE id=\$1 AND status='awaiting_confirmation'/);
   assert.match(source, /Keep the same unique_id and query it later instead of retrying a debit/);
   assert.match(source, /status NOT IN \('succeeded','failed','cancelled','expired'\)/);
+  assert.match(source, /async function editTelegramOkpayTransferMessage\(transfer, fallback = true\)/);
+  assert.match(source, /Telegram 转账状态消息更新失败/);
+});
+
+test('Telegram update deduplication is scoped to the active bot', () => {
+  assert.match(source, /const TELEGRAM_BOT_ID = TELEGRAM_BOT_TOKEN\.match/);
+  assert.match(source, /CREATE TABLE IF NOT EXISTS telegram_bot_updates/);
+  assert.match(source, /PRIMARY KEY \(bot_id, update_id\)/);
+  assert.match(source, /INSERT INTO telegram_bot_updates\(bot_id,update_id\)/);
+  assert.match(source, /\[TELEGRAM_BOT_ID,updateId\]/);
+  assert.match(source, /DELETE FROM telegram_bot_updates WHERE bot_id=\$1 AND update_id=\$2/);
+  assert.doesNotMatch(
+    source,
+    /INSERT INTO telegram_updates\(update_id\) VALUES/,
+  );
+});
+
+test('Telegram-generated license idempotency is also scoped to the bot', () => {
+  assert.match(source, /ALTER TABLE license_keys ADD COLUMN IF NOT EXISTS telegram_bot_id TEXT/);
+  assert.match(source, /ON license_keys \(telegram_bot_id, telegram_update_id\)/);
+  assert.match(source, /WHERE telegram_bot_id = \$1 AND telegram_update_id = \$2/);
+  assert.match(source, /telegramBotId: TELEGRAM_BOT_ID/);
 });
 
 test('transfer command accepts only the renamed, bounded format', () => {
