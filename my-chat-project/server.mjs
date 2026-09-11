@@ -14203,6 +14203,8 @@ function telegramGeneratedLicenseText(created) {
     '你的后台网站是 <b>YKF000.com</b>',
     '为了你的隐私和客户安全',
     '请保护好你的卡密 不要泄露！',
+	'拓界云服不会向外展示或再次提供完整卡密。',
+	'<b>请妥善保管；未保存时平台无法恢复。</b>',
     '',
     `卡密类型：${created.duration.label}`,
     `有效时长：首次登录后台后 ${licenseUnusedDurationLabel(created.row)}`,
