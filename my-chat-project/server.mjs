@@ -152,6 +152,13 @@ const TELEGRAM_BOT_ID = TELEGRAM_BOT_TOKEN.match(/^(\d+):/)?.[1] ||
     ? `token-${createHash('sha256').update(TELEGRAM_BOT_TOKEN).digest('hex').slice(0, 24)}`
     : 'disabled');
 const TELEGRAM_WEBHOOK_SECRET = String(process.env.TELEGRAM_WEBHOOK_SECRET || '').trim();
+// 绑定机器人 ID 后，即使旧机器人仍保留相同 URL 和旧 secret_token，也无法
+// 再把更新串到当前机器人。更换 Bot Token 不需要手工再生成环境变量。
+const TELEGRAM_WEBHOOK_VERIFY_SECRET = createHmac(
+  'sha256',
+  TELEGRAM_WEBHOOK_SECRET,
+).update(`tuojie-telegram-webhook:${TELEGRAM_BOT_ID}`).digest('hex');
+const TELEGRAM_WEBHOOK_URL = `${PUBLIC_API_BASE}/api/telegram/webhook`;
 // Telegram 自动售卡支付配置。OKPay 的密钥和 TronGrid 的只读 API Key
 // 只从服务器环境变量读取，绝不进入机器人消息、数据库订单正文或日志。
 const OKPAY_API_BASE = String(
@@ -566,6 +573,9 @@ if (REQUIRE_CLOUDFLARE && CLOUDFLARE_ORIGIN_SECRET.length < 24) {
   );
 }
 if (TELEGRAM_ENABLED) {
+  if (!/^\d+:[A-Za-z0-9_-]{20,}$/.test(TELEGRAM_BOT_TOKEN)) {
+    throw new Error('TELEGRAM_BOT_TOKEN 格式不正确。');
+  }
   if (!/^[A-Za-z0-9_-]{16,256}$/.test(TELEGRAM_WEBHOOK_SECRET)) {
     throw new Error('TELEGRAM_WEBHOOK_SECRET 必须为16-256位字母、数字、下划线或短横线。');
   }
@@ -12206,6 +12216,55 @@ async function telegramApi(method, payload) {
     throw new Error(result?.description || `Telegram ${method} 失败。`);
   }
   return result.result;
+}
+
+let telegramWebhookReady = !TELEGRAM_ENABLED;
+let telegramWebhookError = '';
+let telegramWebhookRetryTimer = null;
+
+async function configureTelegramWebhook() {
+  if (!TELEGRAM_ENABLED) return;
+  const bot = await telegramApi('getMe', {});
+  if (String(bot?.id || '') !== TELEGRAM_BOT_ID) {
+    throw new Error('Telegram Bot Token 中的机器人 ID 与 getMe 返回结果不一致。');
+  }
+  await telegramApi('setWebhook', {
+    url: TELEGRAM_WEBHOOK_URL,
+    secret_token: TELEGRAM_WEBHOOK_VERIFY_SECRET,
+    allowed_updates: ['message', 'callback_query'],
+    drop_pending_updates: false,
+    max_connections: 20,
+  });
+  const info = await telegramApi('getWebhookInfo', {});
+  const allowedUpdates = new Set(info?.allowed_updates || []);
+  if (
+    info?.url !== TELEGRAM_WEBHOOK_URL ||
+    !allowedUpdates.has('message') ||
+    !allowedUpdates.has('callback_query')
+  ) {
+    throw new Error('Telegram Webhook 验收失败：地址或按键回调订阅不一致。');
+  }
+  telegramWebhookReady = true;
+  telegramWebhookError = '';
+  console.log(
+    `Telegram Webhook：已绑定 @${cleanText(bot.username || 'unknown', 80)}（ID ${TELEGRAM_BOT_ID}），已订阅消息和按键回调`,
+  );
+}
+
+function scheduleTelegramWebhookConfiguration(delayMs = 0) {
+  if (!TELEGRAM_ENABLED || telegramWebhookRetryTimer) return;
+  telegramWebhookRetryTimer = setTimeout(async () => {
+    telegramWebhookRetryTimer = null;
+    try {
+      await configureTelegramWebhook();
+    } catch (error) {
+      telegramWebhookReady = false;
+      telegramWebhookError = cleanText(error?.message || '未知错误', 240);
+      console.error('Telegram Webhook 自动绑定失败：', telegramWebhookError);
+      scheduleTelegramWebhookConfiguration(60_000);
+    }
+  }, Math.max(0, delayMs));
+  telegramWebhookRetryTimer.unref();
 }
 
 const TELEGRAM_SHOP_DURATION_CODES = Object.freeze([
@@ -23867,6 +23926,7 @@ async function router(req, res, parsedRequestUrl = null) {
       mediaStorage: R2_ENABLED ? 'cloudflare-r2' : 'postgres-fallback',
       defaultRetentionHours: RETENTION_HOURS,
       telegramBotEnabled: TELEGRAM_ENABLED,
+      telegramWebhookReady,
       databaseCheck: false,
       readinessEndpoint: '/health/ready',
       at: nowIso(),
@@ -23882,6 +23942,7 @@ async function router(req, res, parsedRequestUrl = null) {
       database: 'neon-postgresql',
       mediaStorage: R2_ENABLED ? 'cloudflare-r2' : 'postgres-fallback',
       telegramBotEnabled: TELEGRAM_ENABLED,
+      telegramWebhookReady,
       superAdminReady: readiness.superAdminReady,
       databaseTime: readiness.databaseTime,
       cacheSeconds: READINESS_CACHE_MS / 1000,
@@ -24016,7 +24077,7 @@ async function router(req, res, parsedRequestUrl = null) {
   if (req.method === 'POST' && pathname === '/api/telegram/webhook') {
     if (!TELEGRAM_ENABLED) return sendError(res,404,'Telegram 机器人未启用。','NOT_FOUND');
     const secret=String(req.headers['x-telegram-bot-api-secret-token']||'');
-    if (!timingSafeTextEqual(secret,TELEGRAM_WEBHOOK_SECRET)) return sendError(res,403,'Webhook 校验失败。','TELEGRAM_SECRET');
+    if (!timingSafeTextEqual(secret,TELEGRAM_WEBHOOK_VERIFY_SECRET)) return sendError(res,403,'Webhook 校验失败。','TELEGRAM_SECRET');
     const update=await readJson(req,512*1024);
     const updateId=Number(update.update_id);
     if (Number.isSafeInteger(updateId)) {
@@ -26945,6 +27006,10 @@ server.keepAliveTimeout = 65_000;
 
 async function shutdown(signal) {
   console.log(`${signal}：正在关闭服务。`);
+  if (telegramWebhookRetryTimer) {
+    clearTimeout(telegramWebhookRetryTimer);
+    telegramWebhookRetryTimer = null;
+  }
   server.close(async () => {
     try {
       await pool.end();
@@ -26966,4 +27031,5 @@ server.listen(PORT, HOST, () => {
   console.log(`拓界云客服 v${APP_VERSION} 已启动：http://${HOST}:${PORT}`);
   console.log(`媒体存储：${R2_ENABLED ? 'Cloudflare R2' : 'PostgreSQL 兼容模式'}`);
   console.log(`Telegram 发卡机器人：${TELEGRAM_ENABLED ? '已启用' : '未启用'}`);
+  scheduleTelegramWebhookConfiguration();
 });

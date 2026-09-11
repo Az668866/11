@@ -102,6 +102,22 @@ test('Telegram update deduplication is scoped to the active bot', () => {
   );
 });
 
+test('startup binds message and callback updates to the current Telegram bot', () => {
+  assert.match(source, /const TELEGRAM_WEBHOOK_VERIFY_SECRET = createHmac/);
+  assert.match(source, /\.update\(`tuojie-telegram-webhook:\$\{TELEGRAM_BOT_ID\}`\)/);
+  assert.match(source, /telegramApi\('setWebhook'/);
+  assert.match(source, /allowed_updates: \['message', 'callback_query'\]/);
+  assert.match(source, /secret_token: TELEGRAM_WEBHOOK_VERIFY_SECRET/);
+  assert.match(source, /telegramApi\('getWebhookInfo'/);
+  assert.match(source, /allowedUpdates\.has\('callback_query'\)/);
+  assert.match(source, /scheduleTelegramWebhookConfiguration\(\);/);
+  assert.match(source, /timingSafeTextEqual\(secret,TELEGRAM_WEBHOOK_VERIFY_SECRET\)/);
+  assert.doesNotMatch(
+    source,
+    /timingSafeTextEqual\(secret,TELEGRAM_WEBHOOK_SECRET\)/,
+  );
+});
+
 test('Telegram-generated license idempotency is also scoped to the bot', () => {
   assert.match(source, /ALTER TABLE license_keys ADD COLUMN IF NOT EXISTS telegram_bot_id TEXT/);
   assert.match(source, /ON license_keys \(telegram_bot_id, telegram_update_id\)/);
