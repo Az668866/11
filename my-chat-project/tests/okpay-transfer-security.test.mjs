@@ -32,6 +32,16 @@ function loadTransferParser() {
   return factory();
 }
 
+function loadShopTokenAmount() {
+  const start = source.indexOf('function shopDecimalUnits');
+  const end = source.indexOf('function shopOrderPublic', start);
+  assert.ok(start >= 0 && end > start, 'shop amount helpers must exist');
+  const factory = new Function(
+    `${source.slice(start, end)}\nreturn shopTokenAmount;`,
+  );
+  return factory();
+}
+
 test('OKPay HMAC implementation matches all protocol vectors', () => {
   const signing = loadOkpaySigning('TESTtoken123456789abcdefghijABCD');
   assert.equal(
@@ -75,6 +85,14 @@ test('OKPay HMAC implementation matches all protocol vectors', () => {
     }),
     '8BC0AF979075038025DDD51B6F4A2E6CF3FF9B5B5371EB2268D303F89883E92A',
   );
+});
+
+test('OKPay fixed 8-decimal USDT amounts compare without rounding', () => {
+  const amount = loadShopTokenAmount();
+  assert.equal(amount('10.00000000'), 10_000_000n);
+  assert.equal(amount('10.12345600'), 10_123_456n);
+  assert.equal(amount('10.12345601'), null);
+  assert.equal(amount(''), null);
 });
 
 test('transfer flow keeps authorization, confirmation and idempotency barriers', () => {

@@ -12441,7 +12441,10 @@ function shopDecimalUnits(value, scale = 6) {
   const match = text.match(/^(\d+)(?:\.(\d+))?$/);
   if (!match || match[1].length > 18) return null;
   const fraction = match[2] || '';
-  if (fraction.length > scale) return null;
+  // Some OKPay production responses serialize USDT with 8 decimal places.
+  // Accept precision beyond the local scale only when the discarded digits
+  // are all zero, so comparison remains exact and never rounds a payment up.
+  if (fraction.length > scale && /[^0]/.test(fraction.slice(scale))) return null;
   try {
     const units = BigInt(match[1]) * (10n ** BigInt(scale)) +
       BigInt((fraction + '0'.repeat(scale)).slice(0, scale) || '0');
