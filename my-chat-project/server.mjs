@@ -6668,6 +6668,9 @@ async function requestCloudflareTurnCredentials(scopeKey) {
 
 async function realtimeConfig(scopeKey = 'shared') {
   const fallback = staticRealtimeConfig();
+  // A configured private relay is the primary route. Cloudflare TURN is only used
+  // when no private TURN is configured, because its network does not cover mainland China.
+  if (fallback.turnConfigured) return fallback;
   if (!CLOUDFLARE_TURN_ENABLED) return fallback;
   if (cloudflareTurnFailureUntil > Date.now()) {
     return {
@@ -6706,7 +6709,7 @@ function parseCallSignal(body = {}) {
   const callId = cleanText(body.callId, 80);
   if (![
     'offer','claim','answer','ice','connected',
-    'hangup','reject','busy','timeout','failed',
+    'hangup','reject','busy','timeout','failed','media-state',
   ].includes(action)) {
     throw requestError('通话信令类型无效。', 400, 'CALL_ACTION');
   }
@@ -6720,6 +6723,7 @@ function parseCallSignal(body = {}) {
     mode,
     deviceId: cleanText(body.deviceId, 120),
     reason: cleanText(body.reason, 120),
+    renegotiation: body.renegotiation === true,
   };
   if (action === 'offer' || action === 'answer') {
     const sdp = body.sdp;
@@ -6731,6 +6735,10 @@ function parseCallSignal(body = {}) {
       throw requestError('通话描述为空或格式无效。', 400, 'CALL_SDP');
     }
     signal.sdp = { type: sdp.type, sdp: value };
+  }
+  if (action === 'media-state') {
+    signal.muted = body.muted === true;
+    signal.cameraOff = body.cameraOff === true;
   }
   if (action === 'ice') {
     const candidate = body.candidate;
@@ -7176,11 +7184,20 @@ async function savePendingCallOffer(
     );
     const existing = existingResult.rows[0];
     if (existing) {
-      if (
-        existing.caller_kind !== normalizedCallerKind ||
+      if (signal.renegotiation && !['answered','connected'].includes(existing.status)) {
+        throw requestError('这次通话还未接听，不能重新协商。', 409, 'CALL_NOT_ANSWERED');
+      }
+      const sameOriginalCaller = existing.caller_kind === normalizedCallerKind;
+      const actorKey = callActorKey(normalizedCallerKind, callerDeviceId);
+      const wrongOriginalDevice = sameOriginalCaller && (
         existing.caller_device_id && existing.caller_device_id !== callerDeviceId
-      ) {
-        throw requestError('通话编号已被使用。', 409, 'CALL_ID_CONFLICT');
+      );
+      const unclaimedOppositeParticipant = !sameOriginalCaller && existing.claimed_by !== actorKey;
+      const wrongAssignedAdmin = !sameOriginalCaller && normalizedCallerKind === 'admin' && (
+        existing.assigned_device_id && existing.assigned_device_id !== callerDeviceId
+      );
+      if (wrongOriginalDevice || unclaimedOppositeParticipant || wrongAssignedAdmin) {
+        throw requestError('当前设备不是这次通话的参与方。', 409, 'CALL_PARTICIPANT_CONFLICT');
       }
       if (!ACTIVE_CALL_STATUSES.has(existing.status)) {
         throw requestError('这次通话已经结束。', 409, 'CALL_ENDED');
@@ -7190,10 +7207,6 @@ async function savePendingCallOffer(
           UPDATE call_sessions
           SET mode=$4,
               offer=$5::jsonb,
-              caller_device_id=CASE
-                WHEN caller_device_id='' THEN $8
-                ELSE caller_device_id
-              END,
               updated_at=NOW(),
               expires_at=NOW() + (
                 CASE WHEN status='ringing' THEN $6::int ELSE $7::int END::text || ' seconds'
@@ -7209,7 +7222,6 @@ async function savePendingCallOffer(
           JSON.stringify(signal.sdp),
           CALL_RING_TIMEOUT_SECONDS,
           CALL_ACTIVE_TIMEOUT_SECONDS,
-          callerDeviceId,
         ],
       );
       await client.query('COMMIT');
@@ -7362,6 +7374,7 @@ async function answerPendingCall(
   conversationId,
   actorKind,
   deviceId,
+  renegotiation = false,
 ) {
   if (!isUuid(callId)) return { accepted: false, call: null };
   const actorKey = callActorKey(actorKind, deviceId);
@@ -7369,16 +7382,21 @@ async function answerPendingCall(
     `
       UPDATE call_sessions
       SET status=CASE WHEN status='ringing' THEN 'answered' ELSE status END,
-          claimed_by=COALESCE(claimed_by,$5),
-          claimed_at=COALESCE(claimed_at,NOW()),
+          claimed_by=CASE WHEN caller_kind <> $4 THEN COALESCE(claimed_by,$5) ELSE claimed_by END,
+          claimed_at=CASE WHEN caller_kind <> $4 THEN COALESCE(claimed_at,NOW()) ELSE claimed_at END,
           answered_at=COALESCE(answered_at,NOW()),
           updated_at=NOW(),
           expires_at=NOW() + ($6::int::text || ' seconds')::interval
       WHERE id=$1 AND tenant_id=$2 AND conversation_id=$3
-        AND caller_kind <> $4
         AND status=ANY($7::text[])
         AND expires_at > NOW()
-        AND (claimed_by IS NULL OR claimed_by=$5)
+        AND (
+          (NOT $8::boolean AND caller_kind <> $4 AND (claimed_by IS NULL OR claimed_by=$5))
+          OR ($8::boolean AND status IN ('answered','connected') AND (
+            (caller_kind=$4 AND caller_device_id=$9)
+            OR (caller_kind <> $4 AND claimed_by=$5)
+          ))
+        )
       RETURNING *
     `,
     [
@@ -7389,6 +7407,8 @@ async function answerPendingCall(
       actorKey,
       CALL_ACTIVE_TIMEOUT_SECONDS,
       ['ringing', 'answered', 'connected'],
+      renegotiation === true,
+      cleanText(deviceId, 120) || 'legacy',
     ],
   );
   if (result.rows[0]) return { accepted: true, call: result.rows[0] };
@@ -24989,6 +25009,7 @@ async function router(req, res, parsedRequestUrl = null) {
           conversation.id,
           'user',
           signal.deviceId,
+          signal.renegotiation,
         );
         if (!answered.accepted) {
           return sendError(
@@ -26700,6 +26721,7 @@ async function router(req, res, parsedRequestUrl = null) {
             conversationId,
             'admin',
             signal.deviceId,
+            signal.renegotiation,
           );
           if (!answered.accepted) {
             return sendError(
