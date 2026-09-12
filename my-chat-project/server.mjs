@@ -12635,13 +12635,28 @@ async function getOkpayRecipient(telegramId) {
   };
 }
 
-async function getOkpayUsdtBalance() {
-  const result = await okpayRequest('/shop/balance', {});
-  const balance = String(result.data?.usdt ?? '').trim();
-  if (okpayCurrencyCents(balance) == null) {
+function normalizeOkpayBalanceValue(value, label, { usdt = false } = {}) {
+  const text = String(value ?? '').trim();
+  if (!/^\d{1,30}(?:\.\d{1,18})?$/.test(text)) {
+    throw new Error(`OKPay 未返回有效的 ${label} 余额。`);
+  }
+  if (usdt && okpayCurrencyCents(text) == null) {
     throw new Error('OKPay 未返回有效的 USDT 余额。');
   }
-  return balance;
+  return text;
+}
+
+async function getOkpayBalance() {
+  const result = await okpayRequest('/shop/balance', {});
+  return {
+    usdt: normalizeOkpayBalanceValue(result.data?.usdt, 'USDT', { usdt: true }),
+    trx: normalizeOkpayBalanceValue(result.data?.trx, 'TRX'),
+  };
+}
+
+async function getOkpayUsdtBalance() {
+  const result = await okpayRequest('/shop/balance', {});
+  return normalizeOkpayBalanceValue(result.data?.usdt, 'USDT', { usdt: true });
 }
 
 async function submitOkpayTransfer(transfer) {
@@ -16866,6 +16881,10 @@ function telegramUserChatUrl(user) {
     : `tg://user?id=${encodeURIComponent(String(user?.id || ''))}`;
 }
 
+function parseOkpayBalanceCommand(raw) {
+  return /^ok余额(?:@[A-Za-z0-9_]+)?$/iu.test(String(raw || '').trim());
+}
+
 function parseOkpayTransferCommand(raw) {
   const value = String(raw || '').trim();
   const prefix = value.match(/^(转账|提现)(?:\s|$)/u);
@@ -17363,6 +17382,43 @@ async function handleTelegramOkpayTransferCommand(message, command) {
   return true;
 }
 
+async function handleTelegramOkpayBalanceCommand(message) {
+  const chat = message?.chat;
+  const userId = String(message?.from?.id || '');
+  if (!telegramLedgerGroupAllowed(chat, userId)) {
+    await recordTelegramShopIllegalActor(message?.from || {}, '尝试查询 OKPay 商户余额')
+      .catch(() => {});
+    await telegramApi('sendMessage', {
+      chat_id: chat?.id,
+      text: '⛔ “ok余额”只能由白名单管理员在已授权通知群中使用。',
+      ...telegramThread(message),
+    }).catch(() => {});
+    return true;
+  }
+  try {
+    const balance = await getOkpayBalance();
+    await telegramApi('sendMessage', {
+      chat_id: chat.id,
+      text: [
+        '<b>💰 OKPay 商户余额</b>',
+        '',
+        `<b>USDT</b>：<code>${escapeTelegramHtml(formatCurrencyCents(okpayCurrencyCents(balance.usdt)))}</code>`,
+        `<b>TRX</b>：<code>${escapeTelegramHtml(balance.trx)}</code>`,
+      ].join('\n'),
+      parse_mode: 'HTML',
+      ...telegramThread(message),
+    });
+  } catch (error) {
+    await telegramApi('sendMessage', {
+      chat_id: chat.id,
+      text: `❌ 查询 OKPay 商户余额失败：${escapeTelegramHtml(cleanText(error?.message || '请稍后重试。', 240))}`,
+      parse_mode: 'HTML',
+      ...telegramThread(message),
+    }).catch(() => {});
+  }
+  return true;
+}
+
 async function processTelegramOkpayTransfers() {
   if (telegramOkpayTransferPollPromise) return telegramOkpayTransferPollPromise;
   telegramOkpayTransferPollPromise = (async () => {
@@ -17840,6 +17896,10 @@ async function processTelegramUpdate(update) {
       await handleTelegramOkpayTransferCommand(message, okpayTransferCommand);
       return;
     }
+    if (parseOkpayBalanceCommand(raw)) {
+      await handleTelegramOkpayBalanceCommand(message);
+      return;
+    }
     const ledgerEntry = parseTelegramLedgerCommand(raw);
     const isLedgerBalance = ['账户余额', '余额'].includes(raw);
     if (telegramLedgerGroupAllowed(chat, userId) && (ledgerEntry || isLedgerBalance)) {
@@ -17922,6 +17982,7 @@ async function processTelegramUpdate(update) {
           '二维码异常：回复异常消息并发送“更换域名wxmb2.netlify.app”',
           '群账户记账：发送“+38 周卡”或“-10 买号”',
           '查询余额：发送“账户余额”或“余额”',
+          '查询 OKPay 商户余额：发送“ok余额”',
           'OKPay转账：在授权群发送“转账 金额 Telegram数字ID”',
         ].join('\n'),
         ...telegramThread(message),

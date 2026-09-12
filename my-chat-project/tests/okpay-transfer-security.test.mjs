@@ -32,6 +32,16 @@ function loadTransferParser() {
   return factory();
 }
 
+function loadOkpayBalanceParser() {
+  const start = source.indexOf('function parseOkpayBalanceCommand');
+  const end = source.indexOf('function parseOkpayTransferCommand', start);
+  assert.ok(start >= 0 && end > start, 'OKPay balance command parser must exist');
+  const factory = new Function(
+    `${source.slice(start, end)}\nreturn parseOkpayBalanceCommand;`,
+  );
+  return factory();
+}
+
 function loadOkpayCurrencyCents() {
   const start = source.indexOf('function currencyCents');
   const end = source.indexOf('function telegramLedgerKeyboard', start);
@@ -198,6 +208,23 @@ test('transfer command accepts only the renamed, bounded format', () => {
   assert.equal(parse('转账 10.123 123456789').invalid, true);
   assert.equal(parse('转账 10 abc').invalid, true);
   assert.equal(parse('提现 10 123456789').legacyName, true);
+});
+
+test('OKPay balance command is exact and supports an optional bot mention', () => {
+  const parse = loadOkpayBalanceParser();
+  assert.equal(parse('ok余额'), true);
+  assert.equal(parse('OK余额@tuojie_bot'), true);
+  assert.equal(parse('ok余额 查询'), false);
+  assert.equal(parse('账户余额'), false);
+});
+
+test('OKPay balance query uses the signed provider endpoint and group authorization', () => {
+  assert.match(source, /async function getOkpayBalance\(\)/);
+  assert.match(source, /okpayRequest\('\/shop\/balance', \{\}\)/);
+  assert.match(source, /normalizeOkpayBalanceValue\(result\.data\?\.trx, 'TRX'\)/);
+  assert.match(source, /async function handleTelegramOkpayBalanceCommand\(message\)/);
+  assert.match(source, /尝试查询 OKPay 商户余额/);
+  assert.match(source, /查询 OKPay 商户余额：发送“ok余额”/);
 });
 
 test('signed success responses and withdrawal callbacks are verified', () => {
